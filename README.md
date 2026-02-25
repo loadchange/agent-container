@@ -5,7 +5,7 @@ Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inside a Docke
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hiragram/claude-docker/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/loadchange/claude-docker/main/install.sh | bash
 ```
 
 This installs the `claude-docker` command to `~/.local/bin/`.
@@ -26,6 +26,33 @@ claude-docker -p "explain this codebase"
 ```
 
 The current directory is mounted as the workspace inside the container.
+
+## Configuration
+
+You can customize the container environment by exporting the following optional environment variables before running `claude-docker`:
+
+- **Proxy**:
+  - `CLAUDE_DOCKER_HTTP_PROXY`: HTTP proxy URL (e.g., `http://127.0.0.1:1087`)
+  - `CLAUDE_DOCKER_HTTPS_PROXY`: HTTPS proxy URL
+  - `CLAUDE_DOCKER_ALL_PROXY`: SOCKS/ALL proxy URL (e.g., `socks5://127.0.0.1:1080`)
+  - `CLAUDE_DOCKER_NO_PROXY`: Comma-separated list of domains to bypass the proxy (defaults to `localhost,127.0.0.1`)
+- **DNS**:
+  - `CLAUDE_DOCKER_DNS1`: Primary custom DNS server IP (e.g., `1.1.1.1`)
+  - `CLAUDE_DOCKER_DNS2`: Secondary custom DNS server IP (e.g., `1.0.0.1`)
+- **Timezone**:
+  - `CLAUDE_DOCKER_TZ`: Container timezone (e.g., `Asia/Shanghai`)
+
+Example:
+```bash
+export CLAUDE_DOCKER_HTTP_PROXY="http://127.0.0.1:1087"
+export CLAUDE_DOCKER_HTTPS_PROXY="http://127.0.0.1:1087"
+export CLAUDE_DOCKER_ALL_PROXY="socks5://127.0.0.1:1080"
+export CLAUDE_DOCKER_NO_PROXY="localhost,127.0.0.1"
+export CLAUDE_DOCKER_DNS1="1.1.1.1"
+export CLAUDE_DOCKER_DNS2="1.0.0.1"
+export CLAUDE_DOCKER_TZ="America/Phoenix"
+claude-docker
+```
 
 ## What it does
 
@@ -61,10 +88,7 @@ These are copied to `~/.claude-docker/` to avoid conflicts with the host-side Cl
 ## Uninstall
 
 ```bash
-rm ~/.local/bin/claude-docker
-rm -rf ~/.claude-docker ~/.claude-docker.json
-docker rmi claude-code-docker
-docker volume rm claude-code-local
+curl -fsSL https://raw.githubusercontent.com/loadchange/claude-docker/main/uninstall.sh | bash
 ```
 
 ## Requirements

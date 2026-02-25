@@ -7,7 +7,23 @@ CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 CONTAINER_CLAUDE_HOME="$HOME/.claude-docker"
 CONTAINER_CLAUDE_JSON="$HOME/.claude-docker.json"
 
-# --- Dockerが使えるかチェック ---
+# --- Optional Configurations ---
+# Global Proxy (e.g., http://192.168.1.100:7890)
+CLAUDE_DOCKER_HTTP_PROXY="${CLAUDE_DOCKER_HTTP_PROXY:-}"
+CLAUDE_DOCKER_HTTPS_PROXY="${CLAUDE_DOCKER_HTTPS_PROXY:-}"
+CLAUDE_DOCKER_ALL_PROXY="${CLAUDE_DOCKER_ALL_PROXY:-}"
+CLAUDE_DOCKER_NO_PROXY="${CLAUDE_DOCKER_NO_PROXY:-localhost,127.0.0.1}"
+
+# Custom DNS
+# Primary DNS (e.g., 8.8.8.8)
+CLAUDE_DOCKER_DNS1="${CLAUDE_DOCKER_DNS1:-}"
+# Secondary DNS (e.g., 8.8.4.4)
+CLAUDE_DOCKER_DNS2="${CLAUDE_DOCKER_DNS2:-}"
+
+# Timezone (e.g., Asia/Shanghai)
+CLAUDE_DOCKER_TZ="${CLAUDE_DOCKER_TZ:-}"
+
+# --- Check if Docker is available ---
 if ! command -v docker &> /dev/null; then
   echo "Error: docker is not installed or not in PATH." >&2
   exit 1
@@ -18,7 +34,7 @@ if ! docker info &> /dev/null; then
   exit 1
 fi
 
-# --- Dockerイメージのビルド ---
+# --- Build Docker image ---
 build_image() {
   echo "Building Docker image '$IMAGE_NAME'..."
   local tmpdir
@@ -29,23 +45,23 @@ build_image() {
 #!/bin/bash
 set -e
 
-# ホスト側パスへのシンボリックリンクを作成（root権限で実行）
-# installed_plugins.json等がホストの絶対パスを参照しているため
+# Create symbolic link to host-side path (run with root privileges)
+# This is necessary because installed_plugins.json and other files reference absolute paths on the host.
 if [ -n "$HOST_CLAUDE_HOME" ] && [ "$HOST_CLAUDE_HOME" != "/home/claude/.claude" ]; then
   mkdir -p "$(dirname "$HOST_CLAUDE_HOME")"
   ln -sfn /home/claude/.claude "$HOST_CLAUDE_HOME"
 fi
 
-# .local volumeの権限をclaudeユーザーに
+# Change ownership of .local volume to the 'claude' user
 chown -R claude:claude /home/claude/.local
 
-# Claude Codeが未インストールならインストール（claudeユーザーで）
+# Install Claude Code if it's not already installed (as the 'claude' user)
 if [ ! -x /home/claude/.local/bin/claude ]; then
   echo "Installing Claude Code..."
   su -s /bin/bash claude -c 'curl -fsSL https://claude.ai/install.sh | bash'
 fi
 
-# マウントされた.sshの権限を調整（read-onlyマウントなのでコピーして使う）
+# Adjust permissions for the mounted .ssh directory (copied because the mount is read-only)
 if [ -d /home/claude/.ssh-host ]; then
   cp -a /home/claude/.ssh-host /home/claude/.ssh
   chown -R claude:claude /home/claude/.ssh
@@ -56,20 +72,20 @@ if [ -d /home/claude/.ssh-host ]; then
   chmod 644 /home/claude/.ssh/config 2>/dev/null || true
 fi
 
-# マウントされた.config/ghの権限を調整
+# Adjust permissions for the mounted .config/gh directory
 if [ -d /home/claude/.config/gh ]; then
   chown -R claude:claude /home/claude/.config
 fi
 
-# マウントされた.gitconfigの権限を調整
+# Adjust permissions for the mounted .gitconfig file
 if [ -f /home/claude/.gitconfig ]; then
   chown claude:claude /home/claude/.gitconfig
 fi
 
-# workspaceの権限をclaudeユーザーに
+# Change ownership of the workspace to the 'claude' user
 chown claude:claude /workspace 2>/dev/null || true
 
-# claudeユーザーでコマンドを実行
+# Execute the command as the 'claude' user
 export HOME=/home/claude
 exec setpriv --reuid=$(id -u claude) --regid=$(id -g claude) --init-groups env HOME=/home/claude "$@"
 ENTRYPOINT_EOF
@@ -97,7 +113,7 @@ ENV PATH="/home/claude/.local/bin:${PATH}"
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-# シンボリックリンク作成先のベースディレクトリをclaude所有にする
+# Set ownership of the base directory for symbolic links to the 'claude' user
 RUN mkdir -p /Users && chown claude:claude /Users
 
 WORKDIR /workspace
@@ -106,24 +122,39 @@ ENTRYPOINT ["/entrypoint.sh"]
 CMD ["claude"]
 DOCKERFILE_EOF
 
-  docker build -t "$IMAGE_NAME" "$tmpdir"
+  local build_args=()
+  if [ -n "$CLAUDE_DOCKER_HTTP_PROXY" ]; then
+    build_args+=(--build-arg "HTTP_PROXY=$CLAUDE_DOCKER_HTTP_PROXY" --build-arg "http_proxy=$CLAUDE_DOCKER_HTTP_PROXY")
+  fi
+  if [ -n "$CLAUDE_DOCKER_HTTPS_PROXY" ]; then
+    build_args+=(--build-arg "HTTPS_PROXY=$CLAUDE_DOCKER_HTTPS_PROXY" --build-arg "https_proxy=$CLAUDE_DOCKER_HTTPS_PROXY")
+  fi
+  if [ -n "$CLAUDE_DOCKER_ALL_PROXY" ]; then
+    build_args+=(--build-arg "ALL_PROXY=$CLAUDE_DOCKER_ALL_PROXY" --build-arg "all_proxy=$CLAUDE_DOCKER_ALL_PROXY")
+  fi
+  if [ -n "$CLAUDE_DOCKER_HTTP_PROXY" ] || [ -n "$CLAUDE_DOCKER_HTTPS_PROXY" ] || [ -n "$CLAUDE_DOCKER_ALL_PROXY" ]; then
+    build_args+=(--build-arg "NO_PROXY=$CLAUDE_DOCKER_NO_PROXY" --build-arg "no_proxy=$CLAUDE_DOCKER_NO_PROXY")
+  fi
+
+  docker build -t "$IMAGE_NAME" ${build_args[@]+"${build_args[@]}"} "$tmpdir"
+
   trap - EXIT
   rm -rf "$tmpdir"
   echo "Docker image '$IMAGE_NAME' built successfully."
 }
 
-# --- イメージ存在チェック ---
+# --- Check if the image exists ---
 if ! docker image inspect "$IMAGE_NAME" > /dev/null 2>&1; then
   build_image
 fi
 
-# --- Claude Code本体用のvolume作成 ---
+# --- Create Docker volume for Claude Code installations ---
 docker volume create "$VOLUME_NAME" > /dev/null 2>&1 || true
 
-# --- コンテナ用 ~/.claude-docker/ を準備 ---
+# --- Prepare ~/.claude-docker/ for the container ---
 mkdir -p "$CONTAINER_CLAUDE_HOME"
 
-# ホストの設定ファイルを同期（毎回最新を反映）
+# Sync host configuration files (ensure latest settings are always reflected)
 for f in settings.json CLAUDE.md; do
   if [ -f "$CLAUDE_HOME/$f" ]; then
     cp "$CLAUDE_HOME/$f" "$CONTAINER_CLAUDE_HOME/$f"
@@ -137,12 +168,12 @@ for d in hooks plugins commands agents; do
   fi
 done
 
-# --- ~/.claude.json（オンボーディング状態）がなければ作成 ---
+# --- Create ~/.claude.json (onboarding state) if it doesn't exist ---
 if [ ! -s "$CONTAINER_CLAUDE_JSON" ]; then
   echo '{}' > "$CONTAINER_CLAUDE_JSON"
 fi
 
-# --- ホストの git/gh/ssh 設定をマウント ---
+# --- Mount host git/gh/ssh configurations ---
 HOST_MOUNTS=()
 if [ -f "$HOME/.gitconfig" ]; then
   HOST_MOUNTS+=(-v "$HOME/.gitconfig:/home/claude/.gitconfig")
@@ -151,11 +182,41 @@ if [ -d "$HOME/.config/gh" ]; then
   HOST_MOUNTS+=(-v "$HOME/.config/gh:/home/claude/.config/gh")
 fi
 if [ -d "$HOME/.ssh" ]; then
-  # entrypoint.sh でコピー＆権限調整するため別パスにマウント
+  # Mount to a separate path so entrypoint.sh can copy and adjust permissions
   HOST_MOUNTS+=(-v "$HOME/.ssh:/home/claude/.ssh-host:ro")
 fi
 
-# --- Claude起動（未認証ならclaude自身がloginを促す） ---
+# --- Prepare optional Docker run arguments ---
+DOCKER_ARGS=()
+
+# Proxy
+if [ -n "$CLAUDE_DOCKER_HTTP_PROXY" ]; then
+  DOCKER_ARGS+=(-e "HTTP_PROXY=$CLAUDE_DOCKER_HTTP_PROXY" -e "http_proxy=$CLAUDE_DOCKER_HTTP_PROXY")
+fi
+if [ -n "$CLAUDE_DOCKER_HTTPS_PROXY" ]; then
+  DOCKER_ARGS+=(-e "HTTPS_PROXY=$CLAUDE_DOCKER_HTTPS_PROXY" -e "https_proxy=$CLAUDE_DOCKER_HTTPS_PROXY")
+fi
+if [ -n "$CLAUDE_DOCKER_ALL_PROXY" ]; then
+  DOCKER_ARGS+=(-e "ALL_PROXY=$CLAUDE_DOCKER_ALL_PROXY" -e "all_proxy=$CLAUDE_DOCKER_ALL_PROXY")
+fi
+if [ -n "$CLAUDE_DOCKER_HTTP_PROXY" ] || [ -n "$CLAUDE_DOCKER_HTTPS_PROXY" ] || [ -n "$CLAUDE_DOCKER_ALL_PROXY" ]; then
+  DOCKER_ARGS+=(-e "NO_PROXY=$CLAUDE_DOCKER_NO_PROXY" -e "no_proxy=$CLAUDE_DOCKER_NO_PROXY")
+fi
+
+# DNS
+if [ -n "$CLAUDE_DOCKER_DNS1" ]; then
+  DOCKER_ARGS+=(--dns="$CLAUDE_DOCKER_DNS1")
+fi
+if [ -n "$CLAUDE_DOCKER_DNS2" ]; then
+  DOCKER_ARGS+=(--dns="$CLAUDE_DOCKER_DNS2")
+fi
+
+# Timezone
+if [ -n "$CLAUDE_DOCKER_TZ" ]; then
+  DOCKER_ARGS+=(-e "TZ=$CLAUDE_DOCKER_TZ")
+fi
+
+# --- Start Claude (Claude will prompt for login if not authenticated) ---
 exec docker run -it --rm \
   -e "HOST_CLAUDE_HOME=$CLAUDE_HOME" \
   -v "$VOLUME_NAME:/home/claude/.local" \
@@ -163,5 +224,6 @@ exec docker run -it --rm \
   -v "$CONTAINER_CLAUDE_JSON:/home/claude/.claude.json" \
   -v "$(pwd):/workspace" \
   ${HOST_MOUNTS[@]+"${HOST_MOUNTS[@]}"} \
+  ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} \
   "$IMAGE_NAME" \
   claude "$@"

@@ -1,20 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_URL="https://raw.githubusercontent.com/hiragram/claude-docker/main/claude-docker"
+REPO_URL="https://raw.githubusercontent.com/loadchange/claude-docker/main/claude-docker"
 INSTALL_DIR="$HOME/.local/bin"
 COMMAND_NAME="claude-docker"
 
 echo "Installing $COMMAND_NAME..."
 
-# --- インストール先ディレクトリを作成 ---
+# --- Create installation directory ---
 mkdir -p "$INSTALL_DIR"
 
-# --- ダウンロード＆配置 ---
+# --- Download and place the script ---
 curl -fsSL "$REPO_URL" -o "$INSTALL_DIR/$COMMAND_NAME"
 chmod +x "$INSTALL_DIR/$COMMAND_NAME"
 
-# --- PATHチェック ---
+# --- Check PATH ---
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
   echo ""
   echo "Warning: $INSTALL_DIR is not in your PATH."
