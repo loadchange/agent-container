@@ -32,10 +32,13 @@ The current directory is mounted as the workspace inside the container.
 You can customize the container environment by exporting the following optional environment variables before running `claude-docker`:
 
 - **Proxy**:
-  - `CLAUDE_DOCKER_HTTP_PROXY`: HTTP proxy URL (e.g., `http://127.0.0.1:1087`)
+  - `CLAUDE_DOCKER_HTTP_PROXY`: HTTP proxy URL (e.g., `http://host.docker.internal:7890`)
   - `CLAUDE_DOCKER_HTTPS_PROXY`: HTTPS proxy URL
-  - `CLAUDE_DOCKER_ALL_PROXY`: SOCKS/ALL proxy URL (e.g., `socks5://127.0.0.1:1080`)
+  - `CLAUDE_DOCKER_ALL_PROXY`: SOCKS/ALL proxy URL (e.g., `socks5://host.docker.internal:1080`)
   - `CLAUDE_DOCKER_NO_PROXY`: Comma-separated list of domains to bypass the proxy (defaults to `localhost,127.0.0.1`)
+  
+  > **Note for macOS/Windows users**: If you are proxying traffic through a client running on your host machine (like Surge, Clash, v2ray), use `host.docker.internal` instead of `127.0.0.1` as the host. The script automatically maps this domain to your host gateway.
+
 - **DNS**:
   - `CLAUDE_DOCKER_DNS1`: Primary custom DNS server IP (e.g., `1.1.1.1`)
   - `CLAUDE_DOCKER_DNS2`: Secondary custom DNS server IP (e.g., `1.0.0.1`)
@@ -44,9 +47,9 @@ You can customize the container environment by exporting the following optional 
 
 Example:
 ```bash
-export CLAUDE_DOCKER_HTTP_PROXY="http://127.0.0.1:1087"
-export CLAUDE_DOCKER_HTTPS_PROXY="http://127.0.0.1:1087"
-export CLAUDE_DOCKER_ALL_PROXY="socks5://127.0.0.1:1080"
+export CLAUDE_DOCKER_HTTP_PROXY="http://host.docker.internal:1087"
+export CLAUDE_DOCKER_HTTPS_PROXY="http://host.docker.internal:1087"
+export CLAUDE_DOCKER_ALL_PROXY="socks5://host.docker.internal:1080"
 export CLAUDE_DOCKER_NO_PROXY="localhost,127.0.0.1"
 export CLAUDE_DOCKER_DNS1="1.1.1.1"
 export CLAUDE_DOCKER_DNS2="1.0.0.1"

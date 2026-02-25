@@ -219,6 +219,7 @@ fi
 # --- Start Claude (Claude will prompt for login if not authenticated) ---
 exec docker run -it --rm \
   -e "HOST_CLAUDE_HOME=$CLAUDE_HOME" \
+  --add-host host.docker.internal:host-gateway \
   -v "$VOLUME_NAME:/home/claude/.local" \
   -v "$CONTAINER_CLAUDE_HOME:/home/claude/.claude" \
   -v "$CONTAINER_CLAUDE_JSON:/home/claude/.claude.json" \
