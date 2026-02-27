@@ -83,7 +83,12 @@ if [ -f /home/claude/.gitconfig ]; then
 fi
 
 # Change ownership of the workspace to the 'claude' user
-chown claude:claude /workspace 2>/dev/null || true
+if [ -n "${HOST_WORKSPACE:-}" ]; then
+  mkdir -p "$HOST_WORKSPACE" 2>/dev/null || true
+  chown claude:claude "$HOST_WORKSPACE" 2>/dev/null || true
+else
+  chown claude:claude /workspace 2>/dev/null || true
+fi
 
 # Execute the command as the 'claude' user
 export HOME=/home/claude
@@ -117,6 +122,7 @@ RUN chmod +x /entrypoint.sh
 RUN mkdir -p /Users && chown claude:claude /Users
 
 WORKDIR /workspace
+# Note: WORKDIR is overridden at runtime via --workdir to match host path
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["claude"]
@@ -143,8 +149,10 @@ DOCKERFILE_EOF
   echo "Docker image '$IMAGE_NAME' built successfully."
 }
 
-# --- Check if the image exists ---
-if ! docker image inspect "$IMAGE_NAME" > /dev/null 2>&1; then
+# --- Check if the image exists and build it ---
+# We build every time by default as Docker cache is effective, 
+# but it can be skipped by setting SKIP_BUILD=true
+if ! docker image inspect "$IMAGE_NAME" > /dev/null 2>&1 || [ "${SKIP_BUILD:-false}" != "true" ]; then
   build_image
 fi
 
@@ -216,15 +224,39 @@ if [ -n "$CLAUDE_DOCKER_TZ" ]; then
   DOCKER_ARGS+=(-e "TZ=$CLAUDE_DOCKER_TZ")
 fi
 
+# --- In the case of git worktree, also mount the .git directory of the original repository ---
+# The .git in a worktree is a file (not a directory), and its contents are:
+#   gitdir: /path/to/original-repo/.git/worktrees/<name>
+# If this path is not visible from inside the container, git operations cannot be performed,
+# so we mount the .git directory of the original repository as is.
+if [ -f "$(pwd)/.git" ]; then
+  WORKTREE_GITDIR=$(sed -n 's/^gitdir: //p' "$(pwd)/.git")
+  if [ -n "$WORKTREE_GITDIR" ]; then
+    # Get .git from .git/worktrees/<name> (2 levels up)
+    MAIN_GIT_DIR=$(cd "$WORKTREE_GITDIR/../.." && pwd)
+    # If it is under the workspace, it is already mounted, so no need to add it
+    case "$MAIN_GIT_DIR" in
+      "$(pwd)"*)
+        ;;
+      *)
+        HOST_MOUNTS+=(-v "$MAIN_GIT_DIR:$MAIN_GIT_DIR")
+        ;;
+    esac
+  fi
+fi
+
 # --- Start Claude (Claude will prompt for login if not authenticated) ---
+HOST_WORKSPACE="$(pwd)"
 exec docker run -it --rm \
   -e "HOST_CLAUDE_HOME=$CLAUDE_HOME" \
+  -e "HOST_WORKSPACE=$HOST_WORKSPACE" \
   --add-host host.docker.internal:host-gateway \
   -v "$VOLUME_NAME:/home/claude/.local" \
   -v "$CONTAINER_CLAUDE_HOME:/home/claude/.claude" \
   -v "$CONTAINER_CLAUDE_JSON:/home/claude/.claude.json" \
-  -v "$(pwd):/workspace" \
+  -v "$HOST_WORKSPACE:$HOST_WORKSPACE" \
+  --workdir "$HOST_WORKSPACE" \
   ${HOST_MOUNTS[@]+"${HOST_MOUNTS[@]}"} \
   ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} \
   "$IMAGE_NAME" \
-  claude "$@"
+  claude "$@" --allow-dangerously-skip-permissions
