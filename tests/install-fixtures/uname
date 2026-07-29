@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+case "${1:-}" in
+  -s) printf '%s\n' "${FAKE_UNAME_SYSTEM:-Darwin}" ;;
+  -m) printf '%s\n' "${FAKE_UNAME_MACHINE:-arm64}" ;;
+  *) printf '%s test-host 26.0.0 %s\n' \
+       "${FAKE_UNAME_SYSTEM:-Darwin}" \
+       "${FAKE_UNAME_MACHINE:-arm64}" ;;
+esac

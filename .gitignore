@@ -1,0 +1,4 @@
+.e2e/
+.native-e2e/
+.benchmarks/
+.DS_Store

@@ -1,0 +1,108 @@
+#!/bin/bash
+set -euo pipefail
+
+: "${FAKE_CONTAINER_LOG:?FAKE_CONTAINER_LOG is required}"
+
+{
+  echo "CALL"
+  for argument in "$@"; do
+    printf 'ARG=%s\n' "$argument"
+  done
+} >> "$FAKE_CONTAINER_LOG"
+
+last_argument=""
+for argument in "$@"; do
+  last_argument="$argument"
+done
+
+default_inspect() {
+  printf '{"reference":"%s","digest":"sha256:test-owned"}\n' "$1"
+}
+
+ref_matches() {
+  local expected="${1:-}"
+  local actual="$2"
+  [ -n "$expected" ] && [ "$expected" = "$actual" ]
+}
+
+case "${1:-}" in
+  --version)
+    echo "container CLI version 1.2.0 (build: release, commit: fixture)"
+    ;;
+  system)
+    [ "${2:-}" = "status" ] && [ "${FAKE_SYSTEM_RUNNING:-true}" = true ]
+    ;;
+  list)
+    if [ -n "${FAKE_LIST_SLEEP_MARKER:-}" ] \
+      && [ ! -e "$FAKE_LIST_SLEEP_MARKER" ]; then
+      : > "$FAKE_LIST_SLEEP_MARKER"
+      if [ -n "${FAKE_LIST_WAIT_FILE:-}" ]; then
+        while [ -e "$FAKE_LIST_WAIT_FILE" ]; do
+          sleep 0.1
+        done
+      else
+        sleep "${FAKE_LIST_SLEEP_SECONDS:-2}"
+      fi
+    fi
+    [ "${FAKE_LIST_FAIL:-false}" != true ] || {
+      echo "container service unavailable" >&2
+      exit 69
+    }
+    if [ "${FAKE_LIST_INVALID_JSON:-false}" = true ]; then
+      printf '%s\n' 'not-json'
+    elif [ "${FAKE_ACTIVE_LABELED_CONTAINER:-false}" = true ]; then
+      printf '%s\n' '[{"configuration":{"labels":{"com.loadchange.agent-container":"true"}}}]'
+    else
+      printf '%s\n' '[]'
+    fi
+    ;;
+  image)
+    case "${2:-}" in
+      inspect)
+        image_ref="$last_argument"
+        if ref_matches "${FAKE_IMAGE_INSPECT_FAIL_REF:-}" "$image_ref"; then
+          echo "transient image-store failure for $image_ref" >&2
+          exit 70
+        fi
+        if ref_matches "${FAKE_IMAGE_MISSING_REF:-}" "$image_ref"; then
+          echo "image not found: $image_ref" >&2
+          exit 1
+        fi
+        if ref_matches "${FAKE_IMAGE_EMPTY_REF:-}" "$image_ref"; then
+          exit 0
+        fi
+
+        if ref_matches "${FAKE_IMAGE_RETAG_REF:-}" "$image_ref"; then
+          : "${FAKE_CONTAINER_STATE_DIR:?FAKE_CONTAINER_STATE_DIR is required for retag simulation}"
+          mkdir -p "$FAKE_CONTAINER_STATE_DIR"
+          counter_file="$FAKE_CONTAINER_STATE_DIR/retag-inspect-count"
+          inspect_count=0
+          if [ -f "$counter_file" ]; then
+            inspect_count=$(sed -n '1p' "$counter_file")
+          fi
+          inspect_count=$((inspect_count + 1))
+          printf '%s\n' "$inspect_count" > "$counter_file"
+          if [ "$inspect_count" -gt "${FAKE_IMAGE_RETAG_AFTER:-1}" ]; then
+            printf '{"reference":"%s","digest":"sha256:retargeted"}\n' "$image_ref"
+            exit 0
+          fi
+        fi
+
+        if [ -n "${FAKE_IMAGE_INSPECT_OUTPUT:-}" ]; then
+          printf '%s\n' "$FAKE_IMAGE_INSPECT_OUTPUT"
+        else
+          default_inspect "$image_ref"
+        fi
+        ;;
+      delete|rm)
+        image_ref="$last_argument"
+        if ref_matches "${FAKE_IMAGE_DELETE_FAIL_REF:-}" "$image_ref"; then
+          echo "delete failed for $image_ref" >&2
+          exit 71
+        fi
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac

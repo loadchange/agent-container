@@ -1,0 +1,9 @@
+#!/bin/bash
+case "${*: -1}" in
+  kern.num_files) echo "${FAKE_NUM_FILES:-1000}" ;;
+  kern.maxfiles) echo "${FAKE_MAX_FILES:-100000}" ;;
+  kern.maxfilesperproc) echo "${FAKE_MAX_FILES_PER_PROC:-60000}" ;;
+  kern.maxvnodes) echo "${FAKE_MAX_VNODES:-200000}" ;;
+  kern.free_vnodes) echo "${FAKE_FREE_VNODES:-150000}" ;;
+  *) exit 1 ;;
+esac

@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euo pipefail
+
+destination="${*: -1}"
+if [ -n "${FAKE_MV_FAIL_DESTINATION:-}" ] \
+  && [ "$destination" = "$FAKE_MV_FAIL_DESTINATION" ] \
+  && [ ! -e "${FAKE_MV_ONCE_MARKER:?FAKE_MV_ONCE_MARKER is required}" ]; then
+  : > "$FAKE_MV_ONCE_MARKER"
+  exit 75
+fi
+
+if [ -n "${FAKE_MV_SLEEP_DESTINATION:-}" ] \
+  && [ "$destination" = "$FAKE_MV_SLEEP_DESTINATION" ] \
+  && [ ! -e "${FAKE_MV_SLEEP_MARKER:?FAKE_MV_SLEEP_MARKER is required}" ]; then
+  : > "$FAKE_MV_SLEEP_MARKER"
+  if [ -n "${FAKE_MV_WAIT_FILE:-}" ]; then
+    while [ -e "$FAKE_MV_WAIT_FILE" ]; do
+      sleep 0.1
+    done
+  else
+    sleep "${FAKE_MV_SLEEP_SECONDS:-2}"
+  fi
+fi
+
+exec /usr/bin/env PATH=/usr/bin:/bin mv "$@"

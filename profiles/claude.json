@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "id": "claude",
+  "displayName": "Claude Code",
+  "status": "preview",
+  "installerKind": "npm",
+  "package": "@anthropic-ai/claude-code",
+  "version": "2.1.220",
+  "command": "claude",
+  "probeArg": "--version",
+  "apiKeyEnv": "ANTHROPIC_API_KEY",
+  "disableAutoUpdateEnv": "DISABLE_AUTOUPDATER"
+}

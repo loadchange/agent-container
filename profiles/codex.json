@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "id": "codex",
+  "displayName": "Codex CLI",
+  "status": "preview",
+  "installerKind": "npm",
+  "package": "@openai/codex",
+  "version": "0.146.0",
+  "command": "codex",
+  "probeArg": "--version",
+  "apiKeyEnv": "OPENAI_API_KEY",
+  "disableAutoUpdateEnv": ""
+}

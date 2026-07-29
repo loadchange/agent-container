@@ -1,0 +1,5 @@
+#!/bin/bash
+case "${1:-}" in
+  -productVersion) echo "26.5.2" ;;
+  *) echo "ProductVersion: 26.5.2" ;;
+esac

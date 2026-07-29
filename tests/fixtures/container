@@ -1,0 +1,332 @@
+#!/bin/bash
+set -euo pipefail
+
+: "${FAKE_CONTAINER_LOG:?FAKE_CONTAINER_LOG is required}"
+
+sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    sha256sum | awk '{print $1}'
+  fi
+}
+
+image_ref_from_last_argument() {
+  local image_ref=""
+  local argument
+  for argument in "$@"; do
+    image_ref="$argument"
+  done
+  printf '%s\n' "$image_ref"
+}
+
+image_ref_from_build_arguments() {
+  local previous=""
+  local argument
+  for argument in "$@"; do
+    if [ "$previous" = "--tag" ]; then
+      printf '%s\n' "$argument"
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
+fake_image_state_for_ref() {
+  local image_ref="$1"
+  local image_key
+
+  # Preserve the old single-file override for focused failure tests. Normal
+  # runs use one state file per image reference so one Agent profile cannot
+  # make every other profile appear warm.
+  if [ -n "${FAKE_IMAGE_STATE:-}" ]; then
+    printf '%s\n' "$FAKE_IMAGE_STATE"
+    return 0
+  fi
+  image_key=$(printf '%s' "$image_ref" | sha256_stream)
+  mkdir -p "${FAKE_IMAGE_STATE_DIR:-$FAKE_CONTAINER_LOG.images}"
+  printf '%s/%s\n' \
+    "${FAKE_IMAGE_STATE_DIR:-$FAKE_CONTAINER_LOG.images}" \
+    "$image_key"
+}
+
+fake_image_digest_for_ref() {
+  local image_ref="$1"
+  local image_key
+  image_key=$(printf '%s' "$image_ref" | sha256_stream)
+  printf 'sha256:%s\n' "$image_key"
+}
+
+fake_image_inspect_for_digest() {
+  local image_ref="$1"
+  local image_digest="$2"
+  local image_id
+  image_id=${image_digest#sha256:}
+  printf '%s\n' \
+    "[{\"id\":\"$image_id\",\"configuration\":{\"creationDate\":\"2026-07-29T00:00:00Z\",\"name\":\"$image_ref\",\"descriptor\":{\"digest\":\"$image_digest\",\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"size\":123}},\"variants\":[]}]"
+}
+
+fake_image_inspect_for_ref() {
+  local image_ref="$1"
+  local image_digest
+  image_digest=$(fake_image_digest_for_ref "$image_ref")
+  fake_image_inspect_for_digest "$image_ref" "$image_digest"
+}
+
+capture_staged_capabilities() {
+  local argument stage_source staged_gitconfig staged_ssh
+  if [ -n "${FAKE_CAPTURE_GITCONFIG:-}" ]; then
+    staged_gitconfig=""
+    for argument in "$@"; do
+      case "$argument" in
+        *:/run/agent-host:ro)
+          stage_source=${argument%:/run/agent-host:ro}
+          staged_gitconfig="$stage_source/gitconfig"
+          ;;
+      esac
+    done
+    [ -f "$staged_gitconfig" ] || return 66
+    cp "$staged_gitconfig" "$FAKE_CAPTURE_GITCONFIG"
+  fi
+  if [ -n "${FAKE_CAPTURE_SSH_DIR:-}" ]; then
+    staged_ssh=""
+    for argument in "$@"; do
+      case "$argument" in
+        *:/run/agent-host:ro)
+          stage_source=${argument%:/run/agent-host:ro}
+          staged_ssh="$stage_source/ssh"
+          ;;
+      esac
+    done
+    [ -d "$staged_ssh" ] || return 67
+    mkdir -p "$FAKE_CAPTURE_SSH_DIR"
+    cp -R "$staged_ssh/." "$FAKE_CAPTURE_SSH_DIR/"
+  fi
+}
+
+set_post_start_state() {
+  local mode="$1"
+  local container_id="$2"
+  local state_file="${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}"
+
+  rm -f "$state_file.inspect-error"
+  case "$mode" in
+    auto-remove)
+      rm -f "$state_file"
+      ;;
+    retain)
+      ;;
+    indeterminate)
+      : > "$state_file.inspect-error"
+      ;;
+    foreign)
+      printf '%s\n' \
+        "[{\"id\":\"$container_id\",\"configuration\":{\"id\":\"$container_id\",\"labels\":{},\"image\":{\"reference\":\"foreign:latest\",\"descriptor\":{\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}},\"initProcess\":{\"terminal\":false}},\"status\":{\"state\":\"stopped\"}}]" \
+        > "$state_file"
+      ;;
+    *)
+      exit 72
+      ;;
+  esac
+}
+
+{
+  echo "CALL"
+  for argument in "$@"; do
+    printf 'ARG=%s\n' "$argument"
+  done
+} >> "$FAKE_CONTAINER_LOG"
+
+case "${1:-}" in
+  --version)
+    echo "container CLI version ${FAKE_CONTAINER_VERSION:-1.2.0} (build: release, commit: test)"
+    ;;
+  system)
+    case "${2:-}" in
+      status) [ "${FAKE_SYSTEM_RUNNING:-true}" = true ] ;;
+      start) exit 0 ;;
+    esac
+    ;;
+  list)
+    if [ -n "${FAKE_CONTAINER_LIST_STATE:-}" ] \
+      && [ -f "$FAKE_CONTAINER_LIST_STATE" ]; then
+      cat "$FAKE_CONTAINER_LIST_STATE"
+    elif [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ] \
+      && [ -f "$FAKE_CREATED_CONTAINER_STATE" ]; then
+      cat "$FAKE_CREATED_CONTAINER_STATE"
+    else
+      printf '%s\n' "${FAKE_CONTAINER_LIST_JSON:-[]}"
+    fi
+    ;;
+  inspect)
+    if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ] \
+      && [ -f "$FAKE_CREATED_CONTAINER_STATE.inspect-error" ]; then
+      echo "compound RPC failure after container not found: ${2:-}; state is indeterminate" >&2
+      exit 74
+    elif [ -n "${FAKE_CONTAINER_INSPECT_OUTPUT:-}" ]; then
+      printf '%s\n' "$FAKE_CONTAINER_INSPECT_OUTPUT"
+    elif [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ] \
+      && [ -f "$FAKE_CREATED_CONTAINER_STATE" ]; then
+      cat "$FAKE_CREATED_CONTAINER_STATE"
+    else
+      echo "container not found: ${2:-}" >&2
+      exit 1
+    fi
+    ;;
+  delete|rm)
+    [ "${FAKE_CONTAINER_DELETE_FAIL:-false}" != true ] || exit 1
+    if [ -n "${FAKE_CONTAINER_LIST_STATE:-}" ]; then
+      printf '%s\n' '[]' > "$FAKE_CONTAINER_LIST_STATE"
+    fi
+    if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ]; then
+      rm -f \
+        "$FAKE_CREATED_CONTAINER_STATE" \
+        "$FAKE_CREATED_CONTAINER_STATE.inspect-error"
+    fi
+    ;;
+  image)
+    case "${2:-}" in
+      inspect)
+        image_ref=$(image_ref_from_last_argument "$@")
+        fake_image_state=$(fake_image_state_for_ref "$image_ref")
+        if [ "${FAKE_IMAGE_PRESENT:-false}" = true ] || [ -f "$fake_image_state" ]; then
+          if [ -n "${FAKE_IMAGE_INSPECT_OUTPUT:-}" ]; then
+            printf '%s\n' "$FAKE_IMAGE_INSPECT_OUTPUT"
+          elif [ -s "$fake_image_state" ]; then
+            cat "$fake_image_state"
+          else
+            fake_image_inspect_for_ref "$image_ref"
+          fi
+          if [ "${FAKE_RETAG_AFTER_INSPECT:-false}" = true ]; then
+            fake_image_inspect_for_digest \
+              "$image_ref" \
+              'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+              > "$fake_image_state"
+            printf 'RETAGGED_IMAGE=%s\n' "$image_ref" >> "$FAKE_CONTAINER_LOG"
+          fi
+        else
+          exit 1
+        fi
+        ;;
+      delete|rm)
+        image_ref=$(image_ref_from_last_argument "$@")
+        fake_image_state=$(fake_image_state_for_ref "$image_ref")
+        rm -f "$fake_image_state"
+        exit 0
+        ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  build)
+    [ "${FAKE_BUILD_FAIL:-false}" != true ] || exit 1
+    image_ref=$(image_ref_from_build_arguments "$@") || exit 64
+    fake_image_state=$(fake_image_state_for_ref "$image_ref")
+    fake_image_inspect_for_ref "$image_ref" > "$fake_image_state"
+    ;;
+  create)
+    created_id=""
+    created_profile=""
+    created_uid=""
+    created_pid=""
+    created_image=""
+    created_tty=false
+    previous=""
+    for argument in "$@"; do
+      case "$previous" in
+        --name) created_id="$argument" ;;
+        --label)
+          case "$argument" in
+            com.loadchange.agent-container.profile=*)
+              created_profile=${argument#*=}
+              ;;
+            com.loadchange.agent-container.host-uid=*)
+              created_uid=${argument#*=}
+              ;;
+            com.loadchange.agent-container.launcher-pid=*)
+              created_pid=${argument#*=}
+              ;;
+          esac
+          ;;
+      esac
+      case "$argument" in
+        --tty) created_tty=true ;;
+        agent-container-*:*) created_image="$argument" ;;
+      esac
+      previous="$argument"
+    done
+    if [ "${FAKE_CREATE_FOREIGN_COLLISION:-false}" = true ]; then
+      [ -n "$created_id" ] || exit 71
+      printf '%s\n' \
+        "[{\"id\":\"$created_id\",\"configuration\":{\"id\":\"$created_id\",\"labels\":{},\"image\":{\"reference\":\"foreign:latest\",\"descriptor\":{\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}},\"initProcess\":{\"terminal\":false}},\"status\":{\"state\":\"stopped\"}}]" \
+        > "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}"
+      exit 1
+    fi
+    if [ "${FAKE_CREATE_FOREIGN_AFTER_SUCCESS:-false}" = true ]; then
+      [ -n "$created_id" ] || exit 71
+      printf '%s\n' \
+        "[{\"id\":\"$created_id\",\"configuration\":{\"id\":\"$created_id\",\"labels\":{},\"image\":{\"reference\":\"foreign:latest\",\"descriptor\":{\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}},\"initProcess\":{\"terminal\":false}},\"status\":{\"state\":\"stopped\"}}]" \
+        > "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}"
+      printf '%s\n' "$created_id"
+      exit 0
+    fi
+    [ -n "$created_id" ] \
+      && [ -n "$created_profile" ] \
+      && [ -n "$created_uid" ] \
+      && [ -n "$created_pid" ] \
+      && [ -n "$created_image" ] \
+      || exit 68
+    fake_image_state=$(fake_image_state_for_ref "$created_image")
+    [ -s "$fake_image_state" ] || exit 69
+    created_digest=$(sed -nE \
+      's/.*"digest":"(sha256:[0-9a-f]{64})".*/\1/p' \
+      "$fake_image_state" | head -n 1)
+    [ -n "$created_digest" ] || exit 70
+    capture_staged_capabilities "$@" || exit $?
+    created_started_date=""
+    if [ "${FAKE_CREATE_STARTED:-false}" = true ]; then
+      created_started_date=',"startedDate":"2026-07-29T00:00:00Z"'
+    fi
+    rm -f "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}.inspect-error"
+    printf '%s\n' \
+      "[{\"id\":\"$created_id\",\"configuration\":{\"id\":\"$created_id\",\"labels\":{\"com.loadchange.agent-container\":\"true\",\"com.loadchange.agent-container.profile\":\"$created_profile\",\"com.loadchange.agent-container.host-uid\":\"$created_uid\",\"com.loadchange.agent-container.launcher-pid\":\"$created_pid\"},\"image\":{\"reference\":\"$created_image\",\"descriptor\":{\"digest\":\"$created_digest\"}},\"initProcess\":{\"terminal\":$created_tty}},\"status\":{\"state\":\"stopped\"$created_started_date}}]" \
+      > "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}"
+    printf '%s\n' "$created_id"
+    ;;
+  start)
+    started_id=$(image_ref_from_last_argument "$@")
+    if [ "${FAKE_START_FAIL:-false}" = true ]; then
+      set_post_start_state \
+        "${FAKE_POST_START_INSPECT_MODE:-retain}" \
+        "$started_id"
+      exit 73
+    fi
+    if [ -t 0 ]; then
+      echo "STDIN_TTY=true" >> "$FAKE_CONTAINER_LOG"
+    else
+      echo "STDIN_TTY=false" >> "$FAKE_CONTAINER_LOG"
+    fi
+    if [ "${FAKE_READ_STDIN:-false}" = true ]; then
+      IFS= read -r input_line
+      printf 'READ=%s\n' "$input_line" >> "$FAKE_CONTAINER_LOG"
+    fi
+    if [ -n "${FAKE_RUN_OUTPUT:-}" ]; then
+      printf '%s\n' "$FAKE_RUN_OUTPUT"
+    fi
+    if [ -n "${FAKE_RUN_SLEEP:-}" ]; then
+      exec sleep "$FAKE_RUN_SLEEP"
+    fi
+    set_post_start_state \
+      "${FAKE_POST_START_INSPECT_MODE:-auto-remove}" \
+      "$started_id"
+    exit "${FAKE_RUN_STATUS:-0}"
+    ;;
+  stop)
+    if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ]; then
+      rm -f \
+        "$FAKE_CREATED_CONTAINER_STATE" \
+        "$FAKE_CREATED_CONTAINER_STATE.inspect-error"
+    fi
+    exit 0
+    ;;
+esac

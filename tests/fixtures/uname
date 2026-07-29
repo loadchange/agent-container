@@ -1,0 +1,6 @@
+#!/bin/bash
+case "${1:-}" in
+  -s) echo Darwin ;;
+  -m) echo arm64 ;;
+  *) echo "Darwin test-host 25.0.0 arm64" ;;
+esac

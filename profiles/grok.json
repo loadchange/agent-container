@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "id": "grok",
+  "displayName": "Grok CLI",
+  "status": "experimental",
+  "installerKind": "npm",
+  "package": "@xai-official/grok",
+  "version": "0.2.110",
+  "command": "grok",
+  "probeArg": "--version",
+  "apiKeyEnv": "XAI_API_KEY",
+  "disableAutoUpdateEnv": ""
+}

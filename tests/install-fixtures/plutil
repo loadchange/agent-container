@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euo pipefail
+
+input_file=""
+for argument in "$@"; do
+  case "$argument" in
+    -*) ;;
+    json) ;;
+    *) input_file="$argument" ;;
+  esac
+done
+[ -n "$input_file" ] && [ -f "$input_file" ] || exit 1
+
+first_character=$(sed -n '/[^[:space:]]/ { s/^[[:space:]]*//; s/^\(.\).*$/\1/; p; q; }' "$input_file")
+case "${1:-}" in
+  -convert)
+    case "$first_character" in
+      \[|\{) ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  -lint)
+    case "$first_character" in
+      \[|\{) ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac

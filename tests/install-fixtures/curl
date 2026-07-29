@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+
+source_url=""
+output_path=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    output_path="$argument"
+    previous=""
+    continue
+  fi
+  case "$argument" in
+    -o) previous="-o" ;;
+    file://*) source_url="$argument" ;;
+  esac
+done
+
+[ -n "$source_url" ] && [ -n "$output_path" ] || exit 64
+cp "${source_url#file://}" "$output_path"
