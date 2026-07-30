@@ -102,7 +102,7 @@ Once the release assets and `release-manifest.sha256` are published on `main`,
 install or atomically upgrade all three profiles with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/loadchange/claude-docker/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/loadchange/agent-container/main/install.sh | bash
 ```
 
 If macOS cannot reach GitHub directly, run `proxy_on` in that same shell before
@@ -146,7 +146,7 @@ selector means all profiles; `--all` expresses that default explicitly.
 combined with `--profile`:
 
 ```bash
-installer_url='https://raw.githubusercontent.com/loadchange/claude-docker/main/install.sh'
+installer_url='https://raw.githubusercontent.com/loadchange/agent-container/main/install.sh'
 
 # Grok only
 curl -fsSL "$installer_url" | bash -s -- --profile grok

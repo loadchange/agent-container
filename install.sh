@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly INSTALL_MARKER_TEXT="managed by agent-container installer v1"
-readonly BASE_URL="${AGENT_CONTAINER_INSTALL_BASE_URL:-https://raw.githubusercontent.com/loadchange/claude-docker/main}"
+readonly BASE_URL="${AGENT_CONTAINER_INSTALL_BASE_URL:-https://raw.githubusercontent.com/loadchange/agent-container/main}"
 
 RELEASE_COMMANDS=(
   agent-container
