@@ -175,6 +175,17 @@ case "${1:-}" in
     fi
     ;;
   delete|rm)
+    if [ "${FAKE_CONTAINER_DELETE_ABSENT_RACE:-false}" = true ]; then
+      if [ -n "${FAKE_CONTAINER_LIST_STATE:-}" ]; then
+        printf '%s\n' '[]' > "$FAKE_CONTAINER_LIST_STATE"
+      fi
+      if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ]; then
+        rm -f \
+          "$FAKE_CREATED_CONTAINER_STATE" \
+          "$FAKE_CREATED_CONTAINER_STATE.inspect-error"
+      fi
+      exit 1
+    fi
     [ "${FAKE_CONTAINER_DELETE_FAIL:-false}" != true ] || exit 1
     if [ -n "${FAKE_CONTAINER_LIST_STATE:-}" ]; then
       printf '%s\n' '[]' > "$FAKE_CONTAINER_LIST_STATE"

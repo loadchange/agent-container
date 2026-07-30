@@ -1,5 +1,0 @@
-#!/bin/bash
-set -euo pipefail
-
-echo "Warning: claude-docker is deprecated; using the macOS-only Apple container runtime." >&2
-exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/agent-container" claude "$@"

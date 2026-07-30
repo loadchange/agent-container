@@ -64,23 +64,65 @@ This permits different profiles to overlap. Sessions of the same profile stay
 serialized so two builds cannot race on that profile's provenance-tracked
 image tag.
 
-## Requirements
+## Install Apple container
 
 - Apple silicon Mac
 - macOS 26 or newer
 - Apple [`container` 1.2.0+](https://github.com/apple/container/releases)
 - system Bash, `plutil`, and macOS JavaScriptCore (`osascript`)
 
-Install Apple's signed package and start its per-user services yourself:
+Download the latest signed `.pkg` from Apple's
+[`container` releases](https://github.com/apple/container/releases), open it,
+and complete the macOS installer. Then verify the version and start its
+per-user services:
 
 ```bash
+container --version  # must be 1.2.0 or newer
 container system start
 container system status
 ```
 
-The launcher never starts, stops, upgrades, or reconfigures that service.
+If an older `container` installation is already running, stop it before using
+Apple's installed updater:
 
-## Install
+```bash
+container system stop
+/usr/local/bin/update-container.sh
+container system start
+```
+
+This project never installs, starts, stops, upgrades, or reconfigures Apple's
+service for you.
+
+## Install agent-container
+
+### One-command full install
+
+Once the release assets and `release-manifest.sha256` are published on `main`,
+install or atomically upgrade all three profiles with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/loadchange/claude-docker/main/install.sh | bash
+```
+
+If macOS cannot reach GitHub directly, run `proxy_on` in that same shell before
+the command. The separate proxy settings needed by the image builder are shown
+in [Host proxy plus container proxy demo](#host-proxy-plus-container-proxy-demo).
+
+The installer validates every asset, publishes a content-addressed release
+under `~/.local/share/agent-container/releases/`, atomically switches `current`,
+and installs commands in `~/.local/bin`. A failed upgrade rolls the complete
+installation back.
+
+Ensure that directory is on `PATH` in the current shell and add the same line
+to `~/.zshrc` for later terminals:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+agent-container profiles
+```
+
+### Install from a source checkout
 
 From this source checkout, after generating/verifying the committed release
 manifest:
@@ -89,35 +131,102 @@ manifest:
 AGENT_CONTAINER_INSTALL_BASE_URL="file://$PWD" ./install.sh
 ```
 
-After this exact asset set and `release-manifest.sha256` are published on
-`main`, the remote installer is:
+The same selector arguments described below work from a checkout, for example:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/loadchange/claude-docker/main/install.sh | bash
+AGENT_CONTAINER_INSTALL_BASE_URL="file://$PWD" \
+  ./install.sh --profile grok
 ```
 
-The installer validates every asset, publishes a content-addressed release
-under `~/.local/share/agent-container/releases/`, atomically switches `current`,
-and installs commands in `~/.local/bin`. A failed upgrade rolls the complete
-installation back.
+### Select which profiles to install
 
-Ensure `~/.local/bin` is on `PATH`, then list the installed profiles:
+Use `--profile` once for a single Agent or repeat it for a chosen set. No
+selector means all profiles; `--all` expresses that default explicitly.
+`--profile=grok` is equivalent to `--profile grok`, and `--all` cannot be
+combined with `--profile`:
+
+```bash
+installer_url='https://raw.githubusercontent.com/loadchange/claude-docker/main/install.sh'
+
+# Grok only
+curl -fsSL "$installer_url" | bash -s -- --profile grok
+
+# Claude Code only
+curl -fsSL "$installer_url" | bash -s -- --profile claude
+
+# Codex only
+curl -fsSL "$installer_url" | bash -s -- --profile codex
+
+# Claude Code plus Codex
+curl -fsSL "$installer_url" | \
+  bash -s -- --profile claude --profile codex
+
+# All three, explicitly
+curl -fsSL "$installer_url" | bash -s -- --all
+```
+
+Every selection includes the shared `agent-container`, `Containerfile`, and
+entrypoint. Only the selected compatibility commands and profile definitions
+are published into the current release. The selection is the desired managed
+set: rerunning the installer with another selection removes unselected command
+links only when the installer can prove that this project owns them. It never
+removes an unknown or user-owned command.
+
+Confirm the profiles present in the current managed release with:
 
 ```bash
 agent-container profiles
 ```
 
+The project installer does **not** install Claude, Codex, or Grok directly on
+macOS, and selecting a profile does not pull or build its image. Each official
+native Linux CLI is downloaded into its own image only when that profile is
+first invoked.
+
+### Optionally prebuild the selected images
+
+A version probe is the shortest way to build an installed profile without
+entering its interactive UI. Run the command matching your selection:
+
+```bash
+# Claude Code only
+claude-container --version
+
+# Codex only
+codex-container --version
+
+# Grok only (experimental opt-in is currently required)
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --version
+```
+
+To prebuild all three current native CLIs:
+
+```bash
+claude-container --version
+codex-container --version
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --version
+```
+
+Profiles that are never invoked do not get an Agent image or persistent Agent
+HOME. Changing the installed profile selection does not itself delete an
+existing profile image, credentials, or persistent HOME.
+
 ## Built-in profiles
 
-| Profile | Compatibility command | Pinned Linux package | Status |
-|---|---|---|---|
-| `claude` | `claude-container` | `@anthropic-ai/claude-code@2.1.220` | preview |
-| `codex` | `codex-container` | `@openai/codex@0.146.0` | preview |
-| `grok` | `grok-container` | `@xai-official/grok@0.2.110` | experimental |
+| Profile | Compatibility command | Official native installer | Channel | Status |
+|---|---|---|---|---|
+| `claude` | `claude-container` | `https://claude.ai/install.sh` (`bash`) | Claude `latest` | preview |
+| `codex` | `codex-container` | `https://chatgpt.com/codex/install.sh` (`sh`) | Codex `latest` | preview |
+| `grok` | `grok-container` | `https://x.ai/cli/install.sh` (`bash`) | Grok `stable` | experimental |
 
-The pinned Grok package includes a Linux arm64 payload. Its profile remains
-experimental while Agent-specific login and interactive flows are qualified,
-and it must be enabled explicitly:
+All three profiles follow their publisher's current native release channel.
+On every launch, the host resolves that channel to one exact version and puts
+the exact value into the image recipe fingerprint. An unchanged channel reuses
+the warm image; a channel update rebuilds only that profile. No profile installs
+an npm package, and the Debian guest does not contain Node.js or npm.
+
+The Grok profile remains experimental while Agent-specific login and
+interactive flows are qualified, and it must be enabled explicitly:
 
 ```bash
 AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --version
@@ -129,36 +238,68 @@ Apple container through build, login, TTY/pipes, workspace writes, signals,
 state persistence, and a warm second run.
 
 See [docs/profiles.md](docs/profiles.md) for the strict JSON profile contract
-and how to add another npm-distributed Agent CLI.
+and how to add another native Linux arm64 Agent CLI.
 
 ## First run and authentication
 
-The first run builds a local OCI image containing the profile's exact
-top-level Agent package version. Later runs inspect its identity and reuse it.
-On a clone-capable backing filesystem such as APFS, Apple's unpacked-root copy
-path can use copy-on-write cloning.
+The first run builds a local OCI image from a digest-pinned Debian Bookworm slim
+arm64 base. Before the build, the host resolves the profile's official channel
+to an exact version; only that exact version reaches the installer and image
+recipe. Later runs inspect the image identity and reuse it when the resolved
+version is unchanged. On a clone-capable backing filesystem such as APFS,
+Apple's unpacked-root copy path can use copy-on-write cloning.
+
+The build downloads and runs the profile's official installer with a private
+build-only `HOME=/opt/agent-native`. It then requires the installed command to
+be a Linux arm64 ELF and requires its version probe to report the resolved exact
+version. Claude and Grok are reduced to their single native ELF in
+`/usr/local/bin`; Codex keeps its complete standalone release tree because its
+binary depends on adjacent helpers and resources. None of this build state can
+read the runtime profile HOME or workspace because those mounts do not exist
+during image construction.
 
 Each launch creates a stopped auto-remove container first, verifies its frozen
 OCI digest and project provenance, and only then attaches `container start`.
 The session Agent command therefore cannot execute with the workspace,
 profile HOME, or opted-in host capabilities mounted until this verification
-succeeds. Image construction is a separate trusted supply-chain phase: npm
-lifecycle scripts and the declared version probe do execute in Apple's
+succeeds. Image construction is a separate trusted supply-chain phase: the
+publisher's install script and downloaded release artifacts execute in Apple's
 isolated builder, without those session mounts.
 
+Authenticate each profile inside its isolated guest HOME:
+
 ```bash
-claude-container
+# Claude currently has no --device-auth flag. Follow the URL/login prompt.
+claude-container auth login
+
+# Device flows are suitable for a headless Micro-VM.
 codex-container login --device-auth
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
+  grok-container login --device-auth
 ```
 
-The intended paths are Claude's interactive guest login and Codex's device
-flow, which avoids depending on a localhost browser callback from the
-Micro-VM. Both flows remain part of the preview qualification matrix rather
-than a current compatibility guarantee. Each isolated shadow HOME is
-persistent, so credentials and session state written there survive VM and
-image replacement. Host
-`~/.claude`, `~/.codex`, and other real Agent directories are never imported or
-mounted automatically.
+Then start an interactive session from the repository you want mounted:
+
+```bash
+cd /path/to/your/repository
+claude-container
+codex-container
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container
+```
+
+Arguments after a compatibility command are passed to the native Agent
+unchanged. Use `claude-container --help`, `codex-container --help`, or
+`AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --help` for
+Agent-specific options.
+
+The Codex/Grok device flows avoid relying on an automatic browser callback from
+the Micro-VM. Claude currently exposes no device-auth flag; follow its prompts
+and open any displayed URL in the host browser. Agent-specific login flows
+remain part of the preview or experimental qualification matrix rather than a
+current compatibility guarantee. Each isolated shadow HOME is persistent, so
+credentials and session state written there survive VM and image replacement.
+Host `~/.claude`, `~/.codex`, `~/.grok`, and other real Agent directories are
+never imported or mounted automatically.
 
 API keys are also denied by default. A profile may forward only its declared
 key name after explicit authorization:
@@ -217,38 +358,135 @@ contains guest processes; it does not make untrusted instructions harmless.
 
 ## Configuration
 
-All runtime settings use the shared `AGENT_CONTAINER_` namespace:
-
-| Variable | Default | Purpose |
-|---|---:|---|
-| `AGENT_CONTAINER_CPUS` | `4` | Session VM CPUs |
-| `AGENT_CONTAINER_MEMORY` | `4g` | Session VM memory |
-| `AGENT_CONTAINER_BUILD_CPUS` | `4` | CPUs when Apple creates the shared image builder |
-| `AGENT_CONTAINER_BUILD_MEMORY` | `4g` | Memory when Apple creates the shared image builder |
-| `AGENT_CONTAINER_VERSION` | profile pin | Override the selected Agent version |
-| `AGENT_CONTAINER_BASE_IMAGE` | pinned Node 22 Bookworm OCI digest | Override the base image or mirror |
-| `AGENT_CONTAINER_REBUILD` | `false` | Force a no-cache rebuild and pull |
-| `AGENT_CONTAINER_MAX_FILES` | `40000` | Maximum projected VirtioFS entries |
-| `AGENT_CONTAINER_FD_STOP_PERCENT` | `80` | Live file/vnode stop threshold |
-| `AGENT_CONTAINER_BIN` | `container` | Alternate Apple CLI, useful for source builds/tests |
-
-Proxy, DNS, and timezone values are forwarded only when explicitly set:
+All launcher settings use the shared `AGENT_CONTAINER_` namespace. An override
+can prefix one command or be exported for later commands:
 
 ```bash
-export AGENT_CONTAINER_HTTPS_PROXY='http://host.container.internal:7890'
-export AGENT_CONTAINER_NO_PROXY='localhost,127.0.0.1'
-export AGENT_CONTAINER_DNS1='1.1.1.1'
-export AGENT_CONTAINER_TZ='Asia/Singapore'
-codex-container
+AGENT_CONTAINER_CPUS=6 AGENT_CONTAINER_MEMORY=8g codex-container
+
+export AGENT_CONTAINER_VERSION=0.146.0
+codex-container --version
+unset AGENT_CONTAINER_VERSION
 ```
 
-`host.docker.internal` is rejected because it is Docker-specific. Apple's
-documented host-loopback DNS/PF bridge is an administrator-controlled system
-change; the launcher never creates it automatically.
+### Runtime, image, and network overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENT_CONTAINER_CPUS` | `4` | CPUs for each Agent session VM |
+| `AGENT_CONTAINER_MEMORY` | `4g` | Memory for each Agent session VM |
+| `AGENT_CONTAINER_BUILD_CPUS` | `4` | CPUs used when Apple creates the shared image builder |
+| `AGENT_CONTAINER_BUILD_MEMORY` | `4g` | Memory used when Apple creates the shared image builder |
+| `AGENT_CONTAINER_VERSION` | profile `latest` policy | Use `latest` or one exact native release such as `0.146.0` |
+| `AGENT_CONTAINER_BASE_IMAGE` | pinned Debian Bookworm slim arm64 digest | Use another safe OCI base/mirror reference; included in the image fingerprint |
+| `AGENT_CONTAINER_REBUILD` | `false` | Force a `--no-cache --pull` rebuild of the selected profile |
+| `AGENT_CONTAINER_SKIP_BUILD` | `false` | Never build; fail if the selected profile image is absent or stale |
+| `AGENT_CONTAINER_ENABLE_EXPERIMENTAL` | `false` | Permit experimental profiles such as Grok |
+| `AGENT_CONTAINER_HTTP_PROXY` | unset | Forward `HTTP_PROXY`/`http_proxy` to the builder and Agent VM |
+| `AGENT_CONTAINER_HTTPS_PROXY` | unset | Forward `HTTPS_PROXY`/`https_proxy` to the builder and Agent VM |
+| `AGENT_CONTAINER_ALL_PROXY` | unset | Forward `ALL_PROXY`/`all_proxy` to the builder and Agent VM |
+| `AGENT_CONTAINER_NO_PROXY` | `localhost,127.0.0.1` | Proxy bypass list, forwarded when any Agent proxy is set |
+| `AGENT_CONTAINER_DNS1` | unset | Primary DNS passed to builds and session VMs |
+| `AGENT_CONTAINER_DNS2` | unset | Secondary DNS passed to builds and session VMs |
+| `AGENT_CONTAINER_TZ` | unset | Set the session VM `TZ`, for example `Asia/Singapore` |
+
+The default base image reference is already complete and safe. If an older
+shell has a malformed override such as a wrapped value or a missing `/`, clear
+it instead of copying the default by hand:
+
+```bash
+unset AGENT_CONTAINER_BASE_IMAGE
+```
 
 Apple reuses its already-running shared `buildkit` helper. Build CPU, memory,
 and DNS flags apply when that helper is created; they do not reconfigure an
 existing helper. Session VM resource and DNS flags apply to each new session.
+
+### Host proxy plus container proxy demo
+
+There are two separate network hops on a cold `latest` launch:
+
+1. The macOS launcher queries the publisher's current version with host
+   `curl`. It follows ordinary host `http_proxy`, `https_proxy`, and
+   `ALL_PROXY` variables; `proxy_on` must be active in the same shell.
+2. Apple's builder downloads Debian packages, the official installer, and the
+   native CLI. The running Agent also needs network access. These two guests
+   use the `AGENT_CONTAINER_*_PROXY` values.
+
+For a local HTTP proxy listening on macOS loopback port `1087`, a complete
+example is:
+
+```bash
+# 1. Host-side install and latest-channel requests.
+proxy_on
+
+# 2. Make the host loopback proxy reachable from Apple container VMs.
+#    This Apple system change needs sudo and may need to be recreated after a
+#    restart. Choose a non-conflicting address if this one conflicts locally.
+container system dns list
+# If host.container.internal is not already listed, create it once:
+sudo container system dns create \
+  host.container.internal --localhost 203.0.113.113
+
+# 3. Builder and running-Agent proxy settings.
+export AGENT_CONTAINER_HTTP_PROXY='http://host.container.internal:1087'
+export AGENT_CONTAINER_HTTPS_PROXY='http://host.container.internal:1087'
+export AGENT_CONTAINER_NO_PROXY='localhost,127.0.0.1'
+
+# Build/reuse Grok and run its native version probe.
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --version
+```
+
+If the proxy already listens on an address directly reachable by the VM, use
+that address and skip the DNS/PF bridge. Apple's documented
+[`--localhost` bridge](https://github.com/apple/container/blob/main/docs/how-to.md#access-a-host-service-from-a-container)
+disables Private Relay while present, and its packet-filter redirect is lost
+after a restart. The launcher never creates this administrator-controlled
+system change automatically. `host.docker.internal` is Docker-specific, has
+no Apple container meaning, and is rejected.
+
+Setting only `AGENT_CONTAINER_HTTP_PROXY` or
+`AGENT_CONTAINER_HTTPS_PROXY` cannot bootstrap the host-side latest-channel
+query. Conversely, `proxy_on` alone does not automatically forward its
+`127.0.0.1` endpoint into a VM.
+
+### Capability and safety overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENT_CONTAINER_FORWARD_API_KEY` | `false` | Forward only the selected profile's declared key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `XAI_API_KEY`) |
+| `AGENT_CONTAINER_FULL_GIT_CONFIG` | `false` | Expose the full host Git config instead of only `user.name`/`user.email` |
+| `AGENT_CONTAINER_MOUNT_GH` | `false` | Mount host GitHub CLI configuration read-only |
+| `AGENT_CONTAINER_FORWARD_SSH_AGENT` | `false` | Forward the live SSH-agent socket; never mounts private-key files |
+| `AGENT_CONTAINER_MOUNT_SSH_CONFIG` | `false` | Copy selected SSH metadata into an ephemeral read-only mount |
+| `AGENT_CONTAINER_MAX_FILES` | `40000` | Maximum projected entries across all VirtioFS shares |
+| `AGENT_CONTAINER_FD_STOP_PERCENT` | `80` | Live file/vnode watchdog stop threshold; valid range is 50–95 |
+| `AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK` | `false` | Continue past selected VirtioFS risk checks after explicit acceptance |
+| `AGENT_CONTAINER_ALLOW_CONCURRENT` | `false` | Allow distinct profiles to overlap; also requires risk acceptance |
+| `AGENT_CONTAINER_DISABLE_FD_WATCHDOG` | `false` | Disable the live file/vnode watchdog; intended only for controlled tests |
+
+Capability flags can expose credentials or weaken host-risk controls. Review
+[docs/security.md](docs/security.md) before enabling them. For example:
+
+```bash
+export XAI_API_KEY='...'
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
+AGENT_CONTAINER_FORWARD_API_KEY=true \
+  grok-container
+```
+
+### Installation and development overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENT_CONTAINER_INSTALL_BASE_URL` | published raw `main` URL | Change where `install.sh` downloads its manifest and immutable asset set |
+| `AGENT_CONTAINER_ASSET_DIR` | installed/current release | Use another complete launcher asset directory, mainly for source development |
+| `AGENT_CONTAINER_BIN` | `container` | Use another Apple `container` executable, mainly for source builds/tests |
+
+Arbitrary `AGENT_CONTAINER_IMAGE` values and a custom
+`AGENT_CONTAINER_STATE_DIR` are intentionally unsupported: image references
+must remain profile-scoped for provenance, and state must remain globally
+discoverable under `~/.agent-container` for safe cleanup.
 
 ## Persistent layout
 
@@ -274,21 +512,33 @@ VM and its secret-capable staging; ambiguous resources fail closed.
 
 ## Updating an Agent
 
-Profiles fix the top-level Agent package to an exact version for controlled
-upgrades. Test another published exact version for one profile with:
+The built-in profiles select `latest`, meaning the publisher-controlled Claude
+latest, Codex latest, or Grok stable channel. The host queries that profile's
+official version endpoint on every launch, strictly parses one exact version,
+and includes it in the image fingerprint. Test or temporarily pin another
+published exact native release with:
 
 ```bash
-AGENT_CONTAINER_VERSION=0.145.0 codex-container --version
+AGENT_CONTAINER_VERSION=0.146.0 codex-container --version
 ```
 
 The recipe fingerprint includes the profile, version, base image,
 Containerfile, its context allowlist, and the entrypoint. A changed input
 rebuilds only that profile.
 
-This is controlled versioning, not a bit-for-bit reproducible supply chain.
-The default base is digest-pinned, but Debian packages and the npm transitive
-graph can still move. Full reproducibility additionally requires
-snapshot/versioned OS packages and a locked dependency graph.
+An exact `AGENT_CONTAINER_VERSION` bypasses the channel lookup, which permits an
+offline rollback or warm run when its matching image is already cached. A cold
+build still needs network access to the Debian repositories and publisher's
+installer/artifacts. Claude and Grok auto-updaters are disabled in runtime
+sessions, so publisher releases enter through this fingerprinted rebuild path
+instead of mutating a running image.
+
+Following a publisher channel intentionally trades reproducibility for
+automatic publisher-selected upgrades. Even an exact version is not a
+bit-for-bit reproducible supply chain: the official install script URL and
+Debian package repositories can change. The default Debian base itself is
+digest-pinned. See [docs/security.md](docs/security.md) for the different
+integrity checks performed by the Claude, Codex, and Grok installers.
 
 ## Performance expectations
 
@@ -322,9 +572,8 @@ raw `main` URL used by the installer.
 Uninstall fails closed before mutation if an Agent session is active or path,
 marker, image, or symlink provenance cannot be proved.
 
-`claude-docker` remains only as a deprecated command alias for
-`agent-container claude`; it no longer starts or manages Docker. For safety,
-the installer and uninstaller do not claim or delete legacy Docker images or
+No Docker compatibility command or Docker runtime asset is shipped. For
+safety, the uninstaller does not claim or delete legacy Docker images or
 volumes, whose names alone cannot prove ownership.
 
 ## Architecture

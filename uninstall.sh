@@ -9,7 +9,6 @@ COMMANDS=(
   claude-container
   codex-container
   grok-container
-  claude-docker
 )
 
 purge=false
@@ -19,6 +18,7 @@ case "${1:-}" in
   -h|--help)
     echo "Usage: uninstall.sh [--purge]"
     echo ""
+    echo "Removes the shared launcher and whichever profile commands were installed."
     echo "Without --purge, all per-profile credentials and state are preserved."
     exit 0
     ;;
@@ -311,9 +311,12 @@ for ((command_index = 0; command_index < ${#COMMANDS[@]}; command_index++)); do
   command_path="$resolved_install_dir/$command_name"
   command_paths[$command_index]="$command_path"
   if path_exists "$command_path"; then
-    is_project_command "$command_path" "$command_name" \
-      || preflight_die "unrecognized command was kept: $command_path"
-    command_owned[$command_index]=true
+    if is_project_command "$command_path" "$command_name"; then
+      command_owned[$command_index]=true
+    elif [ -z "$owned_asset_root" ] \
+      || path_exists "$owned_asset_root/current/$command_name"; then
+      preflight_die "unrecognized command was kept: $command_path"
+    fi
   fi
 done
 

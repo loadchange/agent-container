@@ -33,32 +33,47 @@ macOS Agent CLI versus the same Agent profile in `agent-container`.
 
 Report these phases independently:
 
-1. **Cold build**: base-image pull, npm package download, and image build.
-2. **Warm launch**: image already present with a matching fingerprint.
-3. **Workspace I/O**: Git status, file enumeration, build, and tests through
+1. **Channel resolution**: host HTTPS request and strict parsing of the
+   publisher's current Claude, Codex, or Grok version. This occurs on every
+   `latest` launch, even when the image is warm.
+2. **Cold build**: Debian base pull, Debian tool installation, official install
+   script execution, native release download, and image construction.
+3. **Warm launch**: image already present with a matching exact-version
+   fingerprint and inspected identity.
+4. **Workspace I/O**: Git status, file enumeration, build, and tests through
    VirtioFS.
-4. **Agent startup**: CLI initialization before a network request.
-5. **Online task**: API and model latency, reported separately from runtime
+5. **Agent startup**: CLI initialization before a model network request.
+6. **Online task**: API and model latency, reported separately from runtime
    overhead.
-6. **Shutdown**: exit latency, remaining VM/container state, and host file
+7. **Shutdown**: exit latency, remaining VM/container state, and host file
    descriptor recovery.
 
 Do not average a cold build into warm launch results. Do not use a single
-online prompt as evidence of container performance.
+online prompt as evidence of container performance. Codex keeps a complete
+standalone resource tree, whereas Claude and Grok contribute one installed ELF
+each; report download and image sizes rather than treating these different
+payload layouts as runtime overhead.
 
 ## Native-versus-container protocol
 
-Use the same machine, power mode, repository revision, Agent version, terminal
-mode, CPU/memory policy, proxy, and network. Close unrelated high-I/O programs.
-Run one discarded warmup followed by at least 20 measured iterations for each
-side, alternating native and container order to reduce thermal and cache bias.
+Use the same machine, power mode, repository revision, exact native Agent
+version, terminal mode, CPU/memory policy, proxy, and network. Close unrelated
+high-I/O programs. Run one discarded warmup followed by at least 20 measured
+iterations for each side, alternating native and container order to reduce
+thermal and cache bias.
+
+Record whether a run used the profile's floating channel or an exact
+`AGENT_CONTAINER_VERSION`. An exact override removes the channel request and can
+run against a matching cached image without network access; this is a useful
+way to isolate VM startup, but it must not be mixed with `latest` samples. A
+cold build still needs the Debian and publisher endpoints in either mode.
 
 For every metric report sample count, median (`p50`), `p95`, minimum, maximum,
 and failures. Retain raw samples.
 
 ### 1. Process and VM startup
 
-For each preview or stable profile, compare the same exact top-level version:
+For each qualified profile, compare the same exact native release:
 
 ```bash
 /usr/bin/time -p claude --version

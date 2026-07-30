@@ -102,6 +102,7 @@ reset_case_environment() {
     AGENT_CONTAINER_DNS1 \
     AGENT_CONTAINER_DNS2 \
     AGENT_CONTAINER_TZ \
+    AGENT_CONTAINER_VERSION \
     AGENT_CONTAINER_FD_STOP_PERCENT \
     AGENT_CONTAINER_MAX_FILES \
     AGENT_CONTAINER_MOUNT_GH \
@@ -119,10 +120,16 @@ reset_case_environment() {
     FAKE_CONTAINER_VERSION \
     FAKE_CONTAINER_LIST_JSON \
     FAKE_CONTAINER_LIST_STATE \
+    FAKE_CONTAINER_DELETE_ABSENT_RACE \
     FAKE_CONTAINER_DELETE_FAIL \
     FAKE_CONTAINER_INSPECT_OUTPUT \
     FAKE_IMAGE_INSPECT_OUTPUT \
     FAKE_IMAGE_PRESENT \
+    FAKE_CLAUDE_LATEST_VERSION \
+    FAKE_CODEX_LATEST_TAG \
+    FAKE_GROK_LATEST_VERSION \
+    FAKE_VERSION_LOOKUP_FAIL \
+    FAKE_VERSION_RESPONSE_OVERRIDE \
     FAKE_POST_START_INSPECT_MODE \
     FAKE_RETAG_AFTER_INSPECT \
     FAKE_READ_STDIN \
@@ -141,9 +148,11 @@ new_case() {
   case_home="$case_dir/home"
   case_workspace="$case_dir/workspace"
   case_log="$case_dir/container.log"
+  case_curl_log="$case_dir/curl.log"
   case_asset_dir="$repo_root"
   mkdir -p "$case_home" "$case_workspace"
   : > "$case_log"
+  : > "$case_curl_log"
 }
 
 copy_case_assets() {
@@ -184,6 +193,7 @@ launch_exec() {
     "AGENT_CONTAINER_DNS1=${AGENT_CONTAINER_DNS1:-}"
     "AGENT_CONTAINER_DNS2=${AGENT_CONTAINER_DNS2:-}"
     "AGENT_CONTAINER_TZ=${AGENT_CONTAINER_TZ:-}"
+    "AGENT_CONTAINER_VERSION=${AGENT_CONTAINER_VERSION:-}"
     "AGENT_CONTAINER_FD_STOP_PERCENT=${AGENT_CONTAINER_FD_STOP_PERCENT:-80}"
     "AGENT_CONTAINER_MAX_FILES=${AGENT_CONTAINER_MAX_FILES:-40000}"
     "AGENT_CONTAINER_MOUNT_GH=${AGENT_CONTAINER_MOUNT_GH:-false}"
@@ -197,13 +207,20 @@ launch_exec() {
     "FAKE_CONTAINER_LOG=$case_log"
     "FAKE_CONTAINER_LIST_JSON=${FAKE_CONTAINER_LIST_JSON:-[]}"
     "FAKE_CONTAINER_LIST_STATE=${FAKE_CONTAINER_LIST_STATE:-}"
+    "FAKE_CONTAINER_DELETE_ABSENT_RACE=${FAKE_CONTAINER_DELETE_ABSENT_RACE:-false}"
     "FAKE_CONTAINER_DELETE_FAIL=${FAKE_CONTAINER_DELETE_FAIL:-false}"
     "FAKE_CONTAINER_INSPECT_OUTPUT=${FAKE_CONTAINER_INSPECT_OUTPUT:-}"
     "FAKE_CREATED_CONTAINER_STATE=$case_home/fake-created-container.json"
+    "FAKE_CURL_LOG=$case_curl_log"
     "FAKE_CONTAINER_VERSION=${FAKE_CONTAINER_VERSION:-1.2.0}"
     "FAKE_IMAGE_INSPECT_OUTPUT=${FAKE_IMAGE_INSPECT_OUTPUT:-}"
     "FAKE_IMAGE_PRESENT=${FAKE_IMAGE_PRESENT:-false}"
     "FAKE_IMAGE_STATE_DIR=$case_home/fake-images"
+    "FAKE_CLAUDE_LATEST_VERSION=${FAKE_CLAUDE_LATEST_VERSION:-2.1.220}"
+    "FAKE_CODEX_LATEST_TAG=${FAKE_CODEX_LATEST_TAG:-rust-v0.146.0}"
+    "FAKE_GROK_LATEST_VERSION=${FAKE_GROK_LATEST_VERSION:-0.2.114}"
+    "FAKE_VERSION_LOOKUP_FAIL=${FAKE_VERSION_LOOKUP_FAIL:-false}"
+    "FAKE_VERSION_RESPONSE_OVERRIDE=${FAKE_VERSION_RESPONSE_OVERRIDE:-}"
     "FAKE_POST_START_INSPECT_MODE=${FAKE_POST_START_INSPECT_MODE:-}"
     "FAKE_RETAG_AFTER_INSPECT=${FAKE_RETAG_AFTER_INSPECT:-false}"
     "FAKE_READ_STDIN=${FAKE_READ_STDIN:-false}"
@@ -241,6 +258,32 @@ valid_fingerprint() {
   case "$value" in
     *[!0-9a-f]*) return 1 ;;
   esac
+}
+
+assert_native_installer_build_args() {
+  local file="$1"
+  local profile="$2"
+  local installer_url="$3"
+  local installer_shell="$4"
+  local version_env="$5"
+  local bin_dir_env="$6"
+  local home_env="$7"
+  local noninteractive_env="$8"
+  local version="$9"
+  local command="${10}"
+
+  assert_line "$file" "ARG=AGENT_PROFILE=$profile"
+  assert_line "$file" "ARG=AGENT_INSTALLER_URL=$installer_url"
+  assert_line "$file" "ARG=AGENT_INSTALLER_SHELL=$installer_shell"
+  assert_line "$file" "ARG=AGENT_INSTALLER_VERSION_ENV=$version_env"
+  assert_line "$file" "ARG=AGENT_INSTALLER_BIN_DIR_ENV=$bin_dir_env"
+  assert_line "$file" "ARG=AGENT_INSTALLER_HOME_ENV=$home_env"
+  assert_line "$file" "ARG=AGENT_INSTALLER_NONINTERACTIVE_ENV=$noninteractive_env"
+  assert_line "$file" "ARG=AGENT_VERSION=$version"
+  assert_line "$file" "ARG=AGENT_COMMAND=$command"
+  assert_line "$file" "ARG=--progress"
+  assert_line "$file" "ARG=plain"
+  assert_not_contains "$file" "AGENT_PACKAGE="
 }
 
 tests_run=$((tests_run + 1))
@@ -282,20 +325,20 @@ pass "profile ids stay within Apple container name limits"
 tests_run=$((tests_run + 1))
 new_case malformed_profile
 copy_case_assets
-printf '%s\n' '{"schema": 1, "id": "broken"' \
+printf '%s\n' '{"schema": 2, "id": "broken"' \
   > "$case_asset_dir/profiles/broken.json"
 if run_program "$repo_root/agent-container" broken \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "malformed profile JSON should be rejected"
 fi
-assert_contains "$case_dir/err" "Agent profile 'broken' is not valid schema-1 JSON"
+assert_contains "$case_dir/err" "Agent profile 'broken' is not valid schema-2 JSON"
 [ ! -s "$case_log" ] || fail "malformed profile contacted the Apple runtime"
 pass "malformed profile JSON fails closed"
 
 tests_run=$((tests_run + 1))
 new_case unsupported_schema
 copy_case_assets
-sed 's/"schema": 1/"schema": 2/' "$repo_root/profiles/claude.json" \
+sed 's/"schema": 2/"schema": 3/' "$repo_root/profiles/claude.json" \
   > "$case_asset_dir/profiles/schema.json"
 sed 's/"id": "claude"/"id": "schema"/' \
   "$case_asset_dir/profiles/schema.json" > "$case_dir/schema-fixed-id.json"
@@ -304,7 +347,7 @@ if run_program "$repo_root/agent-container" schema \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "unsupported profile schema should be rejected"
 fi
-assert_contains "$case_dir/err" "Unsupported schema '2' in profile 'schema'"
+assert_contains "$case_dir/err" "Unsupported schema '3' in profile 'schema'"
 [ ! -s "$case_log" ] || fail "unsupported schema contacted the Apple runtime"
 pass "profile schema versions are enforced"
 
@@ -325,12 +368,19 @@ new_case empty_profile_field
 copy_case_assets
 {
   printf '%s\n' '{'
-  printf '%s\n' '  "schema": 1,'
+  printf '%s\n' '  "schema": 2,'
   printf '%s\n' '  "id": "envsplit",'
   printf '%s\n' '  "displayName": "Environment Split",'
   printf '%s\n' '  "status": "stable",'
-  printf '%s\n' '  "installerKind": "npm",'
-  printf '%s\n' '  "package": "example-agent",'
+  printf '%s\n' '  "installerKind": "native-script",'
+  printf '%s\n' '  "installerUrl": "https://example.test/install.sh",'
+  printf '%s\n' '  "installerShell": "sh",'
+  printf '%s\n' '  "installerVersionUrl": "https://example.test/latest",'
+  printf '%s\n' '  "installerVersionFormat": "plain-semver",'
+  printf '%s\n' '  "installerVersionEnv": "",'
+  printf '%s\n' '  "installerBinDirEnv": "",'
+  printf '%s\n' '  "installerHomeEnv": "",'
+  printf '%s\n' '  "installerNonInteractiveEnv": "",'
   printf '%s\n' '  "version": "1.0.0",'
   printf '%s\n' '  "command": "example-agent",'
   printf '%s\n' '  "probeArg": "--version",'
@@ -350,15 +400,22 @@ tests_run=$((tests_run + 1))
 new_case malicious_profile
 copy_case_assets
 malicious_sentinel="$case_dir/json-was-executed"
-malicious_package='$(touch '"$malicious_sentinel"')'
+malicious_installer_url='https://example.test/$(touch '"$malicious_sentinel"')'
 {
   printf '%s\n' '{'
-  printf '%s\n' '  "schema": 1,'
+  printf '%s\n' '  "schema": 2,'
   printf '%s\n' '  "id": "evil",'
   printf '%s\n' '  "displayName": "Evil",'
   printf '%s\n' '  "status": "stable",'
-  printf '%s\n' '  "installerKind": "npm",'
-  printf '  "package": "%s",\n' "$malicious_package"
+  printf '%s\n' '  "installerKind": "native-script",'
+  printf '  "installerUrl": "%s",\n' "$malicious_installer_url"
+  printf '%s\n' '  "installerShell": "sh",'
+  printf '%s\n' '  "installerVersionUrl": "https://example.test/latest",'
+  printf '%s\n' '  "installerVersionFormat": "plain-semver",'
+  printf '%s\n' '  "installerVersionEnv": "",'
+  printf '%s\n' '  "installerBinDirEnv": "",'
+  printf '%s\n' '  "installerHomeEnv": "",'
+  printf '%s\n' '  "installerNonInteractiveEnv": "",'
   printf '%s\n' '  "version": "1.0.0",'
   printf '%s\n' '  "command": "evil",'
   printf '%s\n' '  "probeArg": "--version",'
@@ -368,9 +425,9 @@ malicious_package='$(touch '"$malicious_sentinel"')'
 } > "$case_asset_dir/profiles/evil.json"
 if run_program "$repo_root/agent-container" evil \
   >"$case_dir/out" 2>"$case_dir/err"; then
-  fail "unsafe profile package should be rejected"
+  fail "unsafe native installer URL should be rejected"
 fi
-assert_contains "$case_dir/err" "Profile 'evil' has an unsafe npm package"
+assert_contains "$case_dir/err" "Profile 'evil' has an unsafe installerUrl"
 [ ! -e "$malicious_sentinel" ] \
   || fail "profile JSON was evaluated as shell code"
 [ ! -s "$case_log" ] || fail "malicious profile contacted the Apple runtime"
@@ -399,9 +456,19 @@ tests_run=$((tests_run + 1))
 new_case profile_isolation
 run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/claude.out" 2>"$case_dir/claude.err"
-assert_line "$case_log" "ARG=AGENT_PACKAGE=@anthropic-ai/claude-code"
-assert_line "$case_log" "ARG=AGENT_VERSION=2.1.220"
-assert_line "$case_log" "ARG=AGENT_COMMAND=claude"
+assert_contains "$case_dir/claude.err" "Resolved Claude Code latest channel to 2.1.220"
+assert_line "$case_curl_log" "URL=https://downloads.claude.ai/claude-code-releases/latest"
+assert_native_installer_build_args \
+  "$case_log" \
+  claude \
+  https://claude.ai/install.sh \
+  bash \
+  '' \
+  '' \
+  '' \
+  '' \
+  2.1.220 \
+  claude
 assert_line "$case_log" "ARG=AGENT_PROBE_ARG=--version"
 assert_line "$case_log" "ARG=agent-container-claude:latest"
 assert_line "$case_log" "ARG=claude"
@@ -432,9 +499,19 @@ printf '%s\n' 'claude-only' > "$claude_shadow_home/profile-sentinel"
 run_program "$repo_root/agent-container" codex exec "argument with spaces" \
   >"$case_dir/codex.out" 2>"$case_dir/codex.err"
 assert_line "$case_log" "ARG=build"
-assert_line "$case_log" "ARG=AGENT_PACKAGE=@openai/codex"
-assert_line "$case_log" "ARG=AGENT_VERSION=0.146.0"
-assert_line "$case_log" "ARG=AGENT_COMMAND=codex"
+assert_contains "$case_dir/codex.err" "Resolved Codex CLI latest channel to 0.146.0"
+assert_line "$case_curl_log" "URL=https://releases.openai.com/codex/channels/latest"
+assert_native_installer_build_args \
+  "$case_log" \
+  codex \
+  https://chatgpt.com/codex/install.sh \
+  sh \
+  CODEX_RELEASE \
+  CODEX_INSTALL_DIR \
+  CODEX_HOME \
+  CODEX_NON_INTERACTIVE \
+  0.146.0 \
+  codex
 assert_line "$case_log" "ARG=agent-container-codex:latest"
 assert_line "$case_log" "ARG=codex"
 assert_line "$case_log" "ARG=argument with spaces"
@@ -462,7 +539,7 @@ assert_no_line "$case_log" "ARG=build"
 assert_line "$case_log" "ARG=claude"
 [ -f "$claude_shadow_home/profile-sentinel" ] \
   || fail "warm Claude run lost its isolated shadow HOME"
-pass "profile images, metadata, commands, and shadow HOMEs remain isolated"
+pass "official native channels, installer metadata, images, and shadow HOMEs remain isolated"
 
 tests_run=$((tests_run + 1))
 new_case profile_scoped_image_ref
@@ -555,14 +632,127 @@ if run_program "$repo_root/grok-container" --version \
 fi
 assert_contains "$case_dir/disabled.err" "Profile 'grok' is experimental"
 [ ! -s "$case_log" ] || fail "disabled Grok contacted the Apple runtime"
+[ ! -s "$case_curl_log" ] || fail "disabled Grok contacted its version channel"
 
 AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
 run_program "$repo_root/grok-container" "argument with spaces" \
   >"$case_dir/enabled.out" 2>"$case_dir/enabled.err"
+assert_contains "$case_dir/enabled.err" "Resolved Grok CLI latest channel to 0.2.114"
+assert_line "$case_curl_log" "URL=https://x.ai/cli/stable"
+assert_native_installer_build_args \
+  "$case_log" \
+  grok \
+  https://x.ai/cli/install.sh \
+  bash \
+  '' \
+  GROK_BIN_DIR \
+  '' \
+  '' \
+  0.2.114 \
+  grok
 assert_line "$case_log" "ARG=agent-container-grok:latest"
 assert_line "$case_log" "ARG=grok"
 assert_line "$case_log" "ARG=argument with spaces"
-pass "experimental Grok remains gated until explicitly enabled"
+pass "experimental Grok gates its official native channel and installer metadata"
+
+tests_run=$((tests_run + 1))
+new_case floating_native_latest
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+FAKE_GROK_LATEST_VERSION=0.2.114
+run_program "$repo_root/grok-container" --version \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+assert_contains "$case_dir/first.err" "Resolved Grok CLI latest channel to 0.2.114"
+assert_line "$case_curl_log" "URL=https://x.ai/cli/stable"
+assert_line "$case_log" "ARG=AGENT_VERSION=0.2.114"
+
+: > "$case_log"
+: > "$case_curl_log"
+run_program "$repo_root/grok-container" --version \
+  >"$case_dir/warm.out" 2>"$case_dir/warm.err"
+assert_line "$case_curl_log" "URL=https://x.ai/cli/stable"
+assert_no_line "$case_log" "ARG=build"
+
+: > "$case_log"
+: > "$case_curl_log"
+FAKE_GROK_LATEST_VERSION=0.2.115
+run_program "$repo_root/grok-container" --version \
+  >"$case_dir/updated.out" 2>"$case_dir/updated.err"
+assert_contains "$case_dir/updated.err" "Resolved Grok CLI latest channel to 0.2.115"
+assert_line "$case_curl_log" "URL=https://x.ai/cli/stable"
+assert_line "$case_log" "ARG=build"
+assert_line "$case_log" "ARG=AGENT_VERSION=0.2.115"
+pass "an unchanged native latest channel is warm and a moved channel rebuilds"
+
+tests_run=$((tests_run + 1))
+new_case malicious_plain_version_response
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+malicious_version_sentinel="$case_dir/version-response-was-executed"
+FAKE_VERSION_RESPONSE_OVERRIDE='0.2.114;touch '"$malicious_version_sentinel"
+if run_program "$repo_root/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a malicious native version response should fail closed"
+fi
+assert_contains "$case_dir/err" "version channel returned an invalid exact version"
+assert_line "$case_curl_log" "URL=https://x.ai/cli/stable"
+[ ! -e "$malicious_version_sentinel" ] \
+  || fail "native version metadata was evaluated as shell code"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=start"
+pass "plain native version metadata is validated as inert data"
+
+tests_run=$((tests_run + 1))
+new_case malformed_rust_version_response
+FAKE_VERSION_RESPONSE_OVERRIDE='{"tag_name":"rust-v0.146.0"'
+if run_program "$repo_root/codex-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "malformed Codex release JSON should fail closed"
+fi
+assert_contains "$case_dir/err" "version channel returned an invalid exact version"
+assert_line "$case_curl_log" "URL=https://releases.openai.com/codex/channels/latest"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=start"
+pass "Codex rust-v release JSON must satisfy the exact channel format"
+
+tests_run=$((tests_run + 1))
+new_case native_latest_lookup_failure
+FAKE_VERSION_LOOKUP_FAIL=true
+if run_program "$repo_root/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a failed native latest lookup should fail closed"
+fi
+assert_contains "$case_dir/err" "Unable to resolve the Claude Code latest channel"
+assert_line "$case_curl_log" "URL=https://downloads.claude.ai/claude-code-releases/latest"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=start"
+pass "native channel fetch failures stop before image or Agent execution"
+
+tests_run=$((tests_run + 1))
+new_case exact_version_override
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+AGENT_CONTAINER_VERSION=0.2.110
+FAKE_VERSION_LOOKUP_FAIL=true
+run_program "$repo_root/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+[ ! -s "$case_curl_log" ] \
+  || fail "an exact version override still contacted the floating channel"
+assert_line "$case_log" "ARG=AGENT_VERSION=0.2.110"
+assert_line "$case_log" "ARG=AGENT_INSTALLER_URL=https://x.ai/cli/install.sh"
+pass "an exact native version bypasses channel lookup for rollback and offline use"
+
+tests_run=$((tests_run + 1))
+new_case unsupported_version_tag
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+AGENT_CONTAINER_VERSION=beta
+if run_program "$repo_root/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "an unsupported native version tag should be rejected"
+fi
+assert_contains "$case_dir/err" "must be 'latest' or an exact native CLI version"
+[ ! -s "$case_curl_log" ] \
+  || fail "an invalid explicit version contacted the floating channel"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=start"
+pass "only the official latest channel or an exact native version is accepted"
 
 tests_run=$((tests_run + 1))
 new_case global_profile_lock
@@ -1191,6 +1381,19 @@ awk '
 ' "$case_log" \
   || fail "launcher did not confirm normal post-start auto-removal"
 pass "normal --rm absence is quiet and create IDs never leak to Agent stdout"
+
+tests_run=$((tests_run + 1))
+new_case post_start_auto_remove_race
+FAKE_POST_START_INSPECT_MODE=retain
+FAKE_CONTAINER_DELETE_ABSENT_RACE=true
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" "ARG=delete"
+assert_line "$case_log" "ARG=list"
+assert_not_contains "$case_dir/err" "Could not remove stopped"
+[ ! -e "$case_home/fake-created-container.json" ] \
+  || fail "auto-remove race left fake container state"
+pass "post-start delete race is quiet after --rm already removed the container"
 
 tests_run=$((tests_run + 1))
 new_case post_start_inspect_indeterminate

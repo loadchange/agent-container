@@ -1,6 +1,6 @@
 # Architecture: a macOS-native runtime for Agent CLIs
 
-Date: 2026-07-29
+Date: 2026-07-30
 Validated upstream versions: `apple/container` 1.2.0 and
 `apple/containerization` 0.40.1.
 
@@ -13,8 +13,9 @@ short-lived Micro-VM managed by Apple's Containerization stack.
 
 Claude Code, Codex CLI, and Grok CLI are profiles of the same runtime. The core
 owns isolation, lifecycle, identity, mounts, and safety checks; a profile owns
-only the Agent package metadata and command. This separation is the foundation
-for adding more Agent CLIs without copying the launcher.
+only the official native-installer contract, release-channel metadata, and
+command. This separation is the foundation for adding more Agent CLIs without
+copying the launcher.
 
 ## Decision: use Apple's `container` CLI
 
@@ -31,7 +32,7 @@ agent-container (Bash host launcher)
       -> one container-runtime-linux helper per session
         -> Virtualization.framework Micro-VM
           -> optimized Linux kernel + vminitd
-          -> pinned linux/arm64 Agent CLI
+          -> exact publisher-channel-resolved linux/arm64 native Agent CLI
 ```
 
 Directly embedding Containerization would make this project responsible for
@@ -53,10 +54,46 @@ general-purpose VM whose default read-write home sharing is broader than this
 project needs. Each invocation instead creates a named, auto-remove container
 with an ephemeral Linux root and a narrowly selected set of host shares.
 
-## Image model and APFS copy-on-write
+## Native image model and APFS copy-on-write
 
-The shared `Containerfile` installs one pinned npm Agent package selected by a
-profile. It also includes common development tools and the generic entrypoint.
+The shared `Containerfile` starts from Debian Bookworm slim rather than a
+language-runtime image. Its default is the Linux arm64 manifest pinned as:
+
+```text
+mirror.gcr.io/library/debian:bookworm-slim@sha256:9b67294679b30e5d6ab257b40594feeb4a4b81f7fcf4131f4decf0d6a212a9b0
+```
+
+Node.js and npm are not installed. The image contains common development tools,
+one native Agent release, and the generic entrypoint.
+
+Every built-in profile currently selects `latest`. Before inspecting or
+building its image, every host launch queries the profile's official version
+channel: Claude's plain-text latest endpoint, Codex's JSON latest channel, or
+Grok's plain-text stable endpoint. The response must reduce to one safe exact
+version. That exact value, rather than the floating channel name, is included in
+the recipe fingerprint and passed to the official installer. An exact
+`AGENT_CONTAINER_VERSION` skips channel resolution; this allows a matching warm
+image to run without channel network access, although a missing image still
+requires a networked build.
+
+Image construction runs the selected official script with a build-only
+`HOME=/opt/agent-native` and no workspace or persistent profile mounts. Claude
+uses `https://claude.ai/install.sh` through `bash`, Codex uses
+`https://chatgpt.com/codex/install.sh` through `sh`, and Grok uses
+`https://x.ai/cli/install.sh` through `bash`. The resolved exact version is
+supplied as the installer's positional argument or documented environment
+variable, so a channel movement between resolution and build cannot silently
+select a different Agent release.
+
+After installation the recipe resolves the command target, requires `file` to
+identify a Linux ELF64 ARM aarch64 executable, and requires the version probe
+to report the resolved version. Claude and Grok require no adjacent installer
+tree, so their single ELF is copied to `/usr/local/bin` and the temporary tree
+is removed. Claude links against Debian's glibc; Grok is statically linked.
+Codex retains its full versioned standalone tree under
+`/opt/agent-native/.codex/packages/standalone/`, including its adjacent code-mode
+host, `rg`, `bwrap`, and resources; `/usr/local/bin/codex` links into that tree.
+
 Within the project's lifecycle locks and same-user trust boundary, the image
 descriptor selected for a session is treated as immutable. An external
 same-user `container image delete` or prune can still make startup fail, but it
@@ -67,10 +104,10 @@ backing filesystem such as APFS, its filesystem copy path uses `clonefile`
 copy-on-write semantics rather than sharing one writable installation volume.
 Consequently:
 
-- the exact top-level Agent package version and local image identity are
+- the exact channel-resolved native Agent version and local image identity are
   auditable;
 - warm sessions reuse cached image content;
-- concurrent image roots do not share a writable npm installation;
+- concurrent image roots do not share a writable Agent installation;
 - changing the profile, requested Agent version, base image, Containerfile,
   context allowlist, or entrypoint invalidates the launcher build fingerprint.
 
@@ -109,6 +146,13 @@ wholesale; the workspace and any explicitly enabled capability paths are
 separate, narrower shares. Agent login state, settings, histories, and caches
 written below `$HOME` therefore persist for that profile without being shared
 with another profile or with the native macOS installation.
+
+The build-only installer HOME is unrelated to this runtime shadow HOME. At
+runtime the launcher also sets the profile-declared updater-disable variable
+when one exists: `DISABLE_AUTOUPDATER=1` for Claude and
+`GROK_DISABLE_AUTOUPDATER=1` for Grok. Release changes are therefore handled by
+the host's channel resolution and fingerprinted image replacement rather than
+an updater mutating a session root.
 
 The repository root is mounted at its original absolute path. The original
 current directory becomes the guest working directory. This preserves project
@@ -180,10 +224,10 @@ stale session staging. Missing or contradictory provenance is never guessed.
 | Core runtime | Agent profile |
 |---|---|
 | macOS/Apple silicon/version preflight | display name and stable/preview/experimental status |
-| Apple service, VM, PTY, signals, cleanup | npm package and pinned version |
+| Apple service, VM, PTY, signals, cleanup | official installer URL, shell, and exact-version interface |
 | UID/GID and shadow HOME | installed command and version probe |
-| workspace, Git, and capability mounts | declared API-key environment variable |
-| image cache and provenance | optional auto-update disable variable |
+| workspace, Git, and capability mounts | official version endpoint and response format |
+| image cache and provenance | API-key and optional auto-update-disable variables |
 | VirtioFS file/FD/vnode guards | no shell fragments or arbitrary host mounts |
 
 Profiles are validated JSON data and are never sourced as shell. See

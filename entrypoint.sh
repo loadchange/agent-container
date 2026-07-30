@@ -35,9 +35,9 @@ esac
 }
 
 # Add or safely adapt a passwd entry without recursively changing ownership.
-# Bind mounts retain macOS numeric ownership under VirtioFS. Node images ship
-# a UID 1000 user whose passwd HOME is /home/node; if a macOS account happens
-# to use that UID, getpwuid consumers must still see the isolated shadow HOME.
+# Bind mounts retain macOS numeric ownership under VirtioFS. If the base image
+# already has the host UID, getpwuid consumers must still see the isolated
+# shadow HOME.
 if ! getent group "$runtime_gid" >/dev/null 2>&1; then
   printf 'agent-host:x:%s:\n' "$runtime_gid" >> /etc/group
 fi

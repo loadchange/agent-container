@@ -1,13 +1,20 @@
 {
-  "schema": 1,
+  "schema": 2,
   "id": "grok",
   "displayName": "Grok CLI",
   "status": "experimental",
-  "installerKind": "npm",
-  "package": "@xai-official/grok",
-  "version": "0.2.110",
+  "installerKind": "native-script",
+  "installerUrl": "https://x.ai/cli/install.sh",
+  "installerShell": "bash",
+  "installerVersionUrl": "https://x.ai/cli/stable",
+  "installerVersionFormat": "plain-semver",
+  "installerVersionEnv": "",
+  "installerBinDirEnv": "GROK_BIN_DIR",
+  "installerHomeEnv": "",
+  "installerNonInteractiveEnv": "",
+  "version": "latest",
   "command": "grok",
   "probeArg": "--version",
   "apiKeyEnv": "XAI_API_KEY",
-  "disableAutoUpdateEnv": ""
+  "disableAutoUpdateEnv": "GROK_DISABLE_AUTOUPDATER"
 }

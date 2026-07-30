@@ -20,7 +20,6 @@ jobs:
             claude-container \
             codex-container \
             grok-container \
-            claude-docker \
             entrypoint.sh \
             install.sh \
             uninstall.sh \
@@ -36,7 +35,6 @@ jobs:
           test -x claude-container
           test -x codex-container
           test -x grok-container
-          test -x claude-docker
           test -x entrypoint.sh
           test -x install.sh
           test -x uninstall.sh
@@ -50,7 +48,6 @@ jobs:
             claude-container \
             codex-container \
             grok-container \
-            claude-docker \
             Containerfile \
             Containerfile.dockerignore \
             entrypoint.sh \

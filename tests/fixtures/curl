@@ -1,0 +1,61 @@
+#!/bin/bash
+set -euo pipefail
+
+output_file=""
+request_url=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output|-o)
+      output_file="${2:-}"
+      shift 2
+      ;;
+    --connect-timeout|--max-time|--max-filesize|--proto)
+      shift 2
+      ;;
+    --tlsv1.2|--fail|--silent|--show-error|--location)
+      shift
+      ;;
+    http://*|https://*)
+      request_url="$1"
+      shift
+      ;;
+    *)
+      echo "unexpected fake curl argument: $1" >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [ -n "${FAKE_CURL_LOG:-}" ]; then
+  printf 'URL=%s\n' "$request_url" >> "$FAKE_CURL_LOG"
+fi
+
+case "$request_url" in
+  https://downloads.claude.ai/claude-code-releases/latest)
+    payload=$(printf '%s\n' "${FAKE_CLAUDE_LATEST_VERSION:-2.1.220}")
+    ;;
+  https://releases.openai.com/codex/channels/latest)
+    payload=$(printf '{"tag_name":"%s"}\n' "${FAKE_CODEX_LATEST_TAG:-rust-v0.146.0}")
+    ;;
+  https://x.ai/cli/stable)
+    payload=$(printf '%s\n' "${FAKE_GROK_LATEST_VERSION:-0.2.114}")
+    ;;
+  *)
+    echo "unexpected fake curl URL: $request_url" >&2
+    exit 64
+    ;;
+esac
+
+if [ "${FAKE_VERSION_LOOKUP_FAIL:-false}" = true ]; then
+  exit 22
+fi
+
+if [ -n "${FAKE_VERSION_RESPONSE_OVERRIDE:-}" ]; then
+  payload=$FAKE_VERSION_RESPONSE_OVERRIDE
+fi
+
+if [ -n "$output_file" ]; then
+  printf '%s' "$payload" > "$output_file"
+else
+  printf '%s' "$payload"
+fi

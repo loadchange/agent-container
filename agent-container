@@ -6,7 +6,7 @@ readonly MIN_CONTAINER_VERSION="1.2.0"
 readonly MAX_PROFILE_ID_LENGTH=32
 readonly VIRTIOFS_ISSUE_URL="https://github.com/apple/container/issues/1097"
 readonly OWNERSHIP_MARKER_TEXT="managed by agent-container"
-readonly DEFAULT_BASE_IMAGE="docker.io/library/node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3"
+readonly DEFAULT_BASE_IMAGE="mirror.gcr.io/library/debian:bookworm-slim@sha256:9b67294679b30e5d6ab257b40594feeb4a4b81f7fcf4131f4decf0d6a212a9b0"
 
 die() {
   echo "Error: $*" >&2
@@ -249,6 +249,11 @@ validate_env_name() {
   esac
 }
 
+valid_agent_version() {
+  printf '%s\n' "$1" \
+    | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9][A-Za-z0-9._-]*)?(\+[A-Za-z0-9][A-Za-z0-9._-]*)?$'
+}
+
 valid_profile_id() {
   [ "${#1}" -le "$MAX_PROFILE_ID_LENGTH" ] || return 1
   case "$1" in
@@ -283,7 +288,14 @@ function run(argv) {
     'displayName',
     'status',
     'installerKind',
-    'package',
+    'installerUrl',
+    'installerShell',
+    'installerVersionUrl',
+    'installerVersionFormat',
+    'installerVersionEnv',
+    'installerBinDirEnv',
+    'installerHomeEnv',
+    'installerNonInteractiveEnv',
     'version',
     'command',
     'probeArg',
@@ -305,7 +317,7 @@ function run(argv) {
   const expectedKeys = keys.slice().sort();
   if (actualKeys.length !== expectedKeys.length
       || actualKeys.some((key, index) => key !== expectedKeys[index])) {
-    throw new Error('profile keys do not match schema 1');
+    throw new Error('profile keys do not match schema 2');
   }
   if (!Number.isInteger(value.schema)) {
     throw new Error('schema must be an integer');
@@ -318,7 +330,7 @@ function run(argv) {
   return keys.map((key) => String(value[key])).join('\u001f');
 }
 JXA
-  ) || die "Agent profile '$profile_id' is not valid schema-1 JSON."
+  ) || die "Agent profile '$profile_id' is not valid schema-2 JSON."
 
   IFS=$'\037' read -r \
     profile_schema \
@@ -326,7 +338,14 @@ JXA
     profile_display_name \
     profile_status \
     profile_installer_kind \
-    profile_package \
+    profile_installer_url \
+    profile_installer_shell \
+    profile_installer_version_url \
+    profile_installer_version_format \
+    profile_installer_version_env \
+    profile_installer_bin_dir_env \
+    profile_installer_home_env \
+    profile_installer_noninteractive_env \
     profile_version \
     profile_command \
     profile_probe_arg \
@@ -335,7 +354,7 @@ JXA
 $profile_record
 EOF
 
-  [ "$profile_schema" = 1 ] \
+  [ "$profile_schema" = 2 ] \
     || die "Unsupported schema '$profile_schema' in profile '$profile_id'."
   [ "$profile_declared_id" = "$profile_id" ] \
     || die "Profile id '$profile_declared_id' does not match filename '$profile_id.json'."
@@ -353,14 +372,42 @@ EOF
       ;;
     *) die "Profile '$profile_id' has unsupported status '$profile_status'." ;;
   esac
-  [ "$profile_installer_kind" = npm ] \
+  [ "$profile_installer_kind" = native-script ] \
     || die "Profile '$profile_id' uses unsupported installerKind '$profile_installer_kind'."
-  printf '%s\n' "$profile_package" \
-    | grep -Eq '^(@[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|[A-Za-z0-9][A-Za-z0-9._-]*)$' \
-    || die "Profile '$profile_id' has an unsafe npm package."
-  printf '%s\n' "$profile_version" \
-    | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([A-Za-z0-9._+-]*)$' \
-    || die "Profile '$profile_id' must pin an exact package version."
+  case "$profile_installer_url" in
+    https://*) ;;
+    *) die "Profile '$profile_id' must use an HTTPS native installer URL." ;;
+  esac
+  case "$profile_installer_url" in
+    *[!A-Za-z0-9._:/-]*) die "Profile '$profile_id' has an unsafe installerUrl." ;;
+  esac
+  case "$profile_installer_shell" in
+    bash|sh) ;;
+    *) die "Profile '$profile_id' has an unsupported installerShell." ;;
+  esac
+  case "$profile_installer_version_url" in
+    https://*) ;;
+    *) die "Profile '$profile_id' must use an HTTPS installerVersionUrl." ;;
+  esac
+  case "$profile_installer_version_url" in
+    *[!A-Za-z0-9._:/-]*) die "Profile '$profile_id' has an unsafe installerVersionUrl." ;;
+  esac
+  case "$profile_installer_version_format" in
+    plain-semver|rust-tag-json) ;;
+    *) die "Profile '$profile_id' has an unsupported installerVersionFormat." ;;
+  esac
+  validate_env_name "$profile_installer_version_env" \
+    || die "Profile '$profile_id' has an unsafe installerVersionEnv."
+  validate_env_name "$profile_installer_bin_dir_env" \
+    || die "Profile '$profile_id' has an unsafe installerBinDirEnv."
+  validate_env_name "$profile_installer_home_env" \
+    || die "Profile '$profile_id' has an unsafe installerHomeEnv."
+  validate_env_name "$profile_installer_noninteractive_env" \
+    || die "Profile '$profile_id' has an unsafe installerNonInteractiveEnv."
+  if [ "$profile_version" != latest ]; then
+    valid_agent_version "$profile_version" \
+      || die "Profile '$profile_id' must select 'latest' or an exact native CLI version."
+  fi
   case "$profile_command" in
     ''|*[!A-Za-z0-9._-]*) die "Profile '$profile_id' has an unsafe command." ;;
   esac
@@ -1098,11 +1145,91 @@ if [ "$mount_ssh_config" = true ]; then
   done
 fi
 
-agent_version="${AGENT_CONTAINER_VERSION:-$profile_version}"
-base_image="${AGENT_CONTAINER_BASE_IMAGE:-$DEFAULT_BASE_IMAGE}"
-case "$agent_version" in
-  ''|*[!A-Za-z0-9._+-]*) die "AGENT_CONTAINER_VERSION is unsafe: $agent_version" ;;
+requested_agent_version="${AGENT_CONTAINER_VERSION:-$profile_version}"
+case "$requested_agent_version" in
+  latest)
+    curl_bin=$(command -v curl || true)
+    [ -n "$curl_bin" ] \
+      || die "curl is required to resolve the $profile_display_name latest channel."
+    agent_version_response=$(mktemp "$host_stage_dir/.agent-version-response.XXXXXX") \
+      || die "Unable to create temporary storage for native CLI version resolution."
+    if ! "$curl_bin" \
+      --fail \
+      --silent \
+      --show-error \
+      --location \
+      --connect-timeout 10 \
+      --max-time 60 \
+      --max-filesize 1048576 \
+      --proto '=https' \
+      --tlsv1.2 \
+      "$profile_installer_version_url" \
+      --output "$agent_version_response"; then
+      rm -f "$agent_version_response"
+      die "Unable to resolve the $profile_display_name latest channel from $profile_installer_version_url. Enable the host proxy (for example, proxy_on), or set AGENT_CONTAINER_VERSION to an exact version to run without the lookup."
+    fi
+    agent_version_response_size=$(wc -c < "$agent_version_response" | tr -d '[:space:]')
+    case "$agent_version_response_size" in
+      ''|*[!0-9]*)
+        rm -f "$agent_version_response"
+        die "The $profile_display_name version channel returned an invalid response size."
+        ;;
+    esac
+    if [ "$agent_version_response_size" -le 0 ] \
+      || [ "$agent_version_response_size" -gt 1048576 ]; then
+      rm -f "$agent_version_response"
+      die "The $profile_display_name version channel returned an unsafe response size."
+    fi
+    if ! agent_version=$("$osascript_bin" -l JavaScript - \
+      "$agent_version_response" "$profile_installer_version_format" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('version response is not readable UTF-8');
+  const text = ObjC.unwrap(source);
+  const format = argv[1];
+  let version;
+  if (format === 'plain-semver') {
+    if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9._-]+)?(?:\+[A-Za-z0-9._-]+)?\n?$/.test(text)) {
+      throw new Error('plain version response is not one exact semver');
+    }
+    version = text.endsWith('\n') ? text.slice(0, -1) : text;
+  } else if (format === 'rust-tag-json') {
+    const value = JSON.parse(text);
+    if (value === null || typeof value !== 'object' || Array.isArray(value)
+        || typeof value.tag_name !== 'string' || !value.tag_name.startsWith('rust-v')) {
+      throw new Error('release response has no rust-v tag_name');
+    }
+    version = value.tag_name.slice('rust-v'.length);
+  } else {
+    throw new Error('unsupported version response format');
+  }
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9._-]+)?(?:\+[A-Za-z0-9._-]+)?$/.test(version)) {
+    throw new Error('resolved version is not an exact safe semver');
+  }
+  return version;
+}
+JXA
+    ); then
+      rm -f "$agent_version_response"
+      die "The $profile_display_name version channel returned an invalid exact version."
+    fi
+    rm -f "$agent_version_response"
+    printf 'Resolved %s latest channel to %s.\n' "$profile_display_name" "$agent_version" >&2
+    ;;
+  *)
+    agent_version="$requested_agent_version"
+    valid_agent_version "$agent_version" \
+      || die "AGENT_CONTAINER_VERSION must be 'latest' or an exact native CLI version."
+    ;;
 esac
+base_image="${AGENT_CONTAINER_BASE_IMAGE:-$DEFAULT_BASE_IMAGE}"
 case "$base_image" in
   ''|*[!A-Za-z0-9._:/@-]*) die "AGENT_CONTAINER_BASE_IMAGE is unsafe: $base_image" ;;
 esac
@@ -1219,6 +1346,7 @@ if [ "$build_required" = true ]; then
   echo "Building $profile_display_name image '$image_name' (version $agent_version)..."
   build_args=(
     build
+    --progress plain
     --tag "$image_name"
     --file Containerfile
     --platform linux/arm64
@@ -1228,7 +1356,13 @@ if [ "$build_required" = true ]; then
     --label "com.loadchange.agent-container.profile=$profile_id"
     --label "com.loadchange.agent-container.recipe=$asset_fingerprint"
     --build-arg "BASE_IMAGE=$base_image"
-    --build-arg "AGENT_PACKAGE=$profile_package"
+    --build-arg "AGENT_PROFILE=$profile_id"
+    --build-arg "AGENT_INSTALLER_URL=$profile_installer_url"
+    --build-arg "AGENT_INSTALLER_SHELL=$profile_installer_shell"
+    --build-arg "AGENT_INSTALLER_VERSION_ENV=$profile_installer_version_env"
+    --build-arg "AGENT_INSTALLER_BIN_DIR_ENV=$profile_installer_bin_dir_env"
+    --build-arg "AGENT_INSTALLER_HOME_ENV=$profile_installer_home_env"
+    --build-arg "AGENT_INSTALLER_NONINTERACTIVE_ENV=$profile_installer_noninteractive_env"
     --build-arg "AGENT_VERSION=$agent_version"
     --build-arg "AGENT_COMMAND=$profile_command"
     --build-arg "AGENT_PROBE_ARG=$profile_probe_arg"
@@ -1589,7 +1723,12 @@ if "$container_bin" inspect "$container_name" \
   > "$post_start_inspect" 2>/dev/null; then
   if verify_created_container "$post_start_inspect" false; then
     if ! "$container_bin" delete --force "$container_name" >/dev/null 2>&1; then
-      warn "Could not remove stopped project-owned container '$container_name'; the next launch will retry provenance-checked recovery."
+      # With --rm, Apple container can remove the stopped record between the
+      # successful inspect above and this explicit delete. Treat that race as
+      # the normal absent state; warn only when the name still resolves.
+      if ! native_container_name_is_absent "$container_name"; then
+        warn "Could not remove stopped project-owned container '$container_name'; the next launch will retry provenance-checked recovery."
+      fi
     fi
   else
     warn "Container '$container_name' still exists after start but no longer matches its verified stopped state; it was retained for provenance-checked recovery."

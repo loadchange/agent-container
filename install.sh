@@ -4,19 +4,24 @@ set -euo pipefail
 readonly INSTALL_MARKER_TEXT="managed by agent-container installer v1"
 readonly BASE_URL="${AGENT_CONTAINER_INSTALL_BASE_URL:-https://raw.githubusercontent.com/loadchange/claude-docker/main}"
 
-COMMANDS=(
+RELEASE_COMMANDS=(
   agent-container
   claude-container
   codex-container
   grok-container
-  claude-docker
 )
+AVAILABLE_PROFILES=(
+  claude
+  codex
+  grok
+)
+COMMANDS=()
+SELECTED_PROFILES=()
 ASSETS=(
   agent-container
   claude-container
   codex-container
   grok-container
-  claude-docker
   Containerfile
   Containerfile.dockerignore
   entrypoint.sh
@@ -28,6 +33,97 @@ ASSETS=(
 die() {
   echo "Error: $*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: install.sh [--all | --profile PROFILE ...]
+
+Install agent-container plus selected compatibility commands.
+
+Options:
+  --profile PROFILE   Install one profile (claude, codex, or grok).
+                      May be repeated to install multiple profiles.
+  --all               Install all profiles explicitly (the default).
+  -h, --help          Show this help.
+
+Examples:
+  ./install.sh
+  ./install.sh --all
+  ./install.sh --profile grok
+  ./install.sh --profile claude --profile codex
+
+The selected profiles are the desired managed set. Re-running with a different
+selection removes only unselected commands that this project can prove it
+owns. Unknown or user-owned files are never removed.
+EOF
+}
+
+usage_die() {
+  echo "Error: $*" >&2
+  echo "Try 'install.sh --help' for usage." >&2
+  exit 64
+}
+
+profile_is_available() {
+  local requested_profile="$1"
+  local available_profile
+  for available_profile in "${AVAILABLE_PROFILES[@]}"; do
+    [ "$available_profile" = "$requested_profile" ] && return 0
+  done
+  return 1
+}
+
+select_profile() {
+  local requested_profile="$1"
+  local selected_profile
+  profile_is_available "$requested_profile" \
+    || usage_die "Unknown profile '$requested_profile'; expected claude, codex, or grok."
+  if [ "${#SELECTED_PROFILES[@]}" -gt 0 ]; then
+    for selected_profile in "${SELECTED_PROFILES[@]}"; do
+      [ "$selected_profile" = "$requested_profile" ] && return 0
+    done
+  fi
+  SELECTED_PROFILES[${#SELECTED_PROFILES[@]}]="$requested_profile"
+}
+
+profile_is_selected() {
+  local requested_profile="$1"
+  local selected_profile
+  for selected_profile in "${SELECTED_PROFILES[@]}"; do
+    [ "$selected_profile" = "$requested_profile" ] && return 0
+  done
+  return 1
+}
+
+command_is_selected() {
+  local requested_command="$1"
+  local selected_profile
+  [ "$requested_command" = agent-container ] && return 0
+  for selected_profile in "${SELECTED_PROFILES[@]}"; do
+    [ "$requested_command" = "$selected_profile-container" ] && return 0
+  done
+  return 1
+}
+
+asset_is_selected() {
+  local requested_asset="$1"
+  local asset_profile
+  case "$requested_asset" in
+    agent-container|Containerfile|Containerfile.dockerignore|entrypoint.sh)
+      return 0
+      ;;
+    *-container)
+      asset_profile=${requested_asset%-container}
+      profile_is_selected "$asset_profile"
+      ;;
+    profiles/*.json)
+      asset_profile=${requested_asset#profiles/}
+      asset_profile=${asset_profile%.json}
+      profile_is_selected "$asset_profile"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 warn() {
@@ -107,14 +203,69 @@ is_recognized_regular_command() {
       grep -Fq 'apple/container/issues/1097' "$command_path" \
         && grep -Eq 'PROGRAM_NAME="(agent-container|claude-container)"' "$command_path"
       ;;
-    claude-docker)
-      grep -Fq 'IMAGE_NAME="claude-code-docker"' "$command_path" \
-        && grep -Fq 'VOLUME_NAME="claude-code-local"' "$command_path" \
-        && grep -Fq 'CONTAINER_CLAUDE_HOME=' "$command_path"
-      ;;
     *) return 1 ;;
   esac
 }
+
+selection_mode=default
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --all)
+      [ "$selection_mode" != profiles ] \
+        || usage_die "--all cannot be combined with --profile."
+      selection_mode=all
+      shift
+      ;;
+    --profile)
+      [ "$selection_mode" != all ] \
+        || usage_die "--profile cannot be combined with --all."
+      [ "$#" -ge 2 ] || usage_die "--profile requires a profile name."
+      selection_mode=profiles
+      select_profile "$2"
+      shift 2
+      ;;
+    --profile=*)
+      [ "$selection_mode" != all ] \
+        || usage_die "--profile cannot be combined with --all."
+      profile_value=${1#--profile=}
+      [ -n "$profile_value" ] || usage_die "--profile requires a profile name."
+      selection_mode=profiles
+      select_profile "$profile_value"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      usage_die "Positional arguments are not supported."
+      ;;
+    -*|*)
+      usage_die "Unknown argument '$1'."
+      ;;
+  esac
+done
+
+if [ "$selection_mode" != profiles ]; then
+  for profile_id in "${AVAILABLE_PROFILES[@]}"; do
+    select_profile "$profile_id"
+  done
+fi
+
+# Canonical profile order makes the same set reuse the same immutable release
+# regardless of argument order or duplicate --profile flags.
+ORDERED_PROFILES=()
+for profile_id in "${AVAILABLE_PROFILES[@]}"; do
+  if profile_is_selected "$profile_id"; then
+    ORDERED_PROFILES[${#ORDERED_PROFILES[@]}]="$profile_id"
+  fi
+done
+SELECTED_PROFILES=("${ORDERED_PROFILES[@]}")
+
+COMMANDS=(agent-container)
+for profile_id in "${SELECTED_PROFILES[@]}"; do
+  COMMANDS[${#COMMANDS[@]}]="$profile_id-container"
+done
 
 # Refuse unsupported hosts before downloads, temporary directories, locks, or
 # installed paths are created. The Apple container package/service itself may
@@ -179,7 +330,7 @@ command_tmps=()
 command_backups=()
 command_backed_up=()
 command_switched=()
-command_needs_switch=()
+command_actions=()
 
 cleanup() {
   local status=$?
@@ -188,7 +339,7 @@ cleanup() {
   set +e
 
   if [ "$transaction_complete" != true ]; then
-    i=$((${#COMMANDS[@]} - 1))
+    i=$((${#RELEASE_COMMANDS[@]} - 1))
     while [ "$i" -ge 0 ]; do
       if [ "${command_switched[$i]:-false}" = true ]; then
         rm -f -- "${command_paths[$i]}"
@@ -248,7 +399,7 @@ ignore_signals
 tmp_dir=$(mktemp -d)
 restore_signal_traps
 
-echo "Installing agent-container and compatibility commands..."
+echo "Installing profiles: ${SELECTED_PROFILES[*]}"
 
 curl --fail --silent --show-error --location --retry 3 \
   "${BASE_URL%/}/release-manifest.sha256" \
@@ -297,7 +448,6 @@ bash -n \
   "$tmp_dir/claude-container" \
   "$tmp_dir/codex-container" \
   "$tmp_dir/grok-container" \
-  "$tmp_dir/claude-docker" \
   "$tmp_dir/entrypoint.sh" \
   || die "A downloaded shell asset failed validation."
 grep -Eq '^[[:space:]]*(ARG[[:space:]]+BASE_IMAGE|FROM[[:space:]])' "$tmp_dir/Containerfile" \
@@ -317,9 +467,14 @@ for profile_id in claude codex grok; do
 done
 
 release_id=$(
-  for ((asset_index = 0; asset_index < ${#ASSETS[@]}; asset_index++)); do
-    printf '%s  %s\n' "${manifest_hashes[$asset_index]}" "${ASSETS[$asset_index]}"
-  done | sha256_stream
+  {
+    for ((asset_index = 0; asset_index < ${#ASSETS[@]}; asset_index++)); do
+      printf '%s  %s\n' "${manifest_hashes[$asset_index]}" "${ASSETS[$asset_index]}"
+    done
+    for profile_id in "${SELECTED_PROFILES[@]}"; do
+      printf 'selected-profile  %s\n' "$profile_id"
+    done
+  } | sha256_stream
 )
 case "$release_id" in
   *[!0-9a-f]*) die "Could not calculate a valid release fingerprint." ;;
@@ -439,12 +594,34 @@ if path_exists "$release_dir"; then
     && [ ! -L "$release_dir/release-manifest.sha256" ] \
     && cmp -s "$tmp_dir/release-manifest.sha256" "$release_dir/release-manifest.sha256" \
     || die "Existing release is incomplete or modified: $release_dir"
+  [ -d "$release_dir/profiles" ] && [ ! -L "$release_dir/profiles" ] \
+    || die "Existing release has an unsafe profiles directory: $release_dir"
   for asset in "${ASSETS[@]}"; do
-    [ -f "$release_dir/$asset" ] \
-      && [ ! -L "$release_dir/$asset" ] \
-      && cmp -s "$tmp_dir/$asset" "$release_dir/$asset" \
-      || die "Existing release is incomplete or modified: $release_dir"
+    if asset_is_selected "$asset"; then
+      [ -f "$release_dir/$asset" ] \
+        && [ ! -L "$release_dir/$asset" ] \
+        && cmp -s "$tmp_dir/$asset" "$release_dir/$asset" \
+        || die "Existing release is incomplete or modified: $release_dir"
+    else
+      ! path_exists "$release_dir/$asset" \
+        || die "Existing release contains an unselected asset: $release_dir/$asset"
+    fi
   done
+  release_root_listing="$tmp_dir/existing-release-root-list"
+  find "$release_dir" -mindepth 1 -maxdepth 1 -print \
+    > "$release_root_listing" 2>/dev/null \
+    || die "Could not safely enumerate the existing release: $release_dir"
+  release_root_count=$(wc -l < "$release_root_listing" | tr -d '[:space:]')
+  expected_root_count=$((7 + ${#SELECTED_PROFILES[@]}))
+  [ "$release_root_count" = "$expected_root_count" ] \
+    || die "Existing release contains unexpected root entries: $release_dir"
+  release_profile_listing="$tmp_dir/existing-release-profile-list"
+  find "$release_dir/profiles" -mindepth 1 -maxdepth 1 -print \
+    > "$release_profile_listing" 2>/dev/null \
+    || die "Could not safely enumerate the existing profiles: $release_dir"
+  release_profile_count=$(wc -l < "$release_profile_listing" | tr -d '[:space:]')
+  [ "$release_profile_count" = "${#SELECTED_PROFILES[@]}" ] \
+    || die "Existing release contains unexpected profile entries: $release_dir"
 else
   ignore_signals
   stage_dir=$(mktemp -d "$releases_dir/.staging.XXXXXX")
@@ -459,7 +636,7 @@ else
     "$tmp_dir/Containerfile.dockerignore" \
     "$stage_dir/Containerfile.dockerignore"
   install -m 0755 "$tmp_dir/entrypoint.sh" "$stage_dir/entrypoint.sh"
-  for profile_id in claude codex grok; do
+  for profile_id in "${SELECTED_PROFILES[@]}"; do
     install -m 0644 "$tmp_dir/profiles/$profile_id.json" "$stage_dir/profiles/$profile_id.json"
   done
   install -m 0444 "$tmp_dir/release-manifest.sha256" "$stage_dir/release-manifest.sha256"
@@ -475,50 +652,53 @@ current_path="$asset_root/current"
 current_tmp="$asset_root/.current.new.$$"
 current_backup="$asset_root/.current.rollback.$$"
 
-for ((command_index = 0; command_index < ${#COMMANDS[@]}; command_index++)); do
-  command_name=${COMMANDS[$command_index]}
+for ((command_index = 0; command_index < ${#RELEASE_COMMANDS[@]}; command_index++)); do
+  command_name=${RELEASE_COMMANDS[$command_index]}
   command_paths[$command_index]="$install_dir/$command_name"
   command_tmps[$command_index]="$install_dir/.$command_name.new.$$"
   command_backups[$command_index]="$install_dir/.$command_name.rollback.$$"
   command_backed_up[$command_index]=false
   command_switched[$command_index]=false
-  command_needs_switch[$command_index]=true
+  command_actions[$command_index]=ignore
 done
 
 for reserved_path in "$current_tmp" "$current_backup"; do
   ! path_exists "$reserved_path" \
     || die "Refusing to overwrite a transaction path: $reserved_path"
 done
-for ((command_index = 0; command_index < ${#COMMANDS[@]}; command_index++)); do
+for ((command_index = 0; command_index < ${#RELEASE_COMMANDS[@]}; command_index++)); do
   for reserved_path in "${command_tmps[$command_index]}" "${command_backups[$command_index]}"; do
     ! path_exists "$reserved_path" \
       || die "Refusing to overwrite a transaction path: $reserved_path"
   done
 
-  command_name=${COMMANDS[$command_index]}
+  command_name=${RELEASE_COMMANDS[$command_index]}
   command_path=${command_paths[$command_index]}
-  if [ -d "$command_path" ] && [ ! -L "$command_path" ]; then
-    die "Refusing to replace a directory at command path: $command_path"
-  fi
-  if path_exists "$command_path" \
-    && [ ! -f "$command_path" ] \
-    && [ ! -L "$command_path" ]; then
-    die "Refusing to replace a non-regular command path: $command_path"
-  fi
-  if [ -L "$command_path" ] \
+  if command_is_selected "$command_name"; then
+    command_actions[$command_index]=switch
+    if [ -L "$command_path" ] \
+      && [ "$(readlink "$command_path")" = "$asset_root/current/$command_name" ]; then
+      command_actions[$command_index]=keep
+    elif path_exists "$command_path"; then
+      [ -f "$command_path" ] \
+        && [ ! -L "$command_path" ] \
+        && is_recognized_regular_command "$command_path" "$command_name" \
+        || die "Refusing to replace an unrecognized command: $command_path"
+    fi
+  elif [ -L "$command_path" ] \
     && [ "$(readlink "$command_path")" = "$asset_root/current/$command_name" ]; then
-    command_needs_switch[$command_index]=false
-  elif path_exists "$command_path"; then
-    [ ! -L "$command_path" ] \
-      && is_recognized_regular_command "$command_path" "$command_name" \
-      || die "Refusing to replace an unrecognized command: $command_path"
+    command_actions[$command_index]=remove
+  elif [ -f "$command_path" ] \
+    && [ ! -L "$command_path" ] \
+    && is_recognized_regular_command "$command_path" "$command_name"; then
+    command_actions[$command_index]=remove
   fi
 done
 
 ln -s "releases/$release_id" "$current_tmp"
-for ((command_index = 0; command_index < ${#COMMANDS[@]}; command_index++)); do
-  if [ "${command_needs_switch[$command_index]}" = true ]; then
-    ln -s "$asset_root/current/${COMMANDS[$command_index]}" \
+for ((command_index = 0; command_index < ${#RELEASE_COMMANDS[@]}; command_index++)); do
+  if [ "${command_actions[$command_index]}" = switch ]; then
+    ln -s "$asset_root/current/${RELEASE_COMMANDS[$command_index]}" \
       "${command_tmps[$command_index]}"
   fi
 done
@@ -535,14 +715,17 @@ fi
 current_switched=true
 atomic_replace "$current_tmp" "$current_path"
 
-for ((command_index = 0; command_index < ${#COMMANDS[@]}; command_index++)); do
-  if [ "${command_needs_switch[$command_index]}" = true ]; then
+for ((command_index = 0; command_index < ${#RELEASE_COMMANDS[@]}; command_index++)); do
+  if [ "${command_actions[$command_index]}" = switch ]; then
     if path_exists "${command_paths[$command_index]}"; then
       command_backed_up[$command_index]=true
       mv -- "${command_paths[$command_index]}" "${command_backups[$command_index]}"
     fi
     command_switched[$command_index]=true
     atomic_replace "${command_tmps[$command_index]}" "${command_paths[$command_index]}"
+  elif [ "${command_actions[$command_index]}" = remove ]; then
+    command_backed_up[$command_index]=true
+    mv -- "${command_paths[$command_index]}" "${command_backups[$command_index]}"
   fi
 done
 
@@ -552,7 +735,7 @@ if path_exists "$current_backup"; then
   rm -rf -- "$current_backup" \
     || warn "Could not remove the previous current-release backup: $current_backup"
 fi
-for ((command_index = 0; command_index < ${#COMMANDS[@]}; command_index++)); do
+for ((command_index = 0; command_index < ${#RELEASE_COMMANDS[@]}; command_index++)); do
   if path_exists "${command_backups[$command_index]}"; then
     rm -f -- "${command_backups[$command_index]}" \
       || warn "Could not remove the previous command backup: ${command_backups[$command_index]}"
@@ -575,7 +758,7 @@ echo ""
 if command -v container >/dev/null 2>&1; then
   echo "Before the first run, start Apple container explicitly:"
   echo "  container system start"
-  echo "  claude-container"
+  echo "  ${SELECTED_PROFILES[0]}-container"
 else
   echo "Apple container is not installed. Get version 1.2.0 or newer from:"
   echo "  https://github.com/apple/container/releases"

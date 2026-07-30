@@ -194,10 +194,67 @@ large-file-count stress tests on a machine containing important unsaved work.
 
 ## Profile and image supply chain
 
-Profiles select packages installed into a network-enabled OCI build. Treat the
-profile JSON, npm package/version, base image, Containerfile, and entrypoint as
-trusted code inputs. Pin versions, review package ownership, prefer a base
-image digest for controlled deployments, and inspect changes before rebuilding.
+Profiles select official native install scripts that execute in a
+network-enabled OCI builder. Treat the profile JSON, official version endpoint,
+installer URL, installer response, base image, Debian repositories,
+`Containerfile`, and entrypoint as trusted supply-chain inputs. The builder has
+no workspace, runtime shadow HOME, API key, SSH, GitHub, or host Git mounts, so
+installer code cannot read those session capabilities. It can still modify the
+image being built and use outbound networking.
 
-Profiles are data rather than shell, but a valid profile can still select a
-malicious npm package. Schema validation is not package attestation.
+The default base is Debian Bookworm slim's Linux arm64 manifest pinned as
+`mirror.gcr.io/library/debian:bookworm-slim@sha256:9b67294679b30e5d6ab257b40594feeb4a4b81f7fcf4131f4decf0d6a212a9b0`.
+This prevents that base reference from moving, but the build's unversioned
+`apt-get` packages can change. An `AGENT_CONTAINER_BASE_IMAGE` override changes
+the trust root and is part of the recipe fingerprint.
+
+Every built-in profile follows a publisher channel. On each launch, the host
+fetches Claude's latest version, Codex's latest release JSON, or Grok's stable
+version over HTTPS and strictly reduces the response to one exact version. That
+version enters the image fingerprint and is supplied to the installer, which
+prevents a floating channel name from selecting a different release during the
+build. A malformed or unavailable channel fails closed. An exact
+`AGENT_CONTAINER_VERSION` skips this request and can reuse a matching warm image
+offline; it does not make a missing image build offline.
+
+The build then downloads the current install script from the profile's official
+HTTPS URL and executes it as `bash` or `sh` with a private
+`HOME=/opt/agent-native`. The script body itself is not digest-pinned by this
+project. TLS authenticates the configured host at download time, but does not
+make a mutable script URL reproducible or protect against a compromised
+publisher. Exact Agent version selection does not pin the installer logic.
+
+The publishers' artifact-integrity behavior is not uniform:
+
+- Claude's native installer obtains release metadata and verifies its selected
+  executable against the SHA-256 value in the publisher's manifest.
+- Codex's native installer obtains release metadata and a published checksum,
+  verifies the downloaded release, and installs a standalone tree whose helper
+  binaries and resources must remain adjacent.
+- Grok's native installer currently has no checksum or signature verification.
+  It checks that the downloaded executable runs and reports a version. The
+  image recipe additionally checks Linux arm64 ELF type and exact version, but
+  these are consistency checks, not cryptographic provenance. Grok therefore
+  relies more heavily on HTTPS and the security of `x.ai`.
+
+For all three Agents, the image recipe rejects a command that escapes the
+controlled install root, rejects a non-ELF or non-arm64 command, and rejects a
+version-probe mismatch. Claude and Grok are copied into the final image as one
+ELF each because neither requires an adjacent installer tree. Codex retains its
+complete versioned standalone directory so stripping adjacent helpers cannot
+create a subtly incomplete installation. Claude's ELF still depends on the
+glibc supplied by the pinned Debian base; Grok's ELF is statically linked.
+These layout checks do not replace publisher signatures or checksums.
+
+Profiles are data rather than shell and their URLs, shells, environment names,
+commands, and version formats are constrained. The shared recipe additionally
+binds every built-in ID to its expected official installer contract. Schema
+validation prevents several injection and redirection classes; it is not
+software attestation.
+
+At runtime, Claude receives `DISABLE_AUTOUPDATER=1` and Grok receives
+`GROK_DISABLE_AUTOUPDATER=1`. Their installed ELF therefore changes through the
+host's channel resolution and provenance-tracked image rebuild, not through an
+in-session updater. The persistent shadow HOME still contains mutable login
+state, settings, plugins, and caches; preserving it across image replacement is
+intentional and those contents remain part of the runtime trust boundary.

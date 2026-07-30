@@ -11,7 +11,6 @@ ASSETS=(
   claude-container
   codex-container
   grok-container
-  claude-docker
   Containerfile
   Containerfile.dockerignore
   entrypoint.sh
@@ -24,7 +23,6 @@ COMMANDS=(
   claude-container
   codex-container
   grok-container
-  claude-docker
 )
 
 passes=0
@@ -47,6 +45,11 @@ assert_not_contains() {
   if grep -Fq -- "$2" "$1"; then
     fail "unexpected '$2' in $1"
   fi
+}
+
+assert_path_absent() {
+  [ ! -e "$1" ] && [ ! -L "$1" ] \
+    || fail "expected path to be absent: $1"
 }
 
 sha256_file() {
@@ -88,10 +91,11 @@ make_release_source() {
 run_install() {
   local source_root="$1"
   local case_home="$2"
+  shift 2
   HOME="$case_home" \
     PATH="$fixture_path" \
     AGENT_CONTAINER_INSTALL_BASE_URL="file://$source_root" \
-    bash "$repo_root/install.sh"
+    bash "$repo_root/install.sh" "$@"
 }
 
 run_uninstall() {
@@ -147,6 +151,40 @@ assert_install_intact() {
 source_v1="$test_root/source-v1"
 make_release_source "$source_v1"
 
+# Help and selection errors are resolved before platform checks, downloads, or
+# install-path mutation, so curl-piped and scripted installs fail predictably.
+argument_home="$test_root/argument-home"
+mkdir -p "$argument_home"
+HOME="$argument_home" PATH="/usr/bin:/bin" \
+  bash "$repo_root/install.sh" --help \
+  > "$test_root/help.out" 2> "$test_root/help.err"
+assert_contains "$test_root/help.out" 'Usage: install.sh [--all | --profile PROFILE ...]'
+assert_contains "$test_root/help.out" './install.sh --profile grok'
+
+if run_install "$source_v1" "$argument_home" --profile unknown \
+  > "$test_root/unknown-profile.out" 2> "$test_root/unknown-profile.err"; then
+  fail "installer accepted an unknown profile"
+fi
+assert_contains "$test_root/unknown-profile.err" "Unknown profile 'unknown'"
+if run_install "$source_v1" "$argument_home" --profile \
+  > "$test_root/missing-profile.out" 2> "$test_root/missing-profile.err"; then
+  fail "installer accepted --profile without a value"
+fi
+assert_contains "$test_root/missing-profile.err" '--profile requires a profile name'
+if run_install "$source_v1" "$argument_home" --all --profile grok \
+  > "$test_root/mixed-selection.out" 2> "$test_root/mixed-selection.err"; then
+  fail "installer accepted conflicting selection modes"
+fi
+assert_contains "$test_root/mixed-selection.err" '--profile cannot be combined with --all'
+if run_install "$source_v1" "$argument_home" unexpected \
+  > "$test_root/positional.out" 2> "$test_root/positional.err"; then
+  fail "installer accepted a positional argument"
+fi
+assert_contains "$test_root/positional.err" "Unknown argument 'unexpected'"
+[ ! -e "$argument_home/.local" ] \
+  || fail "argument rejection mutated the install home"
+pass "installer help and profile-selection errors are deterministic and pre-mutation"
+
 # Platform checks happen before even a release-manifest fetch.
 for platform_case in non_darwin non_arm64 old_macos; do
   platform_home="$test_root/platform-$platform_case-home"
@@ -193,7 +231,7 @@ mkdir -p "$manifest_home"
 make_release_source "$manifest_source"
 printf '%s\n' '# tampered after manifest publication' \
   >> "$manifest_source/entrypoint.sh"
-if run_install "$manifest_source" "$manifest_home" \
+if run_install "$manifest_source" "$manifest_home" --profile grok \
   > "$test_root/manifest.out" 2> "$test_root/manifest.err"; then
   fail "installer accepted a manifest hash mismatch"
 fi
@@ -212,6 +250,97 @@ assert_contains "$test_root/manifest-extra.err" 'unexpected entries'
 [ ! -e "$manifest_home/.local" ] \
   || fail "extra manifest entry published install paths"
 pass "release manifest is strict and hash mismatches fail before publication"
+
+# A profile selection is the complete desired managed set. Releases contain
+# only shared assets plus the selected wrappers/profiles, and changing the set
+# removes only commands whose project provenance is known.
+selective_home="$test_root/selective-home"
+mkdir -p "$selective_home"
+run_install "$source_v1" "$selective_home" --profile grok \
+  > "$test_root/selective-grok.out" 2> "$test_root/selective-grok.err"
+selective_root=$(CDPATH= cd -- "$selective_home/.local/share/agent-container" && pwd -P)
+selective_grok_link=$(readlink "$selective_root/current")
+selective_grok_release="$selective_root/$selective_grok_link"
+for command_name in agent-container grok-container; do
+  [ -L "$selective_home/.local/bin/$command_name" ] \
+    || fail "single-profile install omitted $command_name"
+done
+for command_name in claude-container codex-container; do
+  assert_path_absent "$selective_home/.local/bin/$command_name"
+done
+for asset in \
+  agent-container grok-container Containerfile Containerfile.dockerignore \
+  entrypoint.sh profiles/grok.json; do
+  [ -f "$selective_grok_release/$asset" ] \
+    && [ ! -L "$selective_grok_release/$asset" ] \
+    || fail "single-profile release omitted $asset"
+done
+for asset in \
+  claude-container codex-container profiles/claude.json profiles/codex.json; do
+  assert_path_absent "$selective_grok_release/$asset"
+done
+[ -f "$selective_grok_release/release-manifest.sha256" ] \
+  || fail "single-profile release omitted its verified manifest"
+
+# Duplicates and argument order describe a set, not a distinct release.
+run_install "$source_v1" "$selective_home" \
+  --profile=grok --profile grok \
+  > "$test_root/selective-repeat.out" 2> "$test_root/selective-repeat.err"
+[ "$(readlink "$selective_root/current")" = "$selective_grok_link" ] \
+  || fail "duplicate profile selection created a distinct release"
+
+run_install "$source_v1" "$selective_home" \
+  --profile codex --profile claude \
+  > "$test_root/selective-multiple.out" 2> "$test_root/selective-multiple.err"
+selective_multiple_link=$(readlink "$selective_root/current")
+[ "$selective_multiple_link" != "$selective_grok_link" ] \
+  || fail "changed profile set reused the wrong release"
+selective_multiple_release="$selective_root/$selective_multiple_link"
+for command_name in agent-container claude-container codex-container; do
+  [ -L "$selective_home/.local/bin/$command_name" ] \
+    || fail "multi-profile install omitted $command_name"
+done
+assert_path_absent "$selective_home/.local/bin/grok-container"
+for asset in claude-container codex-container profiles/claude.json profiles/codex.json; do
+  [ -f "$selective_multiple_release/$asset" ] \
+    || fail "multi-profile release omitted $asset"
+done
+for asset in grok-container profiles/grok.json; do
+  assert_path_absent "$selective_multiple_release/$asset"
+done
+
+run_install "$source_v1" "$selective_home" --all \
+  > "$test_root/selective-all.out" 2> "$test_root/selective-all.err"
+for command_name in "${COMMANDS[@]}"; do
+  [ -L "$selective_home/.local/bin/$command_name" ] \
+    || fail "explicit --all omitted $command_name"
+done
+
+# An unknown file in an unselected command slot is retained, while another
+# omitted command with exact managed provenance is removed.
+rm -f "$selective_home/.local/bin/codex-container"
+printf '%s\n' 'echo user-owned codex command' \
+  > "$selective_home/.local/bin/codex-container"
+chmod 0755 "$selective_home/.local/bin/codex-container"
+run_install "$source_v1" "$selective_home" --profile grok \
+  > "$test_root/selective-replace.out" 2> "$test_root/selective-replace.err"
+[ "$(readlink "$selective_root/current")" = "$selective_grok_link" ] \
+  || fail "returning to the grok set did not reuse its release"
+assert_path_absent "$selective_home/.local/bin/claude-container"
+assert_contains "$selective_home/.local/bin/codex-container" 'echo user-owned codex command'
+
+selective_uninstall_log="$test_root/selective-uninstall.log"
+: > "$selective_uninstall_log"
+HOME="$selective_home" PATH="/usr/bin:/bin" \
+  AGENT_CONTAINER_BIN=definitely-missing-container \
+  bash "$repo_root/uninstall.sh" \
+  > "$test_root/selective-uninstall.out" 2> "$test_root/selective-uninstall.err"
+for command_name in agent-container claude-container grok-container; do
+  assert_path_absent "$selective_home/.local/bin/$command_name"
+done
+assert_path_absent "$selective_root"
+assert_contains "$selective_home/.local/bin/codex-container" 'echo user-owned codex command'
+pass "single, multiple, all, replacement, and selective uninstall sets are exact"
 
 # All generic assets and compatibility commands publish through one release.
 install_home="$test_root/install-home"
@@ -239,7 +368,7 @@ for command_name in "${COMMANDS[@]}"; do
   [ "$(readlink "$command_path")" = "$asset_root/current/$command_name" ] \
     || fail "$command_name targets the wrong release root"
 done
-for wrapper_name in claude-container codex-container grok-container claude-docker; do
+for wrapper_name in claude-container codex-container grok-container; do
   [ -x "$(dirname -- "$(readlink "$install_home/.local/bin/$wrapper_name")")/agent-container" ] \
     || fail "$wrapper_name cannot find sibling agent-container"
 done
@@ -265,7 +394,7 @@ release_count=$(find "$asset_root/releases" -mindepth 1 -maxdepth 1 -type d | wc
 [ "$release_count" = 2 ] || fail "upgrade did not retain exactly two releases"
 pass "one content-addressed release atomically carries every generic asset"
 
-# A failure while publishing the fifth stable command restores all prior files
+# A failure while publishing the fourth stable command restores all prior files
 # and the previous current release.
 rollback_home="$test_root/rollback-home"
 mkdir -p "$rollback_home"
@@ -286,7 +415,7 @@ rollback_once="$test_root/rollback-once"
 if HOME="$rollback_home" \
   PATH="$fixture_path" \
   AGENT_CONTAINER_INSTALL_BASE_URL="file://$source_v2" \
-  FAKE_MV_FAIL_DESTINATION="$rollback_bin/claude-docker" \
+  FAKE_MV_FAIL_DESTINATION="$rollback_bin/grok-container" \
   FAKE_MV_ONCE_MARKER="$rollback_once" \
   bash "$repo_root/install.sh" \
   > "$test_root/rollback.out" 2> "$test_root/rollback.err"; then
@@ -304,7 +433,55 @@ release_count=$(find "$rollback_root/releases" -mindepth 1 -maxdepth 1 -type d |
 [ "$release_count" = 1 ] || fail "failed release survived rollback"
 [ ! -e "$rollback_home/.local/share/.agent-container.install.lock" ] \
   || fail "transaction lock survived rollback"
-pass "late five-command publication failure rolls back the whole install"
+pass "late four-command publication failure rolls back the whole install"
+
+# A late failure while replacing the managed profile set restores commands
+# removed earlier in the same transaction as well as the previous current link.
+selection_rollback_home="$test_root/selection-rollback-home"
+mkdir -p "$selection_rollback_home"
+run_install "$source_v1" "$selection_rollback_home" \
+  > "$test_root/selection-rollback-install.out" \
+  2> "$test_root/selection-rollback-install.err"
+selection_rollback_root=$(CDPATH= cd -- \
+  "$selection_rollback_home/.local/share/agent-container" && pwd -P)
+selection_rollback_bin=$(CDPATH= cd -- \
+  "$selection_rollback_home/.local/bin" && pwd -P)
+selection_rollback_link=$(readlink "$selection_rollback_root/current")
+selection_rollback_release="$selection_rollback_root/$selection_rollback_link"
+rm -f "$selection_rollback_bin/grok-container"
+cp "$selection_rollback_release/grok-container" \
+  "$selection_rollback_bin/grok-container"
+chmod 0755 "$selection_rollback_bin/grok-container"
+cp "$selection_rollback_bin/grok-container" \
+  "$test_root/selection-rollback-grok-before"
+selection_rollback_once="$test_root/selection-rollback-once"
+if HOME="$selection_rollback_home" \
+  PATH="$fixture_path" \
+  AGENT_CONTAINER_INSTALL_BASE_URL="file://$source_v2" \
+  FAKE_MV_FAIL_DESTINATION="$selection_rollback_bin/grok-container" \
+  FAKE_MV_ONCE_MARKER="$selection_rollback_once" \
+  bash "$repo_root/install.sh" --profile grok \
+  > "$test_root/selection-rollback.out" \
+  2> "$test_root/selection-rollback.err"; then
+  fail "late profile-set replacement failure was hidden"
+fi
+[ "$(readlink "$selection_rollback_root/current")" = "$selection_rollback_link" ] \
+  || fail "profile-set rollback did not restore current"
+for command_name in agent-container claude-container codex-container; do
+  [ -L "$selection_rollback_bin/$command_name" ] \
+    && [ "$(readlink "$selection_rollback_bin/$command_name")" = \
+      "$selection_rollback_root/current/$command_name" ] \
+    || fail "profile-set rollback did not restore $command_name"
+done
+[ ! -L "$selection_rollback_bin/grok-container" ] \
+  && cmp -s "$test_root/selection-rollback-grok-before" \
+    "$selection_rollback_bin/grok-container" \
+  || fail "profile-set rollback did not restore regular grok-container"
+release_count=$(find "$selection_rollback_root/releases" \
+  -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')
+[ "$release_count" = 1 ] \
+  || fail "failed selective release survived profile-set rollback"
+pass "late replacement failure restores removed managed profile commands"
 
 # Unknown and special-file command collisions are never read or replaced.
 collision_home="$test_root/collision-home"
