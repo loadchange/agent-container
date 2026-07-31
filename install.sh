@@ -25,6 +25,8 @@ ASSETS=(
   Containerfile
   Containerfile.dockerignore
   entrypoint.sh
+  host-exec-client
+  host-exec-broker.mjs
   profiles/claude.json
   profiles/codex.json
   profiles/grok.json
@@ -110,7 +112,7 @@ asset_is_selected() {
   local requested_asset="$1"
   local asset_profile
   case "$requested_asset" in
-    agent-container|Containerfile|Containerfile.dockerignore|entrypoint.sh)
+    agent-container|Containerfile|Containerfile.dockerignore|entrypoint.sh|host-exec-client|host-exec-broker.mjs)
       return 0
       ;;
     *-container)
@@ -449,13 +451,17 @@ bash -n \
   "$tmp_dir/codex-container" \
   "$tmp_dir/grok-container" \
   "$tmp_dir/entrypoint.sh" \
+  "$tmp_dir/host-exec-client" \
   || die "A downloaded shell asset failed validation."
 grep -Eq '^[[:space:]]*(ARG[[:space:]]+BASE_IMAGE|FROM[[:space:]])' "$tmp_dir/Containerfile" \
   || die "The downloaded Containerfile failed validation."
 [ -f "$tmp_dir/Containerfile.dockerignore" ] \
   && grep -Fqx '**' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!entrypoint.sh' "$tmp_dir/Containerfile.dockerignore" \
+  && grep -Fqx '!host-exec-client' "$tmp_dir/Containerfile.dockerignore" \
   || die "The downloaded Containerfile.dockerignore failed validation."
+grep -Fq 'createServer' "$tmp_dir/host-exec-broker.mjs" \
+  || die "The downloaded host-exec broker failed validation."
 plutil_bin=$(command -v plutil || true)
 [ -n "$plutil_bin" ] || die "macOS plutil is required to validate Agent profiles."
 for profile_id in claude codex grok; do
@@ -612,7 +618,10 @@ if path_exists "$release_dir"; then
     > "$release_root_listing" 2>/dev/null \
     || die "Could not safely enumerate the existing release: $release_dir"
   release_root_count=$(wc -l < "$release_root_listing" | tr -d '[:space:]')
-  expected_root_count=$((7 + ${#SELECTED_PROFILES[@]}))
+  # Shared runtime files (Containerfile, dockerignore, entrypoint, host client,
+  # and host broker), agent-container, one wrapper per selected profile, the
+  # profiles directory, release manifest, and ownership marker.
+  expected_root_count=$((9 + ${#SELECTED_PROFILES[@]}))
   [ "$release_root_count" = "$expected_root_count" ] \
     || die "Existing release contains unexpected root entries: $release_dir"
   release_profile_listing="$tmp_dir/existing-release-profile-list"
@@ -636,6 +645,8 @@ else
     "$tmp_dir/Containerfile.dockerignore" \
     "$stage_dir/Containerfile.dockerignore"
   install -m 0755 "$tmp_dir/entrypoint.sh" "$stage_dir/entrypoint.sh"
+  install -m 0755 "$tmp_dir/host-exec-client" "$stage_dir/host-exec-client"
+  install -m 0644 "$tmp_dir/host-exec-broker.mjs" "$stage_dir/host-exec-broker.mjs"
   for profile_id in "${SELECTED_PROFILES[@]}"; do
     install -m 0644 "$tmp_dir/profiles/$profile_id.json" "$stage_dir/profiles/$profile_id.json"
   done

@@ -6,9 +6,11 @@ macOS-only runtime instead of separate container scripts.
 
 ```text
 agent-container <profile> [agent arguments...]
+agent-container run <profile> [runtime options...] [-- agent arguments...]
 claude-container [claude arguments...]
 codex-container  [codex arguments...]
 grok-container   [grok arguments...]
+<profile>-container run [runtime options...] [-- agent arguments...]
 ```
 
 The host integration is native Swift, Virtualization.framework, and Apple's
@@ -16,9 +18,11 @@ Containerization stack. The Agent itself still runs as an `arm64` **Linux**
 process in a lightweight Micro-VM; a macOS Mach-O Agent binary cannot run in
 the guest.
 
-This does not reproduce macOS GUI, Keychain, Xcode, Mach-O binaries, or the
-complete host toolchain. Agent-specific browser login must support a device
-flow or another guest-compatible mechanism.
+The legacy form does not reproduce macOS GUI, Keychain, Xcode, Mach-O binaries,
+or the complete host toolchain. The explicit `run` form adds a sandboxed bridge
+to eligible commands already on the host `PATH`; it does not make Mach-O
+binaries executable inside Linux. Agent-specific browser login must support a
+device flow or another guest-compatible mechanism.
 
 ## What “physical-machine-like” means
 
@@ -292,6 +296,120 @@ unchanged. Use `claude-container --help`, `codex-container --help`, or
 `AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --help` for
 Agent-specific options.
 
+## Explicit run mode: host commands and additional shares
+
+The legacy forms above retain their narrow boundary and exact Agent-argument
+pass-through. Select `run` explicitly when a task needs a host runtime such as
+Node.js or Python, or needs another host directory. The generic and
+profile-specific forms are equivalent. `run` itself requires a working Node.js
+executable on the host to start its per-session broker; legacy launches do not.
+That bootstrap Node runs before the broker sandbox exists, so the launcher
+rejects a Node command or resolved executable inside the workspace, private
+Agent state, an external writable Git directory, or any read-write extra share.
+
+```bash
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
+  grok-container run \
+    --share-ro /path/to/reference-repository \
+    --share-rw /path/to/generated-output \
+    -- --agent-option
+
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
+  agent-container run grok \
+    --share-ro /path/to/reference-repository \
+    -- --agent-option
+```
+
+Runtime options must precede the `--`; everything after it is passed to the
+native Agent unchanged. `--share-ro` and `--share-rw` may be repeated. Each
+source must be an existing directory and appears in the guest at the same
+canonical absolute path. Shares may not overlap the workspace, external Git
+directory, runtime assets, private Agent state, the real host HOME as a whole,
+or one another. They also count toward the ordinary VirtioFS file budget.
+
+The access mode has two effects. It controls the guest VirtioFS mount, and it
+sets the maximum access that a brokered host command receives through its macOS
+sandbox. A read-only share is still readable and can still be exfiltrated; a
+read-write share allows both guest and brokered host processes to change or
+delete its contents.
+
+At the beginning of a `run` session, the launcher takes a fixed snapshot of
+eligible executable basenames on the host `PATH`. Most are installed as
+fallback shims after the guest's normal command directories: a Linux guest
+command wins when present, and the sandboxed host command runs only when the
+guest has no command with that name. This makes host Node.js and Python usable
+without trying to execute their macOS binaries in Linux. `git` is deliberately
+host-first so that repository operations match the physical-machine workflow.
+Executable symlinks are canonicalized; a basename whose target falls outside
+its admitted tool runtime is skipped rather than invalidating the whole session.
+The policy can be narrowed or adjusted per command:
+
+```bash
+# Keep guest git and do not expose the host git command.
+codex-container run --no-host-exec git --
+
+# Prefer a particular host command even when the guest has the same basename.
+codex-container run --host-first python3 --
+```
+
+`--no-host-exec COMMAND` may be repeated and takes the named host command out of
+both the host-first and fallback sets. Use the legacy form, without `run`, when
+no host-command broker should exist at all. The selected Agent command,
+compatibility wrappers, `container`, and `sudo` remain excluded independently
+of these options. This flag controls only direct shim routing; it is not a
+security boundary. An allowed shell, Node.js/Python program, Git hook, or
+credential helper can still start child executables. The generated macOS
+filesystem sandbox—not the shim list—confines the resulting process tree to the
+admitted read/write roots.
+
+That filesystem boundary currently uses Apple's deprecated `sandbox-exec`
+interface. `run` fails closed if `/usr/bin/sandbox-exec` is unavailable, and
+compatibility must be revalidated for future macOS releases because Apple may
+change or remove it.
+
+Ordinary host commands receive a separate persistent HOME under
+`~/.agent-container/profiles/<id>/host-home`, not the real macOS HOME. Host Git
+is the exception: it can read the selected real host `.gitconfig`,
+`.config/git`, and the named `.ssh/config`, `.ssh/known_hosts`,
+`.ssh/known_hosts.old`, and `.ssh/allowed_signers` metadata paths. Those SSH
+paths are admitted read-only.
+A symlink at one of those names does not widen access: its target must
+independently fall within a sandbox-authorized root or access fails. `run` also
+makes a live `SSH_AUTH_SOCK` available to the broker when one exists. It never
+admits or copies SSH private-key files, but the socket can authorize network
+authentication or signatures. Values stored directly in the admitted Git
+configuration are readable by host Git and may be returned to the guest; Git
+configuration can also invoke credential helpers. Whether a macOS credential
+helper can reach Keychain through the
+broker sandbox is platform-dependent and must not be assumed either available
+or blocked. Use `--no-host-exec git` when that direct route is not intended,
+while remembering that another allowed host process could still start Git
+inside the same filesystem sandbox.
+
+The host-exec path is non-PTY even when the outer Agent session has a TTY. It
+supports piped stdin and streams stdout and stderr, but interactive host tools
+that require terminal ioctls, raw mode, or a controlling terminal are not
+supported. Run those as guest-native tools instead.
+
+Every `run` invocation starts a fresh authenticated broker and generates a
+one-session token. The broker accepts only the frozen command and filesystem
+manifests for that session and starts each request in its own process group.
+Disconnecting a request, exiting the launcher, or stopping the VM terminates the
+host request process group, including ordinary background children that remain
+in it; host services do not intentionally outlive the Agent session. A program
+that deliberately creates a new session with `setsid` can escape PGID-based
+cleanup and is unsupported—do not use host-exec as a durable daemon manager.
+The token, endpoint metadata, and manifests are removed with the session staging
+directory.
+
+`run` is therefore an explicit, materially broader mode than the legacy
+launcher. The macOS sandbox, command allowlist, per-session authentication, and
+path modes reduce its scope, but invoking an interpreter on host-controlled
+files still executes native code as the macOS user. Review every shared path and
+keep the Agent's own approval controls enabled.
+
+## Authentication persistence and API keys
+
 The Codex/Grok device flows avoid relying on an automatic browser callback from
 the Micro-VM. Claude currently exposes no device-auth flag; follow its prompts
 and open any displayed URL in the host browser. Agent-specific login flows
@@ -323,9 +441,11 @@ separate mounts. Apple has no bind-mount UID mapping yet
 drops from root to the host numeric UID/GID without recursively changing any
 host mount.
 
-The default Git configuration is a temporary file containing only
-`user.name` and `user.email`. Credential helpers, HTTP headers, URL rewrites,
-and includes do not enter the VM. These capabilities require separate opt-ins:
+For legacy sessions and guest Git, the default Git configuration is a temporary
+file containing only `user.name` and `user.email`. Credential helpers, HTTP
+headers, URL rewrites, and includes do not enter the VM. The host-first Git
+behavior of explicit `run` mode is a separate, broader capability described
+above. The legacy guest capabilities require separate opt-ins:
 
 ```bash
 # May expose Git credentials, extra headers, URL rewrites, and includes.
@@ -498,17 +618,20 @@ discoverable under `~/.agent-container` for safe cleanup.
   sessions/session-<pid>/      # ephemeral, secret-capable staging
   profiles/<id>/
     home/                      # isolated persistent shadow HOME
+    host-home/                 # isolated HOME for ordinary run-mode host tools
     meta/                      # image ref, recipe hash, inspected identity
     session.lock/              # same-profile image/session serialization
 ```
 
-Only `profiles/<id>/home` is mounted at the guest's HOME path. Core state,
-other profiles, and image provenance never enter the guest. Launchers hold the
-shared lifecycle gate until their PID registration is durable; install and
-uninstall hold it for the whole transaction, closing start/remove races.
-After an uncatchable launcher death, the next launch reconciles registrations
-with Apple container IDs and ownership labels. It removes only a proven orphan
-VM and its secret-capable staging; ambiguous resources fail closed.
+Only `profiles/<id>/home` is mounted at the guest's HOME path. `host-home` is
+used only as the HOME of ordinary brokered macOS commands and is not a view of
+the real host HOME. Core state, other profiles, and image provenance never enter
+the guest. Launchers hold the shared lifecycle gate until their PID registration
+is durable; install and uninstall hold it for the whole transaction, closing
+start/remove races. After an uncatchable launcher death, the next launch
+reconciles registrations with Apple container IDs and ownership labels. It
+removes only a proven orphan VM and its secret-capable staging; ambiguous
+resources fail closed.
 
 ## Updating an Agent
 

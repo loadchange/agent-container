@@ -93,6 +93,49 @@ runtime_passwd_home=$(printf '%s\n' "$runtime_passwd_record" | cut -d: -f6)
     exit 65
   }
 
+runtime_path="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+host_command_manifest=/run/agent-host/host-commands.tsv
+if [ -f "$host_command_manifest" ] && [ ! -L "$host_command_manifest" ]; then
+  host_first_dir=/run/agent-host-first-bin
+  host_fallback_dir=/run/agent-host-fallback-bin
+  mkdir -p "$host_first_dir" "$host_fallback_dir"
+  chmod 0755 "$host_first_dir" "$host_fallback_dir"
+  while IFS=$'\t' read -r host_mode host_name host_executable; do
+    case "$host_mode" in
+      first) host_shim_dir="$host_first_dir" ;;
+      fallback) host_shim_dir="$host_fallback_dir" ;;
+      *)
+        echo "Error: host command manifest contains an invalid mode." >&2
+        exit 65
+        ;;
+    esac
+    case "$host_name" in
+      ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._+-]*)
+        echo "Error: host command manifest contains an unsafe command name." >&2
+        exit 65
+        ;;
+    esac
+    [ "${#host_name}" -le 64 ] || {
+      echo "Error: host command manifest contains an oversized command name." >&2
+      exit 65
+    }
+    case "$host_executable" in
+      /*) ;;
+      *)
+        echo "Error: host command manifest contains a non-absolute executable." >&2
+        exit 65
+        ;;
+    esac
+    [ ! -e "$host_shim_dir/$host_name" ] \
+      || {
+        echo "Error: host command manifest contains a duplicate command." >&2
+        exit 65
+      }
+    ln -s /usr/local/bin/agent-host-exec "$host_shim_dir/$host_name"
+  done < "$host_command_manifest"
+  runtime_path="$host_first_dir:$runtime_path:$host_fallback_dir"
+fi
+
 exec setpriv \
   --reuid="$runtime_uid" \
   --regid="$runtime_gid" \
@@ -103,4 +146,5 @@ exec setpriv \
     USER="$runtime_user" \
     LOGNAME="$runtime_user" \
     SHELL=/bin/bash \
+    PATH="$runtime_path" \
     "$@"

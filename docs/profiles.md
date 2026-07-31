@@ -251,9 +251,22 @@ capability and update the threat model first.
 ## Compatibility wrappers
 
 The project may install `claude-container`, `codex-container`, and
-`grok-container` as thin aliases. They must preserve arguments exactly and must
-not implement separate runtime behavior. The canonical interface remains:
+`grok-container` as generic aliases. Their legacy form preserves Agent arguments
+exactly and does not implement profile-specific runtime behavior:
 
 ```bash
 agent-container <profile> [agent arguments...]
 ```
+
+Each alias also reserves a leading `run` token for the core runtime's explicit
+host-integration mode. It only inserts the alias's fixed profile ID; all runtime
+options and Agent arguments retain the same meaning as the canonical form:
+
+```bash
+<profile>-container run [runtime options...] [-- agent arguments...]
+agent-container run <profile> [runtime options...] [-- agent arguments...]
+```
+
+Additional shares, host-command discovery, broker policy, and lifecycle remain
+core runtime responsibilities. They must not be declared by or specialized for
+a profile JSON. Omitting the reserved `run` token retains the legacy boundary.

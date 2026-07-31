@@ -175,6 +175,128 @@ translates `INT`, `TERM`, and `HUP` into a named container stop. This gives
 interactive Agent CLIs normal terminal behavior while keeping cleanup under the
 host launcher.
 
+## Explicit run mode and the host-exec broker
+
+The legacy `agent-container <profile> ...` interface starts only the verified
+Linux Agent environment described above. A separate, explicit interface opts
+into a wider host integration boundary:
+
+```text
+agent-container run <profile> [runtime options...] [-- agent arguments...]
+<profile>-container run [runtime options...] [-- agent arguments...]
+```
+
+`run` snapshots eligible executable basenames from the launcher's host `PATH`
+before the Agent starts. It writes a frozen per-session manifest containing the
+command basename, canonical executable path, and either `first` or `fallback`
+resolution; the broker independently re-resolves and freezes each target while
+loading the manifest. A PATH symlink whose canonical target is outside its
+admitted tool runtime is skipped individually, so an unrelated pipx/uv-style
+link cannot poison the complete session. When an active Xcode or
+CommandLineTools installation can resolve
+common stock developer shims such as `/usr/bin/git` and `/usr/bin/python3`, the
+launcher freezes those commands to the selected executables so they do not need
+xcrun's ambient host cache at request time. Otherwise it retains the original
+shim. A selected developer runtime is admitted read-only and its actual tool
+directories are inserted immediately before `/usr/bin` in the brokered child
+`PATH`, preserving any user-selected earlier toolchain. The selected Agent
+command, launcher compatibility commands, the
+Apple `container` command, and `sudo` are unconditionally excluded. A repeated
+`--no-host-exec COMMAND` removes another basename; `--host-first COMMAND` moves
+an allowed basename to the host-first set. These lists select direct shim
+routes, not subprocess policy: a routed shell, interpreter, Git hook, or
+credential helper may create more native children. The generated macOS
+filesystem sandbox is applied to the process group and is the enforcement
+boundary for their filesystem access.
+
+The current filesystem boundary is implemented with Apple's deprecated
+`sandbox-exec` interface. `run` fails closed when `/usr/bin/sandbox-exec` is not
+available, but Apple may change or remove this interface in a future macOS
+release. This host bridge therefore requires release-by-release compatibility
+validation and must not be treated as a permanently supported platform API.
+
+Starting the broker necessarily executes one host Node.js process before that
+sandbox exists. The launcher canonicalizes both the selected Node command and
+its reported `process.execPath`, and rejects either path when it is inside the
+workspace, private Agent state, an external writable Git directory, or a
+read-write additional share. This bootstrap remains a trusted native dependency
+and is not part of the guest fallback command surface.
+
+The guest entrypoint builds two shim directories around the guest's normal
+`PATH`:
+
+```text
+host-first shims -> guest command directories -> host-fallback shims
+```
+
+The usual policy is therefore guest-first: a Linux binary in the image wins,
+and a host command is used only when the guest lacks that basename. `git` is
+host-first by default because this mode is intended to approximate the
+physical-machine repository workflow. The shim does not mount or execute a
+Mach-O file in Linux. It sends the exact argument vector and stdin to a generic
+Linux client, which authenticates to a native macOS broker; the broker executes
+the already-resolved host path without invoking a shell and streams stdout,
+stderr, and the final exit status back.
+
+Additional shares are repeatable `--share-ro PATH` or `--share-rw PATH`
+options. The launcher canonicalizes each existing directory, mounts it at the
+same absolute guest path, rejects unsafe and overlapping roots, and includes it
+in the VirtioFS budget. The same ordered root manifest becomes the macOS
+sandbox policy for brokered commands:
+
+- the repository and required external Git directory are read-write;
+- each additional directory receives exactly its requested read-only or
+  read-write mode;
+- host executable and runtime dependency roots are read-only;
+- the real host HOME is not admitted as a general filesystem root.
+
+The two enforcement paths are intentionally aligned: `--share-ro` limits both
+the guest mount and brokered host processes to read access, while `--share-rw`
+permits both sides to mutate that tree. A host command cannot use the broker to
+bypass a read-only guest mount.
+
+Ordinary brokered commands run with a persistent, per-profile HOME at
+`~/.agent-container/profiles/<id>/host-home`. It is separate from the real host
+HOME and from the Linux shadow HOME. Host Git is a deliberate exception. For
+that one command, the broker selects the real host HOME so Git can discover the
+selected real `.gitconfig` and `.config/git` files, while the sandbox admits
+only those Git configuration inputs rather than the complete HOME. The named
+`.ssh/config`, `.ssh/known_hosts`, `.ssh/known_hosts.old`, and
+`.ssh/allowed_signers` metadata paths are admitted read-only. The broker does
+not separately reject a named path because
+it is a symlink; the symlink target must independently be inside a
+sandbox-authorized root for traversal to succeed. A live host `SSH_AUTH_SOCK`,
+when present, is also admitted to `run` sessions. SSH private-key files are
+never admitted or copied. Git configuration can still select credential helpers
+or external commands, and SSH-agent possession authorizes authentication and
+signing operations; whether a macOS credential helper can reach Keychain from
+the sandbox is platform-dependent.
+
+The broker is a per-launch child, not a persistent service. The launcher creates
+a random 256-bit token, command/root manifests, and authenticated endpoint
+metadata under its restrictive session staging directory. The guest sees those
+files through the existing read-only `/run/agent-host` mount. Each authenticated
+request gets a distinct host process group. Client disconnect, launcher exit,
+VM stop, or broker termination kills that complete group, including ordinary
+background descendants that remain members, before session staging is removed.
+Deliberate `setsid`-style daemonization can escape a PGID and is outside the
+protocol contract; the broker is not a durable service manager. The broker also
+watches the launcher PID so an uncatchable launcher failure does not
+intentionally leave a normal host service behind.
+
+Host-exec requests are pipe based and do not allocate a pseudo-terminal. Stdin,
+stdout, and stderr can stream through the connection, but commands that require
+a controlling terminal, raw mode, or terminal ioctls must run in the guest or
+outside `agent-container`. This is independent of the outer Agent session,
+which retains the normal PTY behavior described above.
+
+Selecting `run` is the user's authorization for this broader mode. The command
+manifest, token authentication, and macOS sandbox narrow native host execution,
+but they do not make it equivalent to the legacy Micro-VM-only boundary. In
+particular, a brokered host interpreter executes code as the macOS user within
+the admitted roots. Omitting `run` is the way to avoid creating the broker at
+all.
+
 ## State and session lifecycle
 
 The default state root is `~/.agent-container`:
@@ -185,12 +307,13 @@ The default state root is `~/.agent-container`:
   .agent-container-owned
   profiles/<id>/
     home/                 # persistent isolated Agent HOME
+    host-home/            # persistent isolated HOME for ordinary host tools
     meta/
       image-ref
       image-build-id
       image-identity
     session.lock/         # one image/session transaction per profile
-  sessions/session-<pid>/ # ephemeral staged host metadata
+  sessions/session-<pid>/ # ephemeral metadata, broker manifests/token/endpoint
   session.lock/           # global native-session safety lock
 ```
 
@@ -226,7 +349,7 @@ stale session staging. Missing or contradictory provenance is never guessed.
 | macOS/Apple silicon/version preflight | display name and stable/preview/experimental status |
 | Apple service, VM, PTY, signals, cleanup | official installer URL, shell, and exact-version interface |
 | UID/GID and shadow HOME | installed command and version probe |
-| workspace, Git, and capability mounts | official version endpoint and response format |
+| workspace, Git, capability mounts, and explicit run-mode broker | official version endpoint and response format |
 | image cache and provenance | API-key and optional auto-update-disable variables |
 | VirtioFS file/FD/vnode guards | no shell fragments or arbitrary host mounts |
 
@@ -240,9 +363,14 @@ networking. The launcher can set proxy, DNS, and timezone values, but it does
 not implement a hostname allowlist or an egress firewall. A proxy setting is
 connectivity configuration, not a security boundary.
 
-This is why credentials and host capabilities are denied by default and why
-the project does not automatically add any Agent-specific permission-bypass
-flag. See [security.md](security.md) for the complete threat model.
+Legacy sessions continue to deny credentials and host capabilities by default,
+and the project does not automatically add any Agent-specific
+permission-bypass flag. Explicit `run` sessions intentionally add the
+authenticated host broker, selected host Git configuration and live SSH agent
+described above; network reachability is not what confines that broker. Its
+authorization token, frozen command manifest, and macOS filesystem sandbox are
+the relevant controls. See [security.md](security.md) for the complete threat
+model.
 
 ## Known upstream constraints
 

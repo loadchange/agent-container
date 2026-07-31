@@ -145,7 +145,11 @@ RUN mkdir -p /workspace /Users \
     && chmod 0755 /workspace /Users
 
 COPY entrypoint.sh /usr/local/bin/agent-container-entrypoint
-RUN chmod 0755 /usr/local/bin/agent-container-entrypoint
+COPY host-exec-client /usr/local/bin/agent-host-exec
+RUN chmod 0755 \
+      /usr/local/bin/agent-container-entrypoint \
+      /usr/local/bin/agent-host-exec \
+    && ln -s /usr/local/bin/agent-host-exec /usr/local/bin/host-exec
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/agent-container-entrypoint"]

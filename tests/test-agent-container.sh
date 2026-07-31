@@ -94,6 +94,8 @@ reset_case_environment() {
     AGENT_CONTAINER_FORWARD_API_KEY \
     AGENT_CONTAINER_FORWARD_SSH_AGENT \
     AGENT_CONTAINER_FULL_GIT_CONFIG \
+    AGENT_CONTAINER_HOST_BROKER_BIN \
+    AGENT_CONTAINER_HOST_NODE_BIN \
     AGENT_CONTAINER_HTTP_PROXY \
     AGENT_CONTAINER_IMAGE \
     AGENT_CONTAINER_HTTPS_PROXY \
@@ -113,6 +115,7 @@ reset_case_environment() {
     SSH_AUTH_SOCK \
     FAKE_BUILD_FAIL \
     FAKE_CAPTURE_GITCONFIG \
+    FAKE_CAPTURE_HOST_STAGE_DIR \
     FAKE_CAPTURE_SSH_DIR \
     FAKE_CREATE_STARTED \
     FAKE_CREATE_FOREIGN_AFTER_SUCCESS \
@@ -138,6 +141,7 @@ reset_case_environment() {
     FAKE_RUN_STATUS \
     FAKE_START_FAIL \
     FAKE_SYSTEM_RUNNING \
+    TEST_RUNNER_PATH \
     2>/dev/null || true
 }
 
@@ -162,6 +166,8 @@ copy_case_assets() {
     "$repo_root/Containerfile" \
     "$repo_root/Containerfile.dockerignore" \
     "$repo_root/entrypoint.sh" \
+    "$repo_root/host-exec-broker.mjs" \
+    "$repo_root/host-exec-client" \
     "$case_asset_dir/"
   cp "$repo_root"/profiles/*.json "$case_asset_dir/profiles/"
 }
@@ -173,7 +179,7 @@ launch_exec() {
 
   runner_env=(
     "HOME=$case_home"
-    "PATH=$fixture_dir:/usr/bin:/bin"
+    "PATH=${TEST_RUNNER_PATH:-$fixture_dir:/usr/bin:/bin}"
     "LANG=C"
     "TERM=xterm-256color"
     "AGENT_CONTAINER_BIN=$fixture_dir/container"
@@ -185,6 +191,8 @@ launch_exec() {
     "AGENT_CONTAINER_FORWARD_API_KEY=${AGENT_CONTAINER_FORWARD_API_KEY:-false}"
     "AGENT_CONTAINER_FORWARD_SSH_AGENT=${AGENT_CONTAINER_FORWARD_SSH_AGENT:-false}"
     "AGENT_CONTAINER_FULL_GIT_CONFIG=${AGENT_CONTAINER_FULL_GIT_CONFIG:-false}"
+    "AGENT_CONTAINER_HOST_BROKER_BIN=${AGENT_CONTAINER_HOST_BROKER_BIN:-}"
+    "AGENT_CONTAINER_HOST_NODE_BIN=${AGENT_CONTAINER_HOST_NODE_BIN:-}"
     "AGENT_CONTAINER_HTTP_PROXY=${AGENT_CONTAINER_HTTP_PROXY:-}"
     "AGENT_CONTAINER_IMAGE=${AGENT_CONTAINER_IMAGE:-}"
     "AGENT_CONTAINER_HTTPS_PROXY=${AGENT_CONTAINER_HTTPS_PROXY:-}"
@@ -200,6 +208,7 @@ launch_exec() {
     "AGENT_CONTAINER_MOUNT_SSH_CONFIG=${AGENT_CONTAINER_MOUNT_SSH_CONFIG:-false}"
     "FAKE_BUILD_FAIL=${FAKE_BUILD_FAIL:-false}"
     "FAKE_CAPTURE_GITCONFIG=${FAKE_CAPTURE_GITCONFIG:-}"
+    "FAKE_CAPTURE_HOST_STAGE_DIR=${FAKE_CAPTURE_HOST_STAGE_DIR:-}"
     "FAKE_CAPTURE_SSH_DIR=${FAKE_CAPTURE_SSH_DIR:-}"
     "FAKE_CREATE_STARTED=${FAKE_CREATE_STARTED:-false}"
     "FAKE_CREATE_FOREIGN_AFTER_SUCCESS=${FAKE_CREATE_FOREIGN_AFTER_SUCCESS:-false}"
@@ -451,6 +460,230 @@ for wrapper_profile in \
     || fail "$wrapper changed profile or argument boundaries"
 done
 pass "all compatibility wrappers preserve exact argument boundaries"
+
+tests_run=$((tests_run + 1))
+new_case legacy_wrapper_runtime_words
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+legacy_share="$case_dir/not-mounted"
+mkdir "$legacy_share"
+run_program "$repo_root/grok-container" \
+  --share-ro "$legacy_share" -- "two words" "" '*' \
+  >"$case_dir/out" 2>"$case_dir/err"
+expected_tail=$(printf 'ARG=%s\n' \
+  grok --share-ro "$legacy_share" -- 'two words' '' '*')
+actual_tail=$(command_arguments "$case_log" create | tail -n 7)
+[ "$actual_tail" = "$expected_tail" ] \
+  || fail "legacy wrapper invocation consumed new runtime words"
+assert_no_line "$case_log" "ARG=$legacy_share:$legacy_share:ro"
+pass "runtime words remain ordinary Agent arguments without an explicit run subcommand"
+
+tests_run=$((tests_run + 1))
+new_case generic_run_read_only_share
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+FAKE_CAPTURE_HOST_STAGE_DIR="$case_dir/captured-host-stage"
+read_only_share="$case_dir/read only sibling"
+mkdir "$read_only_share"
+run_program "$repo_root/agent-container" run grok \
+  --share-ro "$read_only_share" -- "two words" "" '*' \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" "ARG=$read_only_share:$read_only_share:ro"
+expected_tail=$(printf 'ARG=%s\n' grok 'two words' '' '*')
+actual_tail=$(command_arguments "$case_log" create | tail -n 4)
+[ "$actual_tail" = "$expected_tail" ] \
+  || fail "generic run changed Agent argument boundaries"
+awk -F '\t' '
+  $1 == "first" && $2 == "git" && $3 ~ /^\// { matches += 1 }
+  END { exit matches == 1 ? 0 : 1 }
+' "$case_dir/captured-host-stage/host-commands.tsv" \
+  || {
+    awk -F '\t' '$2 == "git" { print "observed Git manifest: " $0 }' \
+      "$case_dir/captured-host-stage/host-commands.tsv" >&2
+    fail "run mode did not stage exactly one absolute host-first Git command"
+  }
+assert_contains "$repo_root/entrypoint.sh" \
+  'runtime_path="$host_first_dir:$runtime_path:$host_fallback_dir"'
+assert_contains "$repo_root/entrypoint.sh" 'PATH="$runtime_path"'
+assert_line "$case_dir/captured-host-stage/host-roots.tsv" \
+  "$(printf 'ro\t%s' "$read_only_share")"
+grep -Eq '^[0-9a-f]{64}$' \
+  "$case_dir/captured-host-stage/host-exec-token" \
+  || fail "run mode did not stage one 256-bit host-exec token"
+assert_line "$case_dir/captured-host-stage/host-exec-endpoint" \
+  '192.168.64.1:54321'
+assert_line "$case_dir/captured-host-stage/fake-host-broker-args" \
+  'ARG=--session-dir'
+assert_line "$case_dir/captured-host-stage/fake-host-broker-args" \
+  'ARG=--sandbox-bin'
+assert_line "$case_dir/captured-host-stage/fake-host-broker-args" \
+  'ARG=/usr/bin/sandbox-exec'
+pass "generic run stages host-first Git and one read-only extra share"
+
+tests_run=$((tests_run + 1))
+new_case unsafe_host_node_bootstrap
+unsafe_node="$case_workspace/node"
+unsafe_node_sentinel="$case_dir/unsafe-node-executed"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf 'printf executed > %q\n' "$unsafe_node_sentinel"
+  printf '%s\n' 'printf /usr/bin/node'
+} > "$unsafe_node"
+chmod 0755 "$unsafe_node"
+AGENT_CONTAINER_HOST_NODE_BIN="$unsafe_node"
+if run_program "$repo_root/agent-container" run codex -- --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "an Agent-writable host Node bootstrap should be rejected"
+fi
+assert_contains "$case_dir/err" \
+  "Refusing to execute host Node.js from an Agent-writable root"
+[ ! -e "$unsafe_node_sentinel" ] \
+  || fail "the Agent-writable host Node shim executed outside the sandbox"
+assert_no_line "$case_log" "ARG=create"
+pass "run rejects an Agent-writable Node before unsandboxed bootstrap"
+
+tests_run=$((tests_run + 1))
+new_case cross_root_host_command_symlink
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+FAKE_CAPTURE_HOST_STAGE_DIR="$case_dir/captured-host-stage"
+poison_bin="$case_dir/poison-bin"
+poison_target_dir="$case_dir/poison-target"
+mkdir "$poison_bin" "$poison_target_dir"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$poison_target_dir/poison-tool"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$poison_bin/safe-tool"
+chmod 0755 "$poison_target_dir/poison-tool" "$poison_bin/safe-tool"
+ln -s "$poison_target_dir/poison-tool" "$poison_bin/poison-tool"
+TEST_RUNNER_PATH="$poison_bin:$fixture_dir:/usr/bin:/bin"
+if ! run_program "$repo_root/agent-container" run grok -- --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a cross-root PATH symlink poisoned run startup: $(sed -n '1p' "$case_dir/err")"
+fi
+if awk -F '\t' '$2 == "poison-tool" { found = 1 } END { exit !found }' \
+  "$case_dir/captured-host-stage/host-commands.tsv"; then
+  fail "a cross-root executable symlink entered the host command manifest"
+fi
+assert_line "$case_dir/captured-host-stage/host-commands.tsv" \
+  "$(printf 'fallback\tsafe-tool\t%s' "$poison_bin/safe-tool")"
+pass "run skips cross-root executable symlinks without poisoning the session"
+
+tests_run=$((tests_run + 1))
+new_case wrapper_run_read_write_share
+AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+FAKE_CAPTURE_HOST_STAGE_DIR="$case_dir/captured-host-stage"
+read_write_share="$case_dir/writable sibling"
+mkdir "$read_write_share"
+if ! run_program "$repo_root/grok-container" run \
+  --share-rw "$read_write_share" -- exec "argument with spaces" \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "wrapper run failed: $(sed -n '1p' "$case_dir/err")"
+fi
+assert_line "$case_log" "ARG=$read_write_share:$read_write_share"
+assert_no_line "$case_log" "ARG=$read_write_share:$read_write_share:ro"
+expected_tail=$(printf 'ARG=%s\n' grok exec 'argument with spaces')
+actual_tail=$(command_arguments "$case_log" create | tail -n 3)
+[ "$actual_tail" = "$expected_tail" ] \
+  || fail "wrapper run changed Agent argument boundaries"
+assert_line "$case_dir/captured-host-stage/host-roots.tsv" \
+  "$(printf 'rw\t%s' "$read_write_share")"
+pass "compatibility wrappers expose explicit run mode with read-write shares"
+
+tests_run=$((tests_run + 1))
+new_case run_guest_git_override
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+FAKE_CAPTURE_HOST_STAGE_DIR="$case_dir/captured-host-stage"
+if ! run_program "$repo_root/agent-container" run codex \
+  --no-host-exec git -- --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "run with guest Git override failed: $(sed -n '1p' "$case_dir/err")"
+fi
+if awk -F '\t' '$2 == "git" { found = 1 } END { exit !found }' \
+  "$case_dir/captured-host-stage/host-commands.tsv"; then
+  fail "--no-host-exec git left Git in the host command manifest"
+fi
+expected_tail=$(printf 'ARG=%s\n' codex --version)
+actual_tail=$(command_arguments "$case_log" create | tail -n 2)
+[ "$actual_tail" = "$expected_tail" ] \
+  || fail "--no-host-exec changed Agent argument boundaries"
+pass "a run can force Git back to the verified guest image"
+
+tests_run=$((tests_run + 1))
+new_case invalid_broker_endpoints
+for endpoint_case in zero overflow suffix huge; do
+  new_case "broker_endpoint_$endpoint_case"
+  AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+  if run_program "$repo_root/agent-container" run codex \
+    -- --version \
+    >"$case_dir/out" 2>"$case_dir/err"; then
+    fail "the broker endpoint case '$endpoint_case' should be rejected"
+  fi
+  assert_contains "$case_dir/err" \
+    "did not publish a valid session endpoint"
+  assert_no_line "$case_log" "ARG=create"
+done
+pass "broker endpoints require one numeric TCP port in the range 1 through 65535"
+
+tests_run=$((tests_run + 1))
+new_case unsafe_extra_shares
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+if run_program "$repo_root/agent-container" run codex \
+  --share-ro / -- --version \
+  >"$case_dir/root.out" 2>"$case_dir/root.err"; then
+  fail "sharing the host filesystem root should be rejected"
+fi
+assert_no_line "$case_log" "ARG=create"
+
+new_case unsafe_extra_home
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+if run_program "$repo_root/agent-container" run codex \
+  --share-ro "$case_home" -- --version \
+  >"$case_dir/home.out" 2>"$case_dir/home.err"; then
+  fail "sharing the complete real host HOME should be rejected"
+fi
+assert_no_line "$case_log" "ARG=create"
+
+new_case unsafe_extra_state
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+mkdir "$case_home/.agent-container"
+if run_program "$repo_root/agent-container" run codex \
+  --share-ro "$case_home/.agent-container" -- --version \
+  >"$case_dir/state.out" 2>"$case_dir/state.err"; then
+  fail "sharing private agent-container state should be rejected"
+fi
+assert_no_line "$case_log" "ARG=create"
+
+new_case unsafe_extra_colon
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+colon_share="$case_dir/extra:share"
+mkdir "$colon_share"
+if run_program "$repo_root/agent-container" run codex \
+  --share-ro "$colon_share" -- --version \
+  >"$case_dir/colon.out" 2>"$case_dir/colon.err"; then
+  fail "an Apple-incompatible extra-share path should be rejected"
+fi
+assert_contains "$case_dir/colon.err" \
+  "cannot bind-mount a macOS path containing ':'"
+assert_no_line "$case_log" "ARG=create"
+pass "extra shares reject filesystem root, real HOME, private state, and colon paths"
+
+tests_run=$((tests_run + 1))
+new_case extra_share_virtiofs_budget
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+budget_share="$case_dir/budget-share"
+mkdir "$budget_share"
+touch \
+  "$budget_share/one" \
+  "$budget_share/two" \
+  "$budget_share/three"
+AGENT_CONTAINER_MAX_FILES=10
+if run_program "$repo_root/agent-container" run codex \
+  --share-ro "$budget_share" -- --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "extra shares should count against the VirtioFS file budget"
+fi
+assert_contains "$case_dir/err" "Projected VirtioFS shares"
+assert_no_line "$case_log" "ARG=create"
+pass "extra shares participate in the fail-closed VirtioFS budget"
 
 tests_run=$((tests_run + 1))
 new_case profile_isolation

@@ -21,12 +21,17 @@ jobs:
             codex-container \
             grok-container \
             entrypoint.sh \
+            host-exec-client \
             install.sh \
             uninstall.sh \
             tests/test-agent-container.sh \
+            tests/test-host-exec.sh \
             tests/test-install-uninstall.sh \
             tests/fixtures/* \
             tests/install-fixtures/*
+
+      - name: Validate host broker syntax
+        run: node --check host-exec-broker.mjs
 
       - name: Validate profiles and executable modes
         run: |
@@ -36,9 +41,11 @@ jobs:
           test -x codex-container
           test -x grok-container
           test -x entrypoint.sh
+          test -x host-exec-client
           test -x install.sh
           test -x uninstall.sh
           test -x tests/test-agent-container.sh
+          test -x tests/test-host-exec.sh
           test -x tests/test-install-uninstall.sh
 
       - name: Verify release manifest
@@ -51,6 +58,8 @@ jobs:
             Containerfile \
             Containerfile.dockerignore \
             entrypoint.sh \
+            host-exec-client \
+            host-exec-broker.mjs \
             profiles/claude.json \
             profiles/codex.json \
             profiles/grok.json \
@@ -58,6 +67,9 @@ jobs:
 
       - name: Run generic runtime contract tests
         run: tests/test-agent-container.sh
+
+      - name: Run host executor contract tests
+        run: tests/test-host-exec.sh
 
       - name: Run install and uninstall transaction tests
         run: tests/test-install-uninstall.sh

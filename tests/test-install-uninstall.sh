@@ -14,6 +14,8 @@ ASSETS=(
   Containerfile
   Containerfile.dockerignore
   entrypoint.sh
+  host-exec-client
+  host-exec-broker.mjs
   profiles/claude.json
   profiles/codex.json
   profiles/grok.json
@@ -270,7 +272,7 @@ for command_name in claude-container codex-container; do
 done
 for asset in \
   agent-container grok-container Containerfile Containerfile.dockerignore \
-  entrypoint.sh profiles/grok.json; do
+  entrypoint.sh host-exec-client host-exec-broker.mjs profiles/grok.json; do
   [ -f "$selective_grok_release/$asset" ] \
     && [ ! -L "$selective_grok_release/$asset" ] \
     || fail "single-profile release omitted $asset"

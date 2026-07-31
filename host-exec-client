@@ -1,0 +1,345 @@
+#!/bin/bash
+set -uo pipefail
+
+# Linux guest client for the per-session host executor.
+#
+# This deliberately implements only non-PTY execution. If stdin is a pipe or a
+# file it is streamed as base64 JSON frames; an interactive terminal is not
+# forwarded until a PTY/resize protocol exists. stdout and stderr are decoded
+# as frames arrive, and the host command's exit status is returned.
+#
+# The fixed files live in the launcher's read-only /run/agent-host staging
+# mount. Command shims may invoke this file under a command basename (for
+# example `node`) or call it explicitly as `host-exec-client node ...`.
+
+readonly host_exec_dir=/run/agent-host
+readonly endpoint_file="$host_exec_dir/host-exec-endpoint"
+readonly token_file="$host_exec_dir/host-exec-token"
+readonly protocol_failure_status=125
+readonly max_response_line_chars=262144
+
+die() {
+  printf 'host-exec-client: %s\n' "$*" >&2
+  exit "$protocol_failure_status"
+}
+
+for required_command in jq base64 dd tr chmod mkdir rmdir mktemp rm sleep; do
+  command -v "$required_command" >/dev/null 2>&1 \
+    || die "required guest command is unavailable: $required_command"
+done
+
+invoked_name=${0##*/}
+case "$invoked_name" in
+  host-exec-client|.host-exec-client|agent-host-exec|host-exec)
+    [ "$#" -gt 0 ] || die 'explicit invocation requires a command name'
+    command_name=$1
+    shift
+    ;;
+  *)
+    command_name=$invoked_name
+    ;;
+esac
+
+case "$command_name" in
+  ''|.|..|*[!A-Za-z0-9._+-]*) die 'command name is not a safe basename' ;;
+esac
+case "$command_name" in
+  [A-Za-z0-9]*) ;;
+  *) die 'command name must begin with an ASCII letter or digit' ;;
+esac
+[ "${#command_name}" -le 64 ] || die 'command name is too long'
+
+[ -f "$endpoint_file" ] && [ ! -L "$endpoint_file" ] \
+  || die "endpoint file is unavailable: $endpoint_file"
+[ -f "$token_file" ] && [ ! -L "$token_file" ] \
+  || die "token file is unavailable: $token_file"
+
+IFS= read -r endpoint < "$endpoint_file" \
+  || die 'endpoint file is unreadable'
+IFS= read -r token < "$token_file" \
+  || die 'token file is unreadable'
+
+case "$token" in
+  *[!0-9a-f]*|'') die 'token file does not contain lowercase hexadecimal' ;;
+esac
+[ "${#token}" -eq 64 ] || die 'token file does not contain a 64-hex token'
+
+host=${endpoint%:*}
+port=${endpoint##*:}
+[ "$host" != "$endpoint" ] && [ -n "$host" ] \
+  || die 'endpoint is not IPv4:port'
+case "$host" in
+  *[!0-9.]*|''|.*|*..*|*.) die 'endpoint host is not IPv4' ;;
+esac
+case "$port" in
+  *[!0-9]*|'') die 'endpoint port is not decimal' ;;
+esac
+[ "$port" -ge 1 ] 2>/dev/null && [ "$port" -le 65535 ] 2>/dev/null \
+  || die 'endpoint port is outside 1..65535'
+
+octet_1=${host%%.*}
+octet_remainder=${host#*.}
+[ "$octet_remainder" != "$host" ] || die 'endpoint host is not IPv4'
+octet_2=${octet_remainder%%.*}
+next_octet_remainder=${octet_remainder#*.}
+[ "$next_octet_remainder" != "$octet_remainder" ] \
+  || die 'endpoint host is not IPv4'
+octet_remainder=$next_octet_remainder
+octet_3=${octet_remainder%%.*}
+octet_4=${octet_remainder#*.}
+[ "$octet_4" != "$octet_remainder" ] \
+  || die 'endpoint host is not IPv4'
+case "$octet_4" in
+  *.*) die 'endpoint host is not IPv4' ;;
+esac
+for octet in "$octet_1" "$octet_2" "$octet_3" "$octet_4"; do
+  case "$octet" in
+    *[!0-9]*|'') die 'endpoint host is not IPv4' ;;
+  esac
+  [ "$octet" -le 255 ] 2>/dev/null || die 'endpoint host is not IPv4'
+done
+
+cwd=$(pwd -P) || die 'cannot resolve the current directory'
+
+# A TTY cannot be represented faithfully by this initial protocol. Piped/file
+# stdin is forwarded concurrently with response handling so large pipelines do
+# not deadlock on child output.
+stdin_enabled=true
+if [ -t 0 ]; then
+  stdin_enabled=false
+fi
+
+# Filter environment controls, loader injection, launcher internals, and names
+# that conventionally carry secrets. The broker independently applies the same
+# policy and constructs a clean host environment; this client-side filter is a
+# usability and least-surprise layer, not the authentication boundary.
+request_json=$(
+  jq -cn \
+    --arg token "$token" \
+    --arg command "$command_name" \
+    --arg cwd "$cwd" \
+    --argjson stdin "$stdin_enabled" \
+    --args '
+      def safe_name:
+        test("^[A-Za-z_][A-Za-z0-9_]*$")
+        and (test("^(AGENT_|HOST_|HOME$|PATH$|SHELL$|USER$|LOGNAME$|TMPDIR$|TMP$|TEMP$|PWD$|OLDPWD$|SHLVL$|_$|SSH_AUTH_SOCK$|BASH_ENV$|ENV$|CDPATH$|GLOBIGNORE$|SHELLOPTS$|NODE_OPTIONS$|NODE_PATH$|PYTHONHOME$|PYTHONPATH$|PYTHONSTARTUP$|RUBYOPT$|PERL5OPT$|GIT_CONFIG(_GLOBAL|_SYSTEM|_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+)?$|XDG_(CONFIG|CACHE|DATA|STATE)_HOME$|SSLKEYLOGFILE$|DYLD_.*|LD_.*)") | not)
+        and (test("(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|PRIVATE_KEY|API_KEY)($|_)"; "i") | not);
+      {
+        v: 1,
+        type: "run",
+        token: $token,
+        command: $command,
+        cwd: $cwd,
+        argv: $ARGS.positional,
+        env: (env | to_entries | map(select(.key | safe_name)) | from_entries),
+        stdin: $stdin
+      }
+    ' -- "$@"
+) || die 'could not encode the host execution request'
+
+socket_path="/dev/tcp/$host/$port"
+if ! exec 9<>"$socket_path"; then
+  die "cannot connect to host executor at $endpoint"
+fi
+
+stdin_sender_pid=''
+outbound_lock_root=''
+outbound_lock_dir=''
+outbound_lock_ready=false
+outbound_lock_held=false
+outbound_sender_done=''
+received_exit=false
+retry_read=false
+forwarded_signal_count=0
+
+# Once piped stdin starts, both its background sender and the foreground signal
+# traps can produce protocol frames. They must not write the TCP descriptor
+# independently: a stream socket does not preserve frame or cross-process write
+# boundaries. An unguessable, mode-0700 temporary directory provides one atomic
+# mkdir lock shared by the foreground shell and stdin sender. This is protocol
+# coordination, not a boundary against other same-UID guest processes. It keeps
+# the original 32 KiB input chunks instead of shrinking every queue record to
+# the platform's often-small PIPE_BUF.
+acquire_outbound_lock() {
+  local attempts=0
+  local maximum_attempts=${1:-0}
+  while ! mkdir "$outbound_lock_dir" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$maximum_attempts" -gt 0 ] && [ "$attempts" -ge "$maximum_attempts" ]; then
+      return 1
+    fi
+    sleep 0.01
+  done
+  outbound_lock_held=true
+}
+
+release_outbound_lock() {
+  if [ "$outbound_lock_held" = true ]; then
+    rmdir "$outbound_lock_dir" 2>/dev/null || return 1
+    outbound_lock_held=false
+  fi
+}
+
+send_outbound_frame() {
+  local outbound_frame=$1
+  local maximum_attempts=${2:-0}
+  local send_status=0
+  if [ "$outbound_lock_ready" = true ]; then
+    acquire_outbound_lock "$maximum_attempts" || return 1
+  fi
+  printf '%s\n' "$outbound_frame" >&9 2>/dev/null || send_status=$?
+  if [ "$outbound_lock_ready" = true ]; then
+    release_outbound_lock || return 1
+  fi
+  return "$send_status"
+}
+
+cleanup() {
+  local sender_wait_count=0
+  trap - EXIT INT TERM HUP PIPE
+  if [ -n "$stdin_sender_pid" ]; then
+    if [ -f "$outbound_sender_done" ] && [ ! -L "$outbound_sender_done" ]; then
+      wait "$stdin_sender_pid" >/dev/null 2>&1 || true
+    else
+      # The sender owns a separate process group. TERM reaches a blocked dd /
+      # base64 pipeline as well as its Bash parent; KILL bounds cleanup when a
+      # builtin or hostile child still refuses to return.
+      kill -TERM -- "-$stdin_sender_pid" >/dev/null 2>&1 || true
+      while kill -0 -- "-$stdin_sender_pid" >/dev/null 2>&1 \
+        && [ "$sender_wait_count" -lt 50 ]; do
+        sleep 0.01
+        sender_wait_count=$((sender_wait_count + 1))
+      done
+      kill -KILL -- "-$stdin_sender_pid" >/dev/null 2>&1 || true
+      wait "$stdin_sender_pid" >/dev/null 2>&1 || true
+    fi
+  fi
+  release_outbound_lock >/dev/null 2>&1 || true
+  outbound_lock_ready=false
+  if [ -n "$outbound_lock_root" ]; then
+    rm -f "$outbound_sender_done" >/dev/null 2>&1 || true
+    rmdir "$outbound_lock_dir" >/dev/null 2>&1 || true
+    rmdir "$outbound_lock_root" >/dev/null 2>&1 || true
+  fi
+  exec 9>&- 9<&- 2>/dev/null || true
+}
+trap cleanup EXIT
+trap '' PIPE
+
+forward_signal() {
+  local signal_name=$1
+  local signal_status=$2
+  forwarded_signal_count=$((forwarded_signal_count + 1))
+  if [ "$forwarded_signal_count" -gt 1 ]; then
+    cleanup
+    exit "$signal_status"
+  fi
+  retry_read=true
+  if ! send_outbound_frame \
+    "{\"type\":\"signal\",\"signal\":\"$signal_name\"}" 500; then
+    printf 'host-exec-client: could not serialize %s for the host command\n' \
+      "$signal_name" >&2
+    cleanup
+    exit "$signal_status"
+  fi
+}
+trap 'forward_signal SIGINT 130' INT
+trap 'forward_signal SIGTERM 143' TERM
+trap 'forward_signal SIGHUP 129' HUP
+
+printf '%s\n' "$request_json" >&9 \
+  || die 'failed to send the host execution request'
+
+if [ "$stdin_enabled" = true ]; then
+  # Bash redirects fd 0 of an asynchronous command to /dev/null when job
+  # control is inactive. Preserve the caller's pipe on a separate descriptor
+  # before starting the concurrent sender.
+  exec 8<&0 || die 'could not preserve piped stdin'
+  outbound_lock_root=$(umask 077 && mktemp -d /tmp/agent-host-exec-lock.XXXXXXXX) \
+    || die 'could not create the outbound protocol lock'
+  [ -d "$outbound_lock_root" ] && [ ! -L "$outbound_lock_root" ] \
+    || die 'outbound protocol lock is not a private directory'
+  chmod 0700 "$outbound_lock_root" \
+    || die 'could not secure the outbound protocol lock'
+  outbound_lock_dir="$outbound_lock_root/held"
+  outbound_sender_done="$outbound_lock_root/sender-done"
+  outbound_lock_ready=true
+  # Monitor mode gives this one asynchronous sender a distinct process group;
+  # disable it again immediately in both shells so its own pipeline remains in
+  # that group and the rest of the client keeps normal noninteractive behavior.
+  set -m
+  (
+    set +m
+    trap 'release_outbound_lock; exit 0' INT TERM HUP
+    trap 'release_outbound_lock' EXIT
+    while :; do
+      encoded_chunk=$(dd bs=32768 count=1 <&8 2>/dev/null | base64 | tr -d '\n')
+      [ -n "$encoded_chunk" ] || break
+      send_outbound_frame "{\"type\":\"stdin\",\"data\":\"$encoded_chunk\"}" \
+        || exit 0
+    done
+    if send_outbound_frame '{"type":"stdin_end"}'; then
+      : > "$outbound_sender_done"
+    fi
+  ) &
+  stdin_sender_pid=$!
+  set +m
+  exec 8<&-
+fi
+
+exit_status=$protocol_failure_status
+while [ "$received_exit" = false ]; do
+  response_line=''
+  if ! IFS= read -r response_line <&9; then
+    if [ "$retry_read" = true ]; then
+      retry_read=false
+      continue
+    fi
+    break
+  fi
+  [ "${#response_line}" -le "$max_response_line_chars" ] \
+    || die 'broker response frame is too large'
+  frame_type=$(printf '%s\n' "$response_line" | jq -er '.type | select(type == "string")' 2>/dev/null) \
+    || die 'broker returned an invalid JSON frame'
+
+  case "$frame_type" in
+    start)
+      # Readiness is intentionally silent; command output remains byte-clean.
+      ;;
+    stdout|stderr)
+      frame_data=$(printf '%s\n' "$response_line" \
+        | jq -er '.data | select(type == "string")' 2>/dev/null) \
+        || die "broker returned invalid $frame_type data"
+      if [ "$frame_type" = stdout ]; then
+        printf '%s' "$frame_data" | base64 -d \
+          || die 'broker returned malformed stdout base64'
+      else
+        printf '%s' "$frame_data" | base64 -d >&2 \
+          || die 'broker returned malformed stderr base64'
+      fi
+      ;;
+    error)
+      error_code=$(printf '%s\n' "$response_line" | jq -r '.code // "BROKER_ERROR"' 2>/dev/null)
+      error_message=$(printf '%s\n' "$response_line" | jq -r '.message // "host execution failed"' 2>/dev/null)
+      printf 'host-exec-client: %s: %s\n' "$error_code" "$error_message" >&2
+      exit_status=$protocol_failure_status
+      received_exit=true
+      ;;
+    exit)
+      exit_status=$(printf '%s\n' "$response_line" \
+        | jq -er '.status | select(type == "number" and . >= 0 and . <= 255 and floor == .)' 2>/dev/null) \
+        || die 'broker returned an invalid exit status'
+      received_exit=true
+      ;;
+    *)
+      die "broker returned an unsupported frame type: $frame_type"
+      ;;
+  esac
+done
+
+if [ "$received_exit" != true ]; then
+  printf 'host-exec-client: broker disconnected before reporting command exit\n' >&2
+  exit_status=$protocol_failure_status
+fi
+
+exit "$exit_status"

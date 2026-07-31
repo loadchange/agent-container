@@ -137,6 +137,20 @@ path_contains() {
   esac
 }
 
+paths_overlap() {
+  path_contains "$1" "$2" || path_contains "$2" "$1"
+}
+
+array_contains_value() {
+  local wanted="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    [ "$candidate" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
 is_empty_dir() {
   local first_entry
   [ -d "$1" ] || return 0
@@ -225,6 +239,7 @@ usage() {
   cat <<'EOF'
 Usage:
   agent-container <profile> [agent arguments...]
+  agent-container run <profile> [runtime options...] [-- agent arguments...]
   agent-container profiles
 
 Built-in compatibility commands:
@@ -234,7 +249,20 @@ Built-in compatibility commands:
 
 The host must be Apple silicon running macOS 26 or newer. Each profile runs
 inside an arm64 Linux Micro-VM with an isolated, persistent shadow HOME.
+
+Runtime options for `run`:
+  --share-ro PATH          Share one additional directory read-only
+  --share-rw PATH          Share one additional directory read-write
+  --no-host-exec COMMAND   Do not expose one host command (may be repeated)
+  --host-first COMMAND     Prefer one host command over the guest copy
 EOF
+}
+
+valid_host_command_name() {
+  case "$1" in
+    ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 64 ]
 }
 
 validate_env_name() {
@@ -427,6 +455,8 @@ asset_dir="${AGENT_CONTAINER_ASSET_DIR:-$script_dir}"
 if [ ! -f "$asset_dir/Containerfile" ] \
   || [ ! -f "$asset_dir/Containerfile.dockerignore" ] \
   || [ ! -f "$asset_dir/entrypoint.sh" ] \
+  || [ ! -f "$asset_dir/host-exec-client" ] \
+  || [ ! -f "$asset_dir/host-exec-broker.mjs" ] \
   || [ ! -d "$asset_dir/profiles" ]; then
   asset_dir="${AGENT_CONTAINER_ASSET_DIR:-$host_home_dir/.local/share/agent-container/current}"
 fi
@@ -439,12 +469,22 @@ asset_dir=$(resolve_absolute_dir "$asset_dir") \
   || die "Containerfile.dockerignore not found. Re-run install.sh or set AGENT_CONTAINER_ASSET_DIR."
 [ -f "$asset_dir/entrypoint.sh" ] && [ ! -L "$asset_dir/entrypoint.sh" ] \
   || die "entrypoint.sh not found. Re-run install.sh or set AGENT_CONTAINER_ASSET_DIR."
+[ -f "$asset_dir/host-exec-client" ] && [ ! -L "$asset_dir/host-exec-client" ] \
+  || die "host-exec-client not found. Re-run install.sh or set AGENT_CONTAINER_ASSET_DIR."
+[ -f "$asset_dir/host-exec-broker.mjs" ] && [ ! -L "$asset_dir/host-exec-broker.mjs" ] \
+  || die "host-exec-broker.mjs not found. Re-run install.sh or set AGENT_CONTAINER_ASSET_DIR."
 [ -d "$asset_dir/profiles" ] \
   || die "Profiles directory not found. Re-run install.sh or set AGENT_CONTAINER_ASSET_DIR."
 
 osascript_bin=$(command -v osascript || true)
 [ -n "$osascript_bin" ] \
   || die "macOS osascript/JavaScriptCore is required to validate Agent profiles."
+
+run_mode=false
+extra_share_inputs=()
+extra_share_input_modes=()
+host_exec_denied=()
+host_exec_first=(git)
 
 requested_profile="${1:-}"
 case "$requested_profile" in
@@ -465,8 +505,63 @@ case "$requested_profile" in
     [ "$found_profile" = true ] || die "No Agent profiles are installed."
     exit 0
     ;;
+  run)
+    run_mode=true
+    shift
+    requested_profile="${1:-}"
+    case "$requested_profile" in
+      -h|--help) usage; exit 0 ;;
+      '') die "The run command requires an Agent profile." ;;
+    esac
+    shift
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --share-ro|--share-rw)
+          share_option="$1"
+          [ "$#" -ge 2 ] \
+            || die "$share_option requires a directory path."
+          extra_share_inputs+=("$2")
+          if [ "$share_option" = --share-ro ]; then
+            extra_share_input_modes+=(ro)
+          else
+            extra_share_input_modes+=(rw)
+          fi
+          shift 2
+          ;;
+        --no-host-exec)
+          [ "$#" -ge 2 ] \
+            || die "$1 requires a command name."
+          valid_host_command_name "$2" \
+            || die "Unsafe host command name '$2'."
+          host_exec_denied+=("$2")
+          shift 2
+          ;;
+        --host-first)
+          [ "$#" -ge 2 ] \
+            || die "--host-first requires a command name."
+          valid_host_command_name "$2" \
+            || die "Unsafe host command name '$2'."
+          host_exec_first+=("$2")
+          shift 2
+          ;;
+        --)
+          shift
+          break
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          die "Unknown agent-container run option '$1'. Place Agent arguments after --."
+          ;;
+      esac
+    done
+    ;;
 esac
-shift
+if [ "$run_mode" = false ]; then
+  shift
+fi
 load_profile "$requested_profile"
 
 if [ -n "${AGENT_CONTAINER_IMAGE:-}" ]; then
@@ -689,6 +784,50 @@ if [ -n "$common_git_dir" ]; then
   common_git_dir=$(resolve_absolute_dir "$common_git_dir")
 fi
 
+home_canonical=$(resolve_absolute_dir "$host_home_dir")
+host_home_dir="$home_canonical"
+extra_share_paths=()
+extra_share_modes=()
+if [ "$run_mode" = true ]; then
+  share_index=0
+  while [ "$share_index" -lt "${#extra_share_inputs[@]}" ]; do
+    share_input="${extra_share_inputs[$share_index]}"
+    share_mode="${extra_share_input_modes[$share_index]}"
+    [ -d "$share_input" ] \
+      || die "Additional share is not an existing directory: $share_input"
+    share_path=$(resolve_absolute_dir "$share_input") \
+      || die "Unable to resolve additional share: $share_input"
+    case "$share_path" in
+      /|*$'\n'*|*$'\r'*|*$'\t'*)
+        die "Additional share has an unsafe canonical path: $share_path"
+        ;;
+    esac
+    validate_volume_source_path "$share_path"
+    if path_contains "$share_path" "$home_canonical"; then
+      die "Refusing an additional share that contains the real host HOME: $share_path"
+    fi
+    if paths_overlap "$share_path" "$asset_dir"; then
+      die "Refusing overlap between an additional share and installed runtime assets: $share_path"
+    fi
+    if paths_overlap "$share_path" "$mount_root"; then
+      die "Additional share overlaps the existing workspace mount: $share_path"
+    fi
+    if [ -n "$common_git_dir" ] \
+      && paths_overlap "$share_path" "$common_git_dir"; then
+      die "Additional share overlaps the external Git common directory: $share_path"
+    fi
+    if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+      for existing_share in "${extra_share_paths[@]}"; do
+        paths_overlap "$share_path" "$existing_share" \
+          && die "Additional shares may not overlap: $share_path and $existing_share"
+      done
+    fi
+    extra_share_paths+=("$share_path")
+    extra_share_modes+=("$share_mode")
+    share_index=$((share_index + 1))
+  done
+fi
+
 max_workspace_files="${AGENT_CONTAINER_MAX_FILES:-40000}"
 case "$max_workspace_files" in
   ''|*[!0-9]*) die "AGENT_CONTAINER_MAX_FILES must be a positive integer." ;;
@@ -709,8 +848,6 @@ if [ "$workspace_file_count" -gt "$max_workspace_files" ] \
   die "Workspace mounts have more than $max_workspace_files files. Apple VirtioFS issue #1097 can exhaust host file descriptors and has caused kernel panics. Reduce the mounted tree, or explicitly set AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK=true after reviewing $VIRTIOFS_ISSUE_URL"
 fi
 
-home_canonical=$(resolve_absolute_dir "$host_home_dir")
-host_home_dir="$home_canonical"
 state_root_input="$host_home_dir/.agent-container"
 if [ -n "${AGENT_CONTAINER_STATE_DIR:-}" ] \
   && [ "$AGENT_CONTAINER_STATE_DIR" != "$state_root_input" ]; then
@@ -739,10 +876,19 @@ for shared_tree in "$mount_root" "$common_git_dir"; do
     die "Refusing overlap between shared workspace/Git data '$shared_tree' and private Agent state '$state_root'. Run from a narrower project directory."
   fi
 done
+if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+  for shared_tree in "${extra_share_paths[@]}"; do
+    if path_contains "$shared_tree" "$state_root" \
+      || path_contains "$state_root" "$shared_tree"; then
+      die "Refusing overlap between an additional share '$shared_tree' and private Agent state '$state_root'."
+    fi
+  done
+fi
 
 profiles_root="$state_root/profiles"
 profile_root="$profiles_root/$profile_id"
 profile_home="$profile_root/home"
+profile_host_exec_home="$profile_root/host-home"
 profile_meta="$profile_root/meta"
 sessions_root="$state_root/sessions"
 host_stage_dir="$sessions_root/session-$$"
@@ -777,6 +923,7 @@ fi
 validate_managed_directory "$profiles_root"
 validate_managed_directory "$profile_root"
 validate_managed_directory "$profile_home"
+validate_managed_directory "$profile_host_exec_home"
 validate_managed_directory "$profile_meta"
 validate_managed_directory "$sessions_root"
 validate_managed_directory "$host_stage_dir"
@@ -803,6 +950,11 @@ for volume_source in \
   "$git_xdg_config_dir"; do
   [ -n "$volume_source" ] && validate_volume_source_path "$volume_source"
 done
+if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+  for volume_source in "${extra_share_paths[@]}"; do
+    validate_volume_source_path "$volume_source"
+  done
+fi
 
 # Account for every user-controlled directory that becomes a VirtioFS share.
 # The profile HOME is isolated from the real host HOME, but it can still grow
@@ -826,6 +978,11 @@ if [ -n "$gh_config_dir" ]; then
 fi
 if [ -n "$git_xdg_config_dir" ]; then
   add_tree_to_mount_budget "$git_xdg_config_dir"
+fi
+if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+  for extra_share_path in "${extra_share_paths[@]}"; do
+    add_tree_to_mount_budget "$extra_share_path"
+  done
 fi
 if [ "$mounted_entry_count" -gt "$max_workspace_files" ] \
   && ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
@@ -954,12 +1111,33 @@ mkdir -p \
   "$profiles_root" \
   "$profile_root" \
   "$profile_home" \
+  "$profile_host_exec_home" \
   "$profile_meta" \
   "$sessions_root"
 
 global_lock_acquired=false
 profile_lock_acquired=false
+host_broker_pid=""
+stop_host_broker() {
+  local stop_attempt
+  [ -n "$host_broker_pid" ] || return 0
+  if kill -0 "$host_broker_pid" 2>/dev/null; then
+    kill -TERM "$host_broker_pid" 2>/dev/null || true
+    stop_attempt=0
+    while kill -0 "$host_broker_pid" 2>/dev/null \
+      && [ "$stop_attempt" -lt 50 ]; do
+      sleep 0.1
+      stop_attempt=$((stop_attempt + 1))
+    done
+    if kill -0 "$host_broker_pid" 2>/dev/null; then
+      kill -KILL "$host_broker_pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$host_broker_pid" 2>/dev/null || true
+  host_broker_pid=""
+}
 cleanup_session() {
+  stop_host_broker
   if [ -n "$gitconfig_tmp" ]; then
     rm -f "$gitconfig_tmp" || true
   fi
@@ -1098,6 +1276,290 @@ printf '%s\n' "$profile_id" > "$profile_lock_dir/profile"
 mkdir "$host_stage_dir"
 printf '%s\n' "$$" > "$host_stage_dir/pid"
 printf '%s\n' "$profile_id" > "$host_stage_dir/profile"
+
+host_node_bin=""
+host_broker_bin=""
+if [ "$run_mode" = true ]; then
+  host_path_is_agent_writable() {
+    local candidate_path=$1
+    local writable_index=0
+    if path_contains "$mount_root" "$candidate_path" \
+      || path_contains "$state_root" "$candidate_path"; then
+      return 0
+    fi
+    if [ -n "$common_git_dir" ] \
+      && path_contains "$common_git_dir" "$candidate_path"; then
+      return 0
+    fi
+    while [ "$writable_index" -lt "${#extra_share_paths[@]}" ]; do
+      if [ "${extra_share_modes[$writable_index]}" = rw ] \
+        && path_contains \
+          "${extra_share_paths[$writable_index]}" \
+          "$candidate_path"; then
+        return 0
+      fi
+      writable_index=$((writable_index + 1))
+    done
+    return 1
+  }
+
+  # Agent binaries and launcher internals must remain in the verified guest.
+  # A user blacklist is additive to this small mandatory set.
+  host_exec_denied+=(
+    "$profile_command"
+    agent-container
+    agent-host-exec
+    host-exec
+    claude-container
+    codex-container
+    grok-container
+    container
+    sudo
+  )
+
+  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
+    case "$AGENT_CONTAINER_HOST_BROKER_BIN" in
+      /*) ;;
+      *) die "AGENT_CONTAINER_HOST_BROKER_BIN must be an absolute path." ;;
+    esac
+    host_broker_bin=$(
+      /bin/realpath "$AGENT_CONTAINER_HOST_BROKER_BIN" 2>/dev/null || true
+    )
+    [ -f "$host_broker_bin" ] && [ -x "$host_broker_bin" ] \
+      || die "AGENT_CONTAINER_HOST_BROKER_BIN is not executable: $host_broker_bin"
+    ! host_path_is_agent_writable "$host_broker_bin" \
+      || die "Refusing to execute the host broker from an Agent-writable root: $host_broker_bin"
+  else
+    host_node_command="${AGENT_CONTAINER_HOST_NODE_BIN:-$(command -v node || true)}"
+    case "$host_node_command" in
+      /*) ;;
+      *) die "agent-container run requires a host Node.js executable for the host-exec broker." ;;
+    esac
+    host_node_command=$(
+      /bin/realpath "$host_node_command" 2>/dev/null || true
+    )
+    [ -f "$host_node_command" ] && [ -x "$host_node_command" ] \
+      || die "Host Node.js is not executable: $host_node_command"
+    ! host_path_is_agent_writable "$host_node_command" \
+      || die "Refusing to execute host Node.js from an Agent-writable root: $host_node_command"
+    # Resolve version-manager shims while the user's normal shell environment
+    # is still present; the broker later starts from an intentionally clean env.
+    host_node_bin=$(
+      "$host_node_command" -p 'process.execPath' 2>/dev/null || true
+    )
+    case "$host_node_bin" in
+      /*) ;;
+      *) die "Host Node.js could not resolve its native executable." ;;
+    esac
+    host_node_bin=$(/bin/realpath "$host_node_bin" 2>/dev/null || true)
+    [ -f "$host_node_bin" ] && [ -x "$host_node_bin" ] \
+      || die "Resolved host Node.js is not executable: $host_node_bin"
+    ! host_path_is_agent_writable "$host_node_bin" \
+      || die "Refusing a resolved host Node.js inside an Agent-writable root: $host_node_bin"
+    host_broker_bin="$asset_dir/host-exec-broker.mjs"
+  fi
+
+  host_commands_tmp=$(mktemp "$host_stage_dir/.host-commands.XXXXXX") \
+    || die "Unable to create the host command manifest."
+  host_tool_roots_tmp=$(mktemp "$host_stage_dir/.host-tool-roots.XXXXXX") \
+    || die "Unable to create the host tool-root manifest."
+  host_seen_dir="$host_stage_dir/.host-command-seen"
+  mkdir "$host_seen_dir"
+
+  host_node_runtime_root=""
+  if [ -n "$host_node_bin" ]; then
+    host_node_runtime_root=$(dirname -- "$host_node_bin")
+    if [ "$(basename -- "$host_node_runtime_root")" = bin ]; then
+      node_install_prefix=$(dirname -- "$host_node_runtime_root")
+      case "$node_install_prefix" in
+        /) ;;
+        *) host_node_runtime_root="$node_install_prefix" ;;
+      esac
+    fi
+    if path_contains "$host_node_runtime_root" "$host_home_dir"; then
+      host_node_runtime_root=$(dirname -- "$host_node_bin")
+    fi
+    case "$host_node_runtime_root" in
+      ''|/|*:*|*$'\n'*|*$'\r'*|*$'\t'*) host_node_runtime_root="" ;;
+    esac
+    [ -z "$host_node_runtime_root" ] \
+      || printf '%s\n' "$host_node_runtime_root" >> "$host_tool_roots_tmp"
+  fi
+
+  # Stock macOS developer commands are /usr/bin shims. Freeze common shims
+  # (including Git and Python) to the selected Xcode/CommandLineTools
+  # executables and admit their containing runtime tree read-only; this avoids
+  # xcrun trying to create ambient host cache files inside the sandbox.
+  host_developer_path=""
+  host_developer_root=""
+  if [ -x /usr/bin/xcode-select ]; then
+    host_developer_path=$(/usr/bin/xcode-select -p 2>/dev/null || true)
+  fi
+  case "$host_developer_path" in
+    /*)
+      host_developer_path=$(resolve_absolute_dir "$host_developer_path" || true)
+      ;;
+    *) host_developer_path="" ;;
+  esac
+  case "$host_developer_path" in
+    */Contents/Developer)
+      host_developer_root=${host_developer_path%/Contents/Developer}
+      ;;
+    *) host_developer_root="$host_developer_path" ;;
+  esac
+  case "$host_developer_root" in
+    /|*:*|*$'\n'*|*$'\r'*|*$'\t'*) host_developer_root="" ;;
+  esac
+  if [ -n "$host_developer_root" ] \
+    && path_contains "$host_developer_root" "$host_home_dir"; then
+    host_developer_root=""
+  fi
+  [ -z "$host_developer_root" ] \
+    || printf '%s\n' "$host_developer_root" >> "$host_tool_roots_tmp"
+
+  IFS=: read -r -a host_path_entries <<EOF
+${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
+EOF
+  for host_path_entry in "${host_path_entries[@]}"; do
+    [ -n "$host_path_entry" ] || continue
+    case "$host_path_entry" in
+      /*) ;;
+      *) continue ;;
+    esac
+    [ -d "$host_path_entry" ] || continue
+    canonical_host_path=$(resolve_absolute_dir "$host_path_entry" || true)
+    [ -n "$canonical_host_path" ] || continue
+    case "$canonical_host_path" in
+      *$'\n'*|*$'\r'*|*$'\t'*) continue ;;
+    esac
+
+    host_tool_root="$canonical_host_path"
+    case "$canonical_host_path/" in
+      "$host_home_dir/.nvm/"*) host_tool_root="$host_home_dir/.nvm" ;;
+      "$host_home_dir/.pyenv/"*) host_tool_root="$host_home_dir/.pyenv" ;;
+      /opt/homebrew/*) host_tool_root=/opt/homebrew ;;
+      /usr/local/*) host_tool_root=/usr/local ;;
+    esac
+    printf '%s\n' "$host_tool_root" >> "$host_tool_roots_tmp"
+
+    for host_candidate in "$canonical_host_path"/*; do
+      [ -e "$host_candidate" ] || [ -L "$host_candidate" ] || continue
+      [ -f "$host_candidate" ] || continue
+      [ -x "$host_candidate" ] || continue
+      host_command_name=$(basename -- "$host_candidate")
+      valid_host_command_name "$host_command_name" || continue
+      [ ! -e "$host_seen_dir/$host_command_name" ] || continue
+      : > "$host_seen_dir/$host_command_name"
+      array_contains_value "$host_command_name" "${host_exec_denied[@]}" \
+        && continue
+      host_command_mode=fallback
+      if array_contains_value "$host_command_name" "${host_exec_first[@]}"; then
+        host_command_mode=first
+      fi
+      host_executable="$host_candidate"
+      if [ "$host_command_name" = node ] && [ -n "$host_node_bin" ]; then
+        candidate_node=$(/bin/realpath "$host_candidate" 2>/dev/null || true)
+        if [ "$candidate_node" = "$host_node_command" ] \
+          || [ "$candidate_node" = "$host_node_bin" ]; then
+          # A version-manager shim was already executed and validated during
+          # bootstrap. Freeze direct host `node` calls to its process.execPath
+          # so the sandbox does not need mutable shim/cache behavior at runtime.
+          host_executable="$host_node_bin"
+        fi
+      fi
+      selected_developer_tool=""
+      case "$host_command_name" in
+        ar|as|c++|cc|clang|clang++|gcc|git|ld|libtool|lipo|make|nm|otool|pip3|python3|ranlib|size|strings|strip|swift|swiftc|xcodebuild)
+          if [ "$host_candidate" = "/usr/bin/$host_command_name" ] \
+            && [ -n "$host_developer_path" ]; then
+            for developer_tool_candidate in \
+              "$host_developer_path/usr/bin/$host_command_name" \
+              "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin/$host_command_name"; do
+              if [ -f "$developer_tool_candidate" ] \
+                && [ -x "$developer_tool_candidate" ]; then
+                selected_developer_tool="$developer_tool_candidate"
+                break
+              fi
+            done
+          fi
+          ;;
+      esac
+      if [ -n "$selected_developer_tool" ]; then
+        case "$selected_developer_tool" in
+          "$host_developer_root"/*)
+            [ -f "$selected_developer_tool" ] \
+              && [ -x "$selected_developer_tool" ] \
+              && host_executable="$selected_developer_tool"
+            ;;
+        esac
+      fi
+      case "$host_executable" in
+        *$'\n'*|*$'\r'*|*$'\t'*) continue ;;
+      esac
+      canonical_host_executable=$(
+        /bin/realpath "$host_executable" 2>/dev/null || true
+      )
+      [ -f "$canonical_host_executable" ] \
+        && [ -x "$canonical_host_executable" ] \
+        || continue
+      executable_in_tool_root=false
+      for executable_root in \
+        "$host_tool_root" \
+        "$host_node_runtime_root" \
+        "$host_developer_root" \
+        /bin /sbin /usr/bin /usr/sbin; do
+        [ -n "$executable_root" ] || continue
+        if path_contains "$executable_root" "$canonical_host_executable"; then
+          executable_in_tool_root=true
+          break
+        fi
+      done
+      # A PATH directory may contain unrelated symlinks into arbitrary trees
+      # (pipx/uv layouts are common). Skip only that basename instead of writing
+      # a manifest entry that would make the broker reject the entire session.
+      [ "$executable_in_tool_root" = true ] || continue
+      printf '%s\t%s\t%s\n' \
+        "$host_command_mode" "$host_command_name" "$canonical_host_executable" \
+        >> "$host_commands_tmp"
+    done
+  done
+
+  rm -rf "$host_seen_dir"
+  mv "$host_commands_tmp" "$host_stage_dir/host-commands.tsv"
+  sort -u "$host_tool_roots_tmp" > "$host_stage_dir/host-tool-roots.txt"
+  rm -f "$host_tool_roots_tmp"
+  chmod 0600 \
+    "$host_stage_dir/host-commands.tsv" \
+    "$host_stage_dir/host-tool-roots.txt"
+
+  host_roots_tmp=$(mktemp "$host_stage_dir/.host-roots.XXXXXX") \
+    || die "Unable to create the host-exec root manifest."
+  printf 'rw\t%s\n' "$mount_root" >> "$host_roots_tmp"
+  if [ -n "$common_git_dir" ] \
+    && ! path_contains "$mount_root" "$common_git_dir"; then
+    printf 'rw\t%s\n' "$common_git_dir" >> "$host_roots_tmp"
+  fi
+  share_index=0
+  while [ "$share_index" -lt "${#extra_share_paths[@]}" ]; do
+    printf '%s\t%s\n' \
+      "${extra_share_modes[$share_index]}" \
+      "${extra_share_paths[$share_index]}" \
+      >> "$host_roots_tmp"
+    share_index=$((share_index + 1))
+  done
+  mv "$host_roots_tmp" "$host_stage_dir/host-roots.tsv"
+  chmod 0600 "$host_stage_dir/host-roots.tsv"
+
+  host_exec_token=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null \
+    | od -An -tx1 | tr -d ' \n')
+  case "$host_exec_token" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+    *) die "Unable to generate a host-exec session token." ;;
+  esac
+  [ "${#host_exec_token}" -eq 64 ] \
+    || die "Unable to generate a complete host-exec session token."
+  atomic_write_line "$host_stage_dir/host-exec-token" "$host_exec_token"
+fi
 
 # Registration is now visible to an uninstaller holding the same lifecycle
 # mutex. Release the short gate so explicitly accepted concurrent sessions can
@@ -1238,6 +1700,8 @@ asset_fingerprint=$(
     sha256_file "$asset_dir/Containerfile"
     sha256_file "$asset_dir/Containerfile.dockerignore"
     sha256_file "$asset_dir/entrypoint.sh"
+    sha256_file "$asset_dir/host-exec-client"
+    sha256_file "$asset_dir/host-exec-broker.mjs"
     sha256_file "$profile_file"
     printf '%s\n' "$agent_version"
     printf '%s\n' "$base_image"
@@ -1393,6 +1857,147 @@ if [ "$build_required" = true ]; then
   atomic_write_line "$image_identity_file" "$image_identity"
 fi
 atomic_write_line "$image_ref_file" "$image_name"
+
+if [ "$run_mode" = true ]; then
+  host_gateway="${AGENT_CONTAINER_HOST_GATEWAY:-}"
+  if [ -z "$host_gateway" ]; then
+    network_inspect_tmp="$host_stage_dir/.network-inspect.$$"
+    "$container_bin" network inspect default > "$network_inspect_tmp" 2>/dev/null \
+      || die "Unable to inspect Apple's default container network for host-exec."
+    host_gateway=$(
+      "$osascript_bin" -l JavaScript - "$network_inspect_tmp" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('network inspect is not readable UTF-8');
+  const networks = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(networks) || networks.length !== 1) {
+    throw new Error('network inspect must contain exactly one network');
+  }
+  const gateway = networks[0]
+    && networks[0].status
+    && networks[0].status.ipv4Gateway;
+  if (typeof gateway !== 'string'
+      || !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(gateway)) {
+    throw new Error('default network has no IPv4 gateway');
+  }
+  return gateway;
+}
+JXA
+    ) || {
+      rm -f "$network_inspect_tmp"
+      die "Apple's default container network returned an invalid host gateway."
+    }
+    rm -f "$network_inspect_tmp"
+  fi
+  if ! printf '%s\n' "$host_gateway" \
+    | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1; ok = 1 } END { exit !ok }'; then
+    die "Unsafe host-exec gateway address: $host_gateway"
+  fi
+
+  rm -f "$host_stage_dir/host-exec-endpoint"
+  broker_args=(
+    --session-dir "$host_stage_dir"
+    --bind-address "$host_gateway"
+    --launcher-pid "$$"
+    --real-home "$host_home_dir"
+    --exec-home "$profile_host_exec_home"
+    --sandbox-bin /usr/bin/sandbox-exec
+  )
+  host_broker_path=""
+  broker_path_index=0
+  developer_path_inserted=false
+  while [ "$broker_path_index" -lt "${#host_path_entries[@]}" ]; do
+    broker_path_entry=${host_path_entries[$broker_path_index]}
+    broker_path_index=$((broker_path_index + 1))
+    case "$broker_path_entry" in
+      /*) ;;
+      *) continue ;;
+    esac
+    [ -d "$broker_path_entry" ] || continue
+    broker_path_entry=$(resolve_absolute_dir "$broker_path_entry" || true)
+    case "$broker_path_entry" in
+      ''|*:*|*$'\n'*|*$'\r'*|*$'\t'*) continue ;;
+    esac
+    if [ "$broker_path_entry" = /usr/bin ] \
+      && [ "$developer_path_inserted" = false ] \
+      && [ -n "$host_developer_root" ]; then
+      for developer_bin_dir in \
+        "$host_developer_path/usr/bin" \
+        "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin"; do
+        [ -d "$developer_bin_dir" ] || continue
+        if [ -n "$host_broker_path" ]; then
+          host_broker_path="$host_broker_path:$developer_bin_dir"
+        else
+          host_broker_path="$developer_bin_dir"
+        fi
+      done
+      developer_path_inserted=true
+    fi
+    if [ -n "$host_broker_path" ]; then
+      host_broker_path="$host_broker_path:$broker_path_entry"
+    else
+      host_broker_path="$broker_path_entry"
+    fi
+  done
+  [ -n "$host_broker_path" ] \
+    || host_broker_path=/usr/bin:/bin:/usr/sbin:/sbin
+  broker_env=(
+    "PATH=$host_broker_path"
+    "HOME=$host_home_dir"
+  )
+  [ -n "${LANG:-}" ] && broker_env+=("LANG=$LANG")
+  [ -n "${LC_ALL:-}" ] && broker_env+=("LC_ALL=$LC_ALL")
+  [ -n "${LC_CTYPE:-}" ] && broker_env+=("LC_CTYPE=$LC_CTYPE")
+  [ -n "${LC_MESSAGES:-}" ] && broker_env+=("LC_MESSAGES=$LC_MESSAGES")
+  [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
+  [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
+  [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
+  if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    broker_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+  fi
+  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
+    env -i "${broker_env[@]}" \
+      "$host_broker_bin" "${broker_args[@]}" \
+      > "$host_stage_dir/host-exec-broker.log" 2>&1 &
+  else
+    env -i "${broker_env[@]}" \
+      "$host_node_bin" "$host_broker_bin" "${broker_args[@]}" \
+      > "$host_stage_dir/host-exec-broker.log" 2>&1 &
+  fi
+  host_broker_pid=$!
+
+  broker_ready_attempt=0
+  while [ ! -f "$host_stage_dir/host-exec-endpoint" ] \
+    && kill -0 "$host_broker_pid" 2>/dev/null \
+    && [ "$broker_ready_attempt" -lt 100 ]; do
+    sleep 0.05
+    broker_ready_attempt=$((broker_ready_attempt + 1))
+  done
+  host_exec_endpoint=$(read_single_line "$host_stage_dir/host-exec-endpoint" || true)
+  host_exec_port=""
+  case "$host_exec_endpoint" in
+    "$host_gateway":*) host_exec_port=${host_exec_endpoint#"$host_gateway:"} ;;
+  esac
+  case "$host_exec_port" in
+    ''|0|0*|*[!0-9]*) host_exec_port="" ;;
+  esac
+  if [ -z "$host_exec_port" ] \
+    || [ "${#host_exec_port}" -gt 5 ] \
+    || [ "$host_exec_port" -gt 65535 ] 2>/dev/null; then
+    stop_host_broker
+    die "The host-exec broker did not publish a valid session endpoint."
+  fi
+  chmod 0600 "$host_stage_dir/host-exec-endpoint" \
+    "$host_stage_dir/host-exec-broker.log"
+fi
+
 container_name="agent-$profile_id-$host_uid-$$"
 
 create_args=(
@@ -1424,6 +2029,18 @@ if [ -n "$common_git_dir" ] && [ -d "$common_git_dir" ]; then
     *) create_args+=(--volume "$common_git_dir:$common_git_dir") ;;
   esac
 fi
+
+share_index=0
+while [ "$share_index" -lt "${#extra_share_paths[@]}" ]; do
+  share_path="${extra_share_paths[$share_index]}"
+  share_mode="${extra_share_modes[$share_index]}"
+  if [ "$share_mode" = ro ]; then
+    create_args+=(--volume "$share_path:$share_path:ro")
+  else
+    create_args+=(--volume "$share_path:$share_path")
+  fi
+  share_index=$((share_index + 1))
+done
 
 if [ -n "$gh_config_dir" ]; then
   create_args+=(--volume "$gh_config_dir:$host_home_dir/.config/gh:ro")

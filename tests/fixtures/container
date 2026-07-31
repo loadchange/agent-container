@@ -103,6 +103,19 @@ capture_staged_capabilities() {
     mkdir -p "$FAKE_CAPTURE_SSH_DIR"
     cp -R "$staged_ssh/." "$FAKE_CAPTURE_SSH_DIR/"
   fi
+  if [ -n "${FAKE_CAPTURE_HOST_STAGE_DIR:-}" ]; then
+    stage_source=""
+    for argument in "$@"; do
+      case "$argument" in
+        *:/run/agent-host:ro)
+          stage_source=${argument%:/run/agent-host:ro}
+          ;;
+      esac
+    done
+    [ -d "$stage_source" ] || return 68
+    mkdir -p "$FAKE_CAPTURE_HOST_STAGE_DIR"
+    cp -R "$stage_source/." "$FAKE_CAPTURE_HOST_STAGE_DIR/"
+  fi
 }
 
 set_post_start_state() {
@@ -225,6 +238,15 @@ case "${1:-}" in
         fake_image_state=$(fake_image_state_for_ref "$image_ref")
         rm -f "$fake_image_state"
         exit 0
+        ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  network)
+    case "${2:-}" in
+      inspect)
+        printf '%s\n' \
+          '[{"id":"default","status":{"ipv4Gateway":"192.168.64.1"}}]'
         ;;
       *) exit 0 ;;
     esac

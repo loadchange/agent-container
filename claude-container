@@ -1,4 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-exec "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/agent-container" claude "$@"
+launcher="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/agent-container"
+if [ "${1:-}" = run ]; then
+  shift
+  exec "$launcher" run claude "$@"
+fi
+exec "$launcher" claude "$@"

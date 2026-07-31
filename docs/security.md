@@ -9,7 +9,9 @@ an interactive, physical-machine-like development workflow.
 
 The Micro-VM is an isolation boundary, not a guarantee that mounted data is
 safe. Anything explicitly shared with the guest must be treated as available
-to the Agent, its subprocesses, and any code executed from the workspace.
+to the Agent, its subprocesses, and any code executed from the workspace. In
+explicit `run` mode, the workspace and additional share policy also defines
+what sandboxed brokered host processes can read or modify.
 
 The macOS user account, installed launcher assets, and Apple's per-user
 container services are trusted. Another process already running as the same
@@ -18,7 +20,7 @@ does not claim to isolate mutually hostile host processes from one another.
 
 ## What is isolated
 
-By default the guest does not receive:
+In the legacy launch mode, the guest does not receive:
 
 - the real macOS home directory as a wholesale share;
 - another Agent profile's persistent home;
@@ -31,6 +33,11 @@ By default the guest does not receive:
 The workspace and explicitly enabled capability paths can still be selected
 subdirectories of the macOS home. They are mounted separately and do not turn
 the parent home into a share.
+
+Explicit `run` mode is a separate opt-in boundary. It adds a per-session native
+host-command broker, selected host Git configuration, and access to a live host
+SSH agent when one exists. These capabilities are described below; selecting
+`run` must not be interpreted as preserving the legacy Micro-VM-only boundary.
 
 The Linux root filesystem is ephemeral per session. The selected profile has a
 persistent shadow HOME under
@@ -68,10 +75,13 @@ Higher-risk host integrations require explicit environment switches:
 |---|---|---|
 | Profile API key | `AGENT_CONTAINER_FORWARD_API_KEY=true` | the profile's declared key environment variable |
 | SSH agent | `AGENT_CONTAINER_FORWARD_SSH_AGENT=true` | signing/authentication through the live agent socket |
-| SSH metadata | `AGENT_CONTAINER_MOUNT_SSH_CONFIG=true` | non-symlink `config`, `known_hosts*`, `allowed_signers` files |
+| SSH metadata | `AGENT_CONTAINER_MOUNT_SSH_CONFIG=true` | selected `config`, `known_hosts`, `known_hosts.old`, `allowed_signers` files |
 | GitHub CLI config | `AGENT_CONTAINER_MOUNT_GH=true` | host `~/.config/gh` read-only |
 | Full Git config | `AGENT_CONTAINER_FULL_GIT_CONFIG=true` | host `~/.gitconfig` copy and `~/.config/git` read-only |
 | Concurrent VMs | `AGENT_CONTAINER_ALLOW_CONCURRENT=true` plus risk acceptance | additional VirtioFS-affected sessions across distinct profiles; one session per profile remains enforced |
+| Sandboxed host commands | `agent-container run <profile> ...` or `<profile>-container run ...` | eligible native commands from the host `PATH`; live SSH agent when present |
+| Additional directory, read-only | `--share-ro PATH` in `run` mode | directory contents to the guest and brokered host processes without write authorization |
+| Additional directory, read-write | `--share-rw PATH` in `run` mode | read, change, and delete authority for both the guest and brokered host processes |
 
 Enabling a capability authorizes use, not only reading. SSH agent forwarding
 does not reveal private-key bytes, but guest code can request signatures or
@@ -83,6 +93,123 @@ SSH private keys are never copied by the launcher. SSH metadata mounting and
 SSH agent forwarding are separate decisions. A key file committed or copied
 inside the selected workspace is still visible because the workspace itself is
 the intended read-write capability.
+
+## Explicit run mode and native host execution
+
+The compatibility commands reserve an explicit `run` form, equivalent to the
+generic launcher form:
+
+```bash
+codex-container run --share-ro /path/to/reference --
+agent-container run codex --share-ro /path/to/reference --
+```
+
+The legacy `codex-container ...` and `agent-container codex ...` forms do not
+start a host broker. `run` is intentionally broader: every guest process that
+can read the per-session token can request any command in that session's frozen
+host-command manifest. Token authentication rejects clients that do not possess
+the session token; it is not a way to distinguish the Agent from untrusted code
+the Agent launches inside the same guest.
+
+At launch, the host `PATH` is reduced to safe executable basenames and canonical
+paths. Most host commands are fallbacks behind guest command directories, so a
+guest-native Linux command wins. `git` is host-first by default. The selected
+Agent command, launcher compatibility commands, the Apple `container` command,
+and `sudo` are excluded. `--no-host-exec COMMAND` removes another direct host
+entry and can be repeated; `--host-first COMMAND` changes an eligible command's
+resolution order. These controls govern broker entry points, not a security
+boundary: an allowed shell, Node.js/Python interpreter, Git hook, or credential
+helper can start another executable. The generated macOS filesystem sandbox
+applies to that derived process tree and is the boundary that enforces admitted
+read/write roots. `--no-host-exec git`, for example, removes the direct `git`
+shim but cannot prevent another allowed host process from starting Git inside
+the same sandbox.
+
+The per-session broker itself needs a native Node.js bootstrap before its
+generated sandbox exists. The launcher canonicalizes the selected command and
+the `process.execPath` it reports, and refuses to execute either from the
+workspace, private Agent state, an external writable Git directory, or a
+read-write additional share. PATH symlinks that resolve outside their admitted
+read-only tool runtime are omitted one basename at a time. A host Node installed
+elsewhere remains a trusted launcher dependency; `run` should not be used with a
+host toolchain whose ownership or integrity is not trusted.
+
+The broker never evaluates a shell command assembled by the guest. It validates
+the token and frozen basename-to-path mapping, preserves the argument vector,
+and starts the canonical executable in a new process group under a generated
+macOS sandbox profile. Host executable/runtime roots are read-only. The
+repository and required external Git directory are read-write. Each additional
+canonical directory is admitted with the same `ro` or `rw` mode used for its
+guest mount. Unsafe roots, the complete real HOME, overlaps, and paths colliding
+with runtime state or assets are rejected. Thus `--share-ro` is enforced on
+both sides of the bridge, although it still authorizes reading and possible
+network exfiltration. Host runtime roots can be broader than one executable—for
+example a Homebrew, nvm, pyenv, or selected Xcode/CommandLineTools installation
+tree—and their complete admitted contents are readable even though they are not
+writable.
+
+This boundary currently depends on Apple's deprecated `/usr/bin/sandbox-exec`
+interface. The launcher refuses to start host-exec without it, but deprecation
+means its behavior and availability require validation on each supported macOS
+release. The generated profile is a defense-in-depth boundary with a platform
+lifecycle risk, not a promise that Apple will preserve this API indefinitely.
+
+Ordinary host commands receive
+`~/.agent-container/profiles/<profile>/host-home` as HOME. This avoids ambient
+access through the real HOME and keeps their mutable state separate from both
+the native macOS tool configuration and the guest's shadow HOME. That directory
+persists across sessions for the profile and must itself be treated as mutable
+tool state.
+
+Host Git deliberately uses the real host HOME for configuration discovery, but
+the sandbox admits only the selected real `.gitconfig` and `.config/git`
+configuration inputs rather than the entire directory. It also admits the named
+`.ssh/config`, `.ssh/known_hosts`, `.ssh/known_hosts.old`, and
+`.ssh/allowed_signers` metadata paths read-only. The broker does not
+independently reject a named path merely because
+it is a symlink; its target must independently fall within a sandbox-authorized
+root, or traversal fails. SSH private-key files are not admitted. Values in the
+admitted Git configuration are readable by host Git and can be printed back to
+the guest, so secrets must not be stored there casually. Git configuration is
+also active behavior, not passive text: aliases, includes, hooks,
+credential helpers, filters, signing commands, URL rewrites, and SSH
+configuration can cause more native processes, authentication, or network
+access. Includes that point outside admitted roots may fail, but should not be
+treated as a security policy by themselves.
+
+When a live `SSH_AUTH_SOCK` exists, `run` admits that socket to the broker by
+default so host Git and other allowed native tools can authenticate or request
+signatures. Private-key bytes are not mounted or copied, but possession of the
+socket is authority to use the agent. A configured credential helper may also
+be executed. Whether Keychain-backed helpers can access macOS Keychain from the
+generated sandbox is platform- and release-dependent and remains a validation
+item; do not rely on either success or denial as a stable security guarantee.
+Use `--no-host-exec git` to keep the direct `git` command guest-native, and use a
+legacy session when no native host process or live host SSH-agent exposure is
+acceptable.
+
+The command allowlist and filesystem sandbox do not create a network allowlist.
+A permitted native tool may use the host network, and an interpreter such as
+Node.js or Python can execute arbitrary program logic with the macOS user's
+identity inside the admitted sandbox policy. Review workspace code and every
+shared directory before granting this mode.
+
+The broker uses a random 256-bit token and per-session endpoint and manifests.
+They are staged with restrictive permissions and exposed read-only to the guest.
+Each request is one non-PTY connection with piped stdin and streamed stdout and
+stderr. Interactive native programs that require a controlling terminal, raw
+mode, or terminal ioctls are unsupported even when the outer Agent has a TTY.
+
+Every request has its own process group. Connection loss terminates that group;
+normal launcher cleanup stops the broker and all groups before deleting the
+token and manifests. The broker watches the launcher PID as an additional
+parent-death control, so an uncatchable launcher exit does not intentionally
+leave normal host children or services running. A child that deliberately calls
+`setsid` can leave its original process group and evade PGID cleanup; such
+daemonization is unsupported, and the broker must not be treated as a durable
+service manager or a hostile-process containment boundary. Lifecycle cleanup
+also does not undo filesystem writes, network actions, authentication, or
+signatures already performed during the session.
 
 ## Authentication
 
@@ -145,6 +272,11 @@ symlinks, refuses state outside the host home, and rejects overlap between
 private state and workspace/Git shares. A non-empty state root must carry the
 exact ownership marker before adoption.
 
+Run-mode extra shares must be existing canonical directories. They may not
+contain the real host HOME, overlap the workspace, external Git directory,
+runtime assets, private state, or one another. The same canonical roots and
+access modes feed both the Apple bind mounts and the broker sandbox manifest.
+
 Per-session Git and SSH staging is created with a restrictive umask, mounted
 read-only, and removed on exit. Image deletion should rely on the recorded
 reference, build fingerprint, inspected identity, and ownership provenance;
@@ -165,7 +297,7 @@ reports retained host file descriptors during large VirtioFS scans. Reports
 include host application failures and a kernel panic. Current mitigations are:
 
 - a default 40,000-entry budget across workspace, external Git data, profile
-  HOME, and opted-in configuration shares;
+  HOME, run-mode extra directories, and opted-in configuration shares;
 - a projected 70% host file/per-process-file/vnode preflight;
 - one native session globally by default;
 - a live watchdog that stops the named VM at 80% by default;
