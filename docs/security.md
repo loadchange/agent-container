@@ -24,7 +24,8 @@ In the legacy launch mode, the guest does not receive:
 
 - the real macOS home directory as a wholesale share;
 - another Agent profile's persistent home;
-- host API keys from the environment;
+- host credentials from the environment, except the deliberate Claude
+  custom-provider pair described below;
 - host `~/.ssh` private-key files or the SSH agent socket;
 - the host GitHub CLI configuration;
 - the full host Git or XDG Git configuration;
@@ -75,13 +76,22 @@ contain OAuth/session tokens, private-key paths, file descriptors, and internal
 host process state. Values are inherited with Apple container's `--env NAME`
 form rather than copied into command arguments.
 
-## Capabilities are denied by default
+Claude also treats a non-empty exported `ANTHROPIC_BASE_URL` together with an
+exported `ANTHROPIC_AUTH_TOKEN` as one deliberate custom-provider
+configuration. Only that exact token name is added automatically, only for the
+Claude profile, and only while the custom endpoint is present. This is the
+default `auto` mode; `AGENT_CONTAINER_FORWARD_API_KEY=false` disables the
+exception. A standalone token, `ANTHROPIC_API_KEY`, other profile credentials,
+and prefix-matched secrets remain denied by default.
 
-Higher-risk host integrations require explicit environment switches:
+## Other capabilities are denied by default
+
+Apart from the narrow Claude custom-provider bundle above, higher-risk host
+integrations require explicit environment switches:
 
 | Capability | Switch | Exposure |
 |---|---|---|
-| Profile credential | `AGENT_CONTAINER_FORWARD_API_KEY=true` | the selected profile's declared authentication variables; Claude accepts `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` |
+| Profile credential | `AGENT_CONTAINER_FORWARD_API_KEY=auto|true|false` | `auto` admits only Claude's custom-provider token pair, `true` admits credential names recognized for the active profile, and `false` (or an explicitly empty value) disables this credential path |
 | Additional exact environment names | `AGENT_CONTAINER_FORWARD_ENV=NAME1,NAME2` | each named, exported host value; launcher identity, shell-loader, proxy, and updater variables are rejected |
 | SSH agent | `AGENT_CONTAINER_FORWARD_SSH_AGENT=true` | signing/authentication through the live agent socket |
 | SSH metadata | `AGENT_CONTAINER_MOUNT_SSH_CONFIG=true` | selected `config`, `known_hosts`, `known_hosts.old`, `allowed_signers` files |
@@ -244,11 +254,14 @@ export OPENAI_API_KEY='...'
 AGENT_CONTAINER_FORWARD_API_KEY=true agent-container codex
 ```
 
-The core forwards only the selected profile's declared variables. For the
-built-in profiles these are `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` for
-Claude, `OPENAI_API_KEY` for Codex, and `XAI_API_KEY` for Grok. If more than one
-declared Claude credential is exported, both names are inherited so Claude can
-apply its own precedence rules. Do not put keys or tokens in command-line
+The core forwards only the selected profile's recognized credential names. For
+the built-in profiles these are `ANTHROPIC_API_KEY` or
+`ANTHROPIC_AUTH_TOKEN` for Claude, `OPENAI_API_KEY` for Codex, and `XAI_API_KEY`
+for Grok. If more than one recognized Claude credential is exported under the
+explicit switch, both names are inherited so Claude can apply its own
+precedence rules. The custom-provider
+`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` pair is the sole automatic
+credential exception described above. Do not put keys or tokens in command-line
 arguments, image build arguments, profile JSON, or a repository file.
 
 The credential is still readable by processes in that guest session and can be

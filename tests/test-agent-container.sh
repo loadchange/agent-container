@@ -130,6 +130,16 @@ command_arguments() {
   ' "$file"
 }
 
+assert_create_env_name() {
+  local file="$1"
+  local env_name="$2"
+  command_arguments "$file" create | awk -v expected="ARG=$env_name" '
+    previous == "ARG=--env" && $0 == expected { found = 1 }
+    { previous = $0 }
+    END { exit !found }
+  ' || fail "expected create to pass --env followed by $env_name"
+}
+
 reset_case_environment() {
   unset \
     AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK \
@@ -236,7 +246,6 @@ launch_exec() {
     "AGENT_CONTAINER_ALLOW_CONCURRENT=${AGENT_CONTAINER_ALLOW_CONCURRENT:-false}"
     "AGENT_CONTAINER_ENABLE_EXPERIMENTAL=${AGENT_CONTAINER_ENABLE_EXPERIMENTAL:-false}"
     "AGENT_CONTAINER_FORWARD_ENV=${AGENT_CONTAINER_FORWARD_ENV:-}"
-    "AGENT_CONTAINER_FORWARD_API_KEY=${AGENT_CONTAINER_FORWARD_API_KEY:-false}"
     "AGENT_CONTAINER_FORWARD_SSH_AGENT=${AGENT_CONTAINER_FORWARD_SSH_AGENT:-false}"
     "AGENT_CONTAINER_FULL_GIT_CONFIG=${AGENT_CONTAINER_FULL_GIT_CONFIG:-false}"
     "AGENT_CONTAINER_HOST_BROKER_BIN=${AGENT_CONTAINER_HOST_BROKER_BIN:-}"
@@ -288,6 +297,9 @@ launch_exec() {
     "FAKE_SYSTEM_RUNNING=${FAKE_SYSTEM_RUNNING:-true}"
   )
 
+  if [ -n "${AGENT_CONTAINER_FORWARD_API_KEY+x}" ]; then
+    runner_env+=("AGENT_CONTAINER_FORWARD_API_KEY=$AGENT_CONTAINER_FORWARD_API_KEY")
+  fi
   if [ -n "${ANTHROPIC_API_KEY+x}" ]; then
     runner_env+=("ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
   fi
@@ -920,6 +932,7 @@ export CLAUDE_CODE_NO_FLICKER=
 export DISABLE_AUTOUPDATER=0
 export CLAUDE_CODE_OAUTH_TOKEN='PREFIX_SECRET_MUST_NOT_BE_LOGGED'
 export ANTHROPIC_WEBHOOK_SIGNING_KEY='ANTHROPIC_PREFIX_SECRET_MUST_NOT_BE_LOGGED'
+ANTHROPIC_API_KEY='AUTO_API_KEY_MUST_NOT_BE_LOGGED'
 ANTHROPIC_AUTH_TOKEN='AUTH_TOKEN_MUST_NOT_BE_LOGGED'
 run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"
@@ -929,23 +942,89 @@ for runtime_env_name in "${claude_runtime_env_names[@]}"; do
 done
 assert_line "$case_log" "ARG=DISABLE_AUTOUPDATER=1"
 assert_no_line "$case_log" "ARG=DISABLE_AUTOUPDATER=0"
-assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_create_env_name "$case_log" ANTHROPIC_AUTH_TOKEN
+assert_no_line "$case_log" "ARG=ANTHROPIC_API_KEY"
 assert_no_line "$case_log" "ARG=CLAUDE_CODE_OAUTH_TOKEN"
 assert_no_line "$case_log" "ARG=ANTHROPIC_WEBHOOK_SIGNING_KEY"
 assert_secret_absent "$case_log" "$runtime_env_value" "Claude runtime environment"
+assert_secret_absent "$case_log" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
 assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
 assert_secret_absent "$case_log" "$CLAUDE_CODE_OAUTH_TOKEN" CLAUDE_CODE_OAUTH_TOKEN
 assert_secret_absent "$case_log" "$ANTHROPIC_WEBHOOK_SIGNING_KEY" ANTHROPIC_WEBHOOK_SIGNING_KEY
-pass "Claude inherits the exact reviewed runtime settings without values or prefix expansion"
+assert_secret_absent "$case_dir/out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+pass "Claude inherits reviewed settings and custom-provider auth without values or prefix expansion"
+
+tests_run=$((tests_run + 1))
+new_case claude_provider_credential_modes
+ANTHROPIC_AUTH_TOKEN='PROVIDER_AUTH_MUST_NOT_BE_LOGGED'
+export ANTHROPIC_BASE_URL=
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/empty-base.out" 2>"$case_dir/empty-base.err"
+assert_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
+assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/empty-base.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/empty-base.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+
+: > "$case_log"
+export ANTHROPIC_BASE_URL='https://provider.example.test/anthropic'
+AGENT_CONTAINER_FORWARD_API_KEY=false
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/disabled.out" 2>"$case_dir/disabled.err"
+assert_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
+assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/disabled.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/disabled.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+
+: > "$case_log"
+AGENT_CONTAINER_FORWARD_API_KEY=
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/empty-mode.out" 2>"$case_dir/empty-mode.err"
+assert_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
+assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/empty-mode.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/empty-mode.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+
+: > "$case_log"
+AGENT_CONTAINER_FORWARD_API_KEY=auto
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/auto.out" 2>"$case_dir/auto.err"
+assert_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
+assert_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_create_env_name "$case_log" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/auto.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/auto.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+
+: > "$case_log"
+AGENT_CONTAINER_FORWARD_API_KEY=invalid
+if run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/invalid.out" 2>"$case_dir/invalid.err"; then
+  fail "an invalid credential forwarding mode should fail"
+fi
+assert_contains "$case_dir/invalid.err" \
+  "AGENT_CONTAINER_FORWARD_API_KEY must be auto, true, or false"
+assert_secret_absent "$case_dir/invalid.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/invalid.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+[ ! -s "$case_log" ] \
+  || fail "invalid credential forwarding mode contacted the Apple runtime"
+pass "Claude provider auth honors empty endpoints and explicit auto, disabled, and invalid modes"
 
 tests_run=$((tests_run + 1))
 new_case claude_environment_is_profile_scoped
 export ANTHROPIC_BASE_URL='https://provider.example.test/claude'
+ANTHROPIC_AUTH_TOKEN='PROFILE_SCOPED_AUTH_MUST_NOT_BE_LOGGED'
 export CLAUDE_CODE_EFFORT_LEVEL=max
 run_program "$repo_root/agent-container" codex --version \
   >"$case_dir/out" 2>"$case_dir/err"
 assert_no_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
+assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
 assert_no_line "$case_log" "ARG=CLAUDE_CODE_EFFORT_LEVEL"
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
 pass "Claude runtime settings do not cross into another Agent profile"
 
 tests_run=$((tests_run + 1))
@@ -991,9 +1070,9 @@ if run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "credential opt-in without an exported Claude credential should fail"
 fi
-assert_contains "$case_dir/err" "no credential declared by profile 'claude' is set and exported"
+assert_contains "$case_dir/err" "no credential recognized for profile 'claude' is set and exported"
 assert_no_line "$case_log" "ARG=create"
-pass "credential opt-in fails clearly when no declared credential is available"
+pass "credential opt-in fails clearly when no recognized credential is available"
 
 tests_run=$((tests_run + 1))
 new_case explicit_environment_escape_hatch

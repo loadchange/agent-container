@@ -257,8 +257,9 @@ Runtime options for `run`:
   --host-first COMMAND     Prefer one host command over the guest copy
 
 Environment forwarding:
-  AGENT_CONTAINER_FORWARD_API_KEY=true
-                           Forward credentials declared for the active profile
+  AGENT_CONTAINER_FORWARD_API_KEY=auto|true|false
+                           Credential mode for the active profile (default: auto)
+                           Claude auto-admits an auth token with a custom endpoint
   AGENT_CONTAINER_FORWARD_ENV=NAME1,NAME2
                            Forward additional exported variables by exact name
 EOF
@@ -580,10 +581,24 @@ if [ "$run_mode" = false ]; then
 fi
 load_profile "$requested_profile"
 
-# Automatically inherit only reviewed, non-credential Claude Code settings.
-# Prefix-based forwarding is intentionally avoided: ANTHROPIC_* and
-# CLAUDE_CODE_* also contain tokens, file descriptors, host paths, and other
-# process-internal state that must not cross the VM boundary by accident.
+profile_credential_forward_mode=auto
+if [ -n "${AGENT_CONTAINER_FORWARD_API_KEY+x}" ]; then
+  case "$AGENT_CONTAINER_FORWARD_API_KEY" in
+    auto|AUTO) profile_credential_forward_mode=auto ;;
+    1|true|TRUE|yes|YES|on|ON) profile_credential_forward_mode=true ;;
+    # Preserve the legacy behavior of an explicitly exported empty switch.
+    # An unset switch, in contrast, selects the new auto default above.
+    0|false|FALSE|no|NO|off|OFF|'') profile_credential_forward_mode=false ;;
+    *)
+      die "AGENT_CONTAINER_FORWARD_API_KEY must be auto, true, or false."
+      ;;
+  esac
+fi
+
+# Automatically inherit only reviewed Claude Code settings. Prefix-based
+# forwarding is intentionally avoided: ANTHROPIC_* and CLAUDE_CODE_* also
+# contain tokens, file descriptors, host paths, and other process-internal
+# state that must not cross the VM boundary by accident.
 profile_runtime_env_names=()
 profile_credential_env_names=()
 [ -z "$profile_api_key_env" ] \
@@ -624,8 +639,18 @@ case "$profile_id" in
       CLAUDE_CODE_NO_FLICKER
       CLAUDE_CODE_FORCE_FULL_LOGO
     )
+    # In the default auto mode, a non-empty custom endpoint plus
+    # ANTHROPIC_AUTH_TOKEN is one intentional third-party provider
+    # configuration. Inherit that token so the guest does not fall back to
+    # Claude's login selector. A token without ANTHROPIC_BASE_URL remains
+    # denied unless credentials are explicitly enabled below.
+    if [ "$profile_credential_forward_mode" = auto ] \
+      && [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+      profile_runtime_env_names+=(ANTHROPIC_AUTH_TOKEN)
+    fi
     # Third-party Anthropic-compatible providers commonly use this token name
-    # instead of ANTHROPIC_API_KEY. It remains behind the credential opt-in.
+    # instead of ANTHROPIC_API_KEY. Keep it in the explicit credential set as
+    # well so the opt-in still works when no custom base URL is configured.
     profile_credential_env_names+=(ANTHROPIC_AUTH_TOKEN)
     ;;
 esac
@@ -2186,9 +2211,9 @@ if [ "${#profile_runtime_env_names[@]}" -gt 0 ]; then
   done
 fi
 
-if is_true "${AGENT_CONTAINER_FORWARD_API_KEY:-false}"; then
+if [ "$profile_credential_forward_mode" = true ]; then
   [ "${#profile_credential_env_names[@]}" -gt 0 ] \
-    || die "Profile '$profile_id' does not declare an API-key environment variable."
+    || die "Profile '$profile_id' does not recognize an API-key environment variable."
   forwarded_profile_credential=false
   for forward_env_name in "${profile_credential_env_names[@]}"; do
     if inherit_host_env "$forward_env_name"; then
@@ -2196,7 +2221,7 @@ if is_true "${AGENT_CONTAINER_FORWARD_API_KEY:-false}"; then
     fi
   done
   [ "$forwarded_profile_credential" = true ] \
-    || die "AGENT_CONTAINER_FORWARD_API_KEY is enabled, but no credential declared by profile '$profile_id' is set and exported."
+    || die "AGENT_CONTAINER_FORWARD_API_KEY is enabled, but no credential recognized for profile '$profile_id' is set and exported."
 fi
 
 if [ "${#explicit_forward_env_names[@]}" -gt 0 ]; then

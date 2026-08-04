@@ -157,15 +157,21 @@ an updater mutating a session root.
 Runtime environment inheritance is resolved by the host launcher before
 `container create`. The Claude integration has a fixed, reviewed allowlist of
 non-credential provider/model/telemetry/UI settings; other profiles do not
-receive it. Authentication remains a separate explicit capability, with
-`ANTHROPIC_AUTH_TOKEN` recognized as a Claude alternative to the profile's
-primary `ANTHROPIC_API_KEY`. A comma-separated `AGENT_CONTAINER_FORWARD_ENV`
-escape hatch permits future variables by exact name after strict validation.
-There is deliberately no prefix discovery because `ANTHROPIC_*` and
-`CLAUDE_CODE_*` contain secret and host-process state as well as ordinary
-configuration. Every inherited value uses `container create --env NAME`, so
-the value remains in the launcher's environment instead of being serialized
-into its argument vector.
+receive it. Authentication normally remains a separate explicit capability,
+with `ANTHROPIC_AUTH_TOKEN` recognized as a Claude alternative to the profile's
+primary `ANTHROPIC_API_KEY`. The one automatic exception is a non-empty
+`ANTHROPIC_BASE_URL` paired with an exported `ANTHROPIC_AUTH_TOKEN`: the
+launcher treats those exact names as one intentional custom-provider bundle.
+This is the default credential mode; `true` forwards every credential name
+recognized for the active profile and `false` disables the profile credential
+path. An unset switch selects `auto`, while an explicitly exported empty value
+retains the older disabled behavior. A comma-separated
+`AGENT_CONTAINER_FORWARD_ENV` escape hatch permits future variables by exact
+name after strict validation. There is deliberately no prefix discovery because
+`ANTHROPIC_*` and `CLAUDE_CODE_*` contain secret and host-process state as well
+as ordinary configuration. Every inherited value uses
+`container create --env NAME`, so the value remains in the launcher's
+environment instead of being serialized into its argument vector.
 
 The repository root is mounted at its original absolute path. The original
 current directory becomes the guest working directory. This preserves project
@@ -376,9 +382,10 @@ networking. The launcher can set proxy, DNS, and timezone values, but it does
 not implement a hostname allowlist or an egress firewall. A proxy setting is
 connectivity configuration, not a security boundary.
 
-Legacy sessions continue to deny credentials and host capabilities by default,
-and the project does not automatically add any Agent-specific
-permission-bypass flag. Explicit `run` sessions intentionally add the
+Legacy sessions continue to deny host capabilities and credentials by default
+apart from the narrow Claude custom-provider bundle described above, and the
+project does not automatically add any Agent-specific permission-bypass flag.
+Explicit `run` sessions intentionally add the
 authenticated host broker, selected host Git configuration and live SSH agent
 described above; network reachability is not what confines that broker. Its
 authorization token, frozen command manifest, and macOS filesystem sandbox are
