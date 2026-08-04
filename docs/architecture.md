@@ -154,6 +154,19 @@ when one exists: `DISABLE_AUTOUPDATER=1` for Claude and
 the host's channel resolution and fingerprinted image replacement rather than
 an updater mutating a session root.
 
+Runtime environment inheritance is resolved by the host launcher before
+`container create`. The Claude integration has a fixed, reviewed allowlist of
+non-credential provider/model/telemetry/UI settings; other profiles do not
+receive it. Authentication remains a separate explicit capability, with
+`ANTHROPIC_AUTH_TOKEN` recognized as a Claude alternative to the profile's
+primary `ANTHROPIC_API_KEY`. A comma-separated `AGENT_CONTAINER_FORWARD_ENV`
+escape hatch permits future variables by exact name after strict validation.
+There is deliberately no prefix discovery because `ANTHROPIC_*` and
+`CLAUDE_CODE_*` contain secret and host-process state as well as ordinary
+configuration. Every inherited value uses `container create --env NAME`, so
+the value remains in the launcher's environment instead of being serialized
+into its argument vector.
+
 The repository root is mounted at its original absolute path. The original
 current directory becomes the guest working directory. This preserves project
 paths recorded by Agent CLIs and Git. Linked worktrees and submodules may need

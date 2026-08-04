@@ -8,6 +8,50 @@ test_root=$(CDPATH= cd -- "$test_root" && pwd -P)
 tests_run=0
 background_pid=""
 
+claude_runtime_env_names=(
+  _ANTHROPIC_API_PROVIDER
+  ANTHROPIC_BASE_URL
+  ANTHROPIC_MODEL
+  ANTHROPIC_SMALL_FAST_MODEL
+  ANTHROPIC_DEFAULT_HAIKU_MODEL
+  ANTHROPIC_DEFAULT_SONNET_MODEL
+  ANTHROPIC_DEFAULT_OPUS_MODEL
+  ANTHROPIC_DEFAULT_FABLE_MODEL
+  ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
+  ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
+  ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
+  ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+  CLAUDE_CODE_EFFORT_LEVEL
+  CLAUDE_CODE_ENABLE_TELEMETRY
+  CLAUDE_CODE_ENHANCED_TELEMETRY_BETA
+  CLAUDE_CODE_ENABLE_TOKEN_USAGE_ATTACHMENT
+  CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS
+  CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES
+  CLAUDE_CODE_PROFILE_STARTUP
+  CLAUDE_CODE_PROFILE_QUERY
+  CLAUDE_CODE_PROPAGATE_TRACEPARENT
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK
+  CLAUDE_CODE_DISABLE_SESSION_DATA_UPLOAD
+  DISABLE_TELEMETRY
+  CLAUDE_CODE_DISABLE_POLICY_SKILLS
+  DISABLE_ERROR_REPORTING
+  API_TIMEOUT_MS
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+  CLAUDE_CODE_COORDINATOR_MODE
+  CLAUDE_CODE_NO_FLICKER
+  CLAUDE_CODE_FORCE_FULL_LOGO
+)
+
+test_forward_env_names=(
+  "${claude_runtime_env_names[@]}"
+  CLAUDE_CODE_OAUTH_TOKEN
+  ANTHROPIC_WEBHOOK_SIGNING_KEY
+  DISABLE_AUTOUPDATER
+  TEST_EXPLICIT_ENV
+  TEST_EMPTY_ENV
+)
+
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
@@ -91,6 +135,7 @@ reset_case_environment() {
     AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK \
     AGENT_CONTAINER_ALLOW_CONCURRENT \
     AGENT_CONTAINER_ENABLE_EXPERIMENTAL \
+    AGENT_CONTAINER_FORWARD_ENV \
     AGENT_CONTAINER_FORWARD_API_KEY \
     AGENT_CONTAINER_FORWARD_SSH_AGENT \
     AGENT_CONTAINER_FULL_GIT_CONFIG \
@@ -110,6 +155,7 @@ reset_case_environment() {
     AGENT_CONTAINER_MOUNT_GH \
     AGENT_CONTAINER_MOUNT_SSH_CONFIG \
     ANTHROPIC_API_KEY \
+    ANTHROPIC_AUTH_TOKEN \
     OPENAI_API_KEY \
     XAI_API_KEY \
     SSH_AUTH_SOCK \
@@ -143,6 +189,7 @@ reset_case_environment() {
     FAKE_SYSTEM_RUNNING \
     TEST_RUNNER_PATH \
     2>/dev/null || true
+  unset "${test_forward_env_names[@]}" 2>/dev/null || true
 }
 
 new_case() {
@@ -188,6 +235,7 @@ launch_exec() {
     "AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK=${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"
     "AGENT_CONTAINER_ALLOW_CONCURRENT=${AGENT_CONTAINER_ALLOW_CONCURRENT:-false}"
     "AGENT_CONTAINER_ENABLE_EXPERIMENTAL=${AGENT_CONTAINER_ENABLE_EXPERIMENTAL:-false}"
+    "AGENT_CONTAINER_FORWARD_ENV=${AGENT_CONTAINER_FORWARD_ENV:-}"
     "AGENT_CONTAINER_FORWARD_API_KEY=${AGENT_CONTAINER_FORWARD_API_KEY:-false}"
     "AGENT_CONTAINER_FORWARD_SSH_AGENT=${AGENT_CONTAINER_FORWARD_SSH_AGENT:-false}"
     "AGENT_CONTAINER_FULL_GIT_CONFIG=${AGENT_CONTAINER_FULL_GIT_CONFIG:-false}"
@@ -243,6 +291,9 @@ launch_exec() {
   if [ -n "${ANTHROPIC_API_KEY+x}" ]; then
     runner_env+=("ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
   fi
+  if [ -n "${ANTHROPIC_AUTH_TOKEN+x}" ]; then
+    runner_env+=("ANTHROPIC_AUTH_TOKEN=$ANTHROPIC_AUTH_TOKEN")
+  fi
   if [ -n "${OPENAI_API_KEY+x}" ]; then
     runner_env+=("OPENAI_API_KEY=$OPENAI_API_KEY")
   fi
@@ -252,6 +303,11 @@ launch_exec() {
   if [ -n "${SSH_AUTH_SOCK+x}" ]; then
     runner_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
   fi
+  for test_env_name in "${test_forward_env_names[@]}"; do
+    if printenv "$test_env_name" >/dev/null 2>&1; then
+      runner_env+=("$test_env_name=$(printenv "$test_env_name")")
+    fi
+  done
 
   cd "$case_workspace"
   exec /usr/bin/env -i "${runner_env[@]}" /bin/bash "$program" "$@"
@@ -808,19 +864,31 @@ printf '%s\n' \
 printf '%s\n' 'not-a-real-socket' > "$case_home/ssh-agent.sock"
 
 ANTHROPIC_API_KEY='ANTHROPIC_SECRET_DO_NOT_LOG'
+ANTHROPIC_AUTH_TOKEN='ANTHROPIC_AUTH_SECRET_DO_NOT_LOG'
 OPENAI_API_KEY='OPENAI_SECRET_DO_NOT_LOG'
 XAI_API_KEY='XAI_SECRET_DO_NOT_LOG'
+export CLAUDE_CODE_OAUTH_TOKEN='CLAUDE_OAUTH_SECRET_DO_NOT_LOG'
+export ANTHROPIC_WEBHOOK_SIGNING_KEY='WEBHOOK_SECRET_DO_NOT_LOG'
 SSH_AUTH_SOCK="$case_home/ssh-agent.sock"
 FAKE_CAPTURE_GITCONFIG="$case_dir/staged.gitconfig"
 run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"
 
-for api_name in ANTHROPIC_API_KEY OPENAI_API_KEY XAI_API_KEY; do
+for api_name in \
+  ANTHROPIC_API_KEY \
+  ANTHROPIC_AUTH_TOKEN \
+  OPENAI_API_KEY \
+  XAI_API_KEY \
+  CLAUDE_CODE_OAUTH_TOKEN \
+  ANTHROPIC_WEBHOOK_SIGNING_KEY; do
   assert_no_line "$case_log" "ARG=$api_name"
 done
 assert_secret_absent "$case_log" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
 assert_secret_absent "$case_log" "$OPENAI_API_KEY" OPENAI_API_KEY
 assert_secret_absent "$case_log" "$XAI_API_KEY" XAI_API_KEY
+assert_secret_absent "$case_log" "$CLAUDE_CODE_OAUTH_TOKEN" CLAUDE_CODE_OAUTH_TOKEN
+assert_secret_absent "$case_log" "$ANTHROPIC_WEBHOOK_SIGNING_KEY" ANTHROPIC_WEBHOOK_SIGNING_KEY
 assert_secret_absent "$case_log" GH_SECRET_DO_NOT_LOG GH
 assert_secret_absent "$case_log" GIT_SECRET_DO_NOT_LOG Git
 assert_no_line "$case_log" "ARG=--ssh"
@@ -839,7 +907,46 @@ if /usr/bin/git config --file "$case_dir/staged.gitconfig" \
   fail "default staging copied credential-bearing Git configuration"
 fi
 assert_not_contains "$case_dir/staged.gitconfig" "SECRET"
-pass "default runtime boundary excludes API keys, SSH, GH, and full Git config"
+pass "default runtime boundary excludes credentials, prefix-only variables, SSH, GH, and full Git config"
+
+tests_run=$((tests_run + 1))
+new_case claude_runtime_environment
+runtime_env_value='runtime value with spaces = opus[1M] MUST_NOT_BE_LOGGED'
+for runtime_env_name in "${claude_runtime_env_names[@]}"; do
+  export "$runtime_env_name=$runtime_env_value"
+done
+# Empty is different from unset and must still reach the guest.
+export CLAUDE_CODE_NO_FLICKER=
+export DISABLE_AUTOUPDATER=0
+export CLAUDE_CODE_OAUTH_TOKEN='PREFIX_SECRET_MUST_NOT_BE_LOGGED'
+export ANTHROPIC_WEBHOOK_SIGNING_KEY='ANTHROPIC_PREFIX_SECRET_MUST_NOT_BE_LOGGED'
+ANTHROPIC_AUTH_TOKEN='AUTH_TOKEN_MUST_NOT_BE_LOGGED'
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+for runtime_env_name in "${claude_runtime_env_names[@]}"; do
+  [ "$(grep -Fxc -- "ARG=$runtime_env_name" "$case_log")" -eq 1 ] \
+    || fail "Claude runtime environment did not forward $runtime_env_name exactly once"
+done
+assert_line "$case_log" "ARG=DISABLE_AUTOUPDATER=1"
+assert_no_line "$case_log" "ARG=DISABLE_AUTOUPDATER=0"
+assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_no_line "$case_log" "ARG=CLAUDE_CODE_OAUTH_TOKEN"
+assert_no_line "$case_log" "ARG=ANTHROPIC_WEBHOOK_SIGNING_KEY"
+assert_secret_absent "$case_log" "$runtime_env_value" "Claude runtime environment"
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_log" "$CLAUDE_CODE_OAUTH_TOKEN" CLAUDE_CODE_OAUTH_TOKEN
+assert_secret_absent "$case_log" "$ANTHROPIC_WEBHOOK_SIGNING_KEY" ANTHROPIC_WEBHOOK_SIGNING_KEY
+pass "Claude inherits the exact reviewed runtime settings without values or prefix expansion"
+
+tests_run=$((tests_run + 1))
+new_case claude_environment_is_profile_scoped
+export ANTHROPIC_BASE_URL='https://provider.example.test/claude'
+export CLAUDE_CODE_EFFORT_LEVEL=max
+run_program "$repo_root/agent-container" codex --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_no_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
+assert_no_line "$case_log" "ARG=CLAUDE_CODE_EFFORT_LEVEL"
+pass "Claude runtime settings do not cross into another Agent profile"
 
 tests_run=$((tests_run + 1))
 new_case explicit_profile_api_key
@@ -856,6 +963,102 @@ assert_secret_absent "$case_log" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
 assert_secret_absent "$case_log" "$OPENAI_API_KEY" OPENAI_API_KEY
 assert_secret_absent "$case_log" "$XAI_API_KEY" XAI_API_KEY
 pass "API-key opt-in forwards only the active profile variable name"
+
+tests_run=$((tests_run + 1))
+new_case explicit_claude_auth_token
+ANTHROPIC_AUTH_TOKEN='CLAUDE_AUTH_VALUE_MUST_NOT_BE_LOGGED'
+AGENT_CONTAINER_FORWARD_API_KEY=true
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_no_line "$case_log" "ARG=ANTHROPIC_API_KEY"
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+
+: > "$case_log"
+ANTHROPIC_API_KEY='CLAUDE_API_KEY_MUST_NOT_BE_LOGGED'
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/both.out" 2>"$case_dir/both.err"
+assert_line "$case_log" "ARG=ANTHROPIC_API_KEY"
+assert_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_secret_absent "$case_log" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+pass "credential opt-in supports Anthropic-compatible auth tokens without exposing values"
+
+tests_run=$((tests_run + 1))
+new_case missing_profile_credential
+AGENT_CONTAINER_FORWARD_API_KEY=true
+if run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "credential opt-in without an exported Claude credential should fail"
+fi
+assert_contains "$case_dir/err" "no credential declared by profile 'claude' is set and exported"
+assert_no_line "$case_log" "ARG=create"
+pass "credential opt-in fails clearly when no declared credential is available"
+
+tests_run=$((tests_run + 1))
+new_case explicit_environment_escape_hatch
+export TEST_EXPLICIT_ENV='explicit value with spaces MUST_NOT_BE_LOGGED'
+export TEST_EMPTY_ENV=
+export CLAUDE_CODE_EFFORT_LEVEL=max
+AGENT_CONTAINER_FORWARD_ENV='TEST_EXPLICIT_ENV,TEST_EMPTY_ENV,CLAUDE_CODE_EFFORT_LEVEL,TEST_EXPLICIT_ENV'
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+[ "$(grep -Fxc -- 'ARG=TEST_EXPLICIT_ENV' "$case_log")" -eq 1 ] \
+  || fail "explicit environment variable was not forwarded exactly once"
+[ "$(grep -Fxc -- 'ARG=TEST_EMPTY_ENV' "$case_log")" -eq 1 ] \
+  || fail "explicit empty environment variable was not forwarded exactly once"
+[ "$(grep -Fxc -- 'ARG=CLAUDE_CODE_EFFORT_LEVEL' "$case_log")" -eq 1 ] \
+  || fail "automatic and explicit environment overlap was not deduplicated"
+assert_secret_absent "$case_log" "$TEST_EXPLICIT_ENV" TEST_EXPLICIT_ENV
+pass "explicit forwarding supports future and empty settings and deduplicates automatic names"
+
+tests_run=$((tests_run + 1))
+new_case invalid_explicit_environment
+for managed_env_name in \
+  HOME \
+  AGENT_CONTAINER_CPUS \
+  HTTP_PROXY \
+  DISABLE_AUTOUPDATER \
+  LD_PRELOAD \
+  DYLD_INSERT_LIBRARIES \
+  BASH_ENV; do
+  AGENT_CONTAINER_FORWARD_ENV="$managed_env_name"
+  if run_program "$repo_root/agent-container" claude --version \
+    >"$case_dir/reserved-$managed_env_name.out" \
+    2>"$case_dir/reserved-$managed_env_name.err"; then
+    fail "launcher-managed explicit environment name $managed_env_name should fail"
+  fi
+  assert_contains \
+    "$case_dir/reserved-$managed_env_name.err" \
+    "launcher-managed name: $managed_env_name"
+  [ ! -s "$case_log" ] \
+    || fail "reserved environment rejection contacted the Apple runtime"
+done
+
+AGENT_CONTAINER_FORWARD_ENV=NOT_EXPORTED
+if run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/unset.out" 2>"$case_dir/unset.err"; then
+  fail "an unset explicit environment name should fail"
+fi
+assert_contains "$case_dir/unset.err" "'NOT_EXPORTED', but it is unset or not exported"
+[ ! -s "$case_log" ] || fail "unset environment rejection contacted the Apple runtime"
+
+AGENT_CONTAINER_FORWARD_ENV='bad-name'
+if run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/invalid.out" 2>"$case_dir/invalid.err"; then
+  fail "an invalid explicit environment name should fail"
+fi
+assert_contains "$case_dir/invalid.err" "contains an invalid environment-variable name"
+[ ! -s "$case_log" ] || fail "invalid environment rejection contacted the Apple runtime"
+
+AGENT_CONTAINER_FORWARD_ENV='GOOD,,BAD'
+if run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/empty.out" 2>"$case_dir/empty.err"; then
+  fail "an explicit environment list with an empty item should fail"
+fi
+assert_contains "$case_dir/empty.err" "without empty entries"
+[ ! -s "$case_log" ] || fail "malformed environment list contacted the Apple runtime"
+pass "explicit forwarding rejects reserved, unset, invalid, and malformed names before runtime access"
 
 tests_run=$((tests_run + 1))
 new_case experimental_grok

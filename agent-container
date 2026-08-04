@@ -255,6 +255,12 @@ Runtime options for `run`:
   --share-rw PATH          Share one additional directory read-write
   --no-host-exec COMMAND   Do not expose one host command (may be repeated)
   --host-first COMMAND     Prefer one host command over the guest copy
+
+Environment forwarding:
+  AGENT_CONTAINER_FORWARD_API_KEY=true
+                           Forward credentials declared for the active profile
+  AGENT_CONTAINER_FORWARD_ENV=NAME1,NAME2
+                           Forward additional exported variables by exact name
 EOF
 }
 
@@ -274,6 +280,16 @@ validate_env_name() {
   esac
   case "$name" in
     *[!A-Z0-9_]*) return 1 ;;
+  esac
+}
+
+validate_forward_env_name() {
+  local name="$1"
+  [ -n "$name" ] && validate_env_name "$name" || return 1
+  case "$name" in
+    AGENT_CONTAINER_*|HOST_UID|HOST_GID|HOST_HOME|HOME|USER|LOGNAME|SHELL|PATH|PWD|OLDPWD|SHLVL|_|GIT_CONFIG_GLOBAL|TERM|COLORTERM|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|TZ|LD_*|DYLD_*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|DISABLE_AUTOUPDATER|GROK_DISABLE_AUTOUPDATER)
+      return 1
+      ;;
   esac
 }
 
@@ -563,6 +579,85 @@ if [ "$run_mode" = false ]; then
   shift
 fi
 load_profile "$requested_profile"
+
+# Automatically inherit only reviewed, non-credential Claude Code settings.
+# Prefix-based forwarding is intentionally avoided: ANTHROPIC_* and
+# CLAUDE_CODE_* also contain tokens, file descriptors, host paths, and other
+# process-internal state that must not cross the VM boundary by accident.
+profile_runtime_env_names=()
+profile_credential_env_names=()
+[ -z "$profile_api_key_env" ] \
+  || profile_credential_env_names+=("$profile_api_key_env")
+case "$profile_id" in
+  claude)
+    profile_runtime_env_names+=(
+      _ANTHROPIC_API_PROVIDER
+      ANTHROPIC_BASE_URL
+      ANTHROPIC_MODEL
+      ANTHROPIC_SMALL_FAST_MODEL
+      ANTHROPIC_DEFAULT_HAIKU_MODEL
+      ANTHROPIC_DEFAULT_SONNET_MODEL
+      ANTHROPIC_DEFAULT_OPUS_MODEL
+      ANTHROPIC_DEFAULT_FABLE_MODEL
+      ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
+      ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
+      ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
+      ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+      CLAUDE_CODE_EFFORT_LEVEL
+      CLAUDE_CODE_ENABLE_TELEMETRY
+      CLAUDE_CODE_ENHANCED_TELEMETRY_BETA
+      CLAUDE_CODE_ENABLE_TOKEN_USAGE_ATTACHMENT
+      CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS
+      CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES
+      CLAUDE_CODE_PROFILE_STARTUP
+      CLAUDE_CODE_PROFILE_QUERY
+      CLAUDE_CODE_PROPAGATE_TRACEPARENT
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+      CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK
+      CLAUDE_CODE_DISABLE_SESSION_DATA_UPLOAD
+      DISABLE_TELEMETRY
+      CLAUDE_CODE_DISABLE_POLICY_SKILLS
+      DISABLE_ERROR_REPORTING
+      API_TIMEOUT_MS
+      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+      CLAUDE_CODE_COORDINATOR_MODE
+      CLAUDE_CODE_NO_FLICKER
+      CLAUDE_CODE_FORCE_FULL_LOGO
+    )
+    # Third-party Anthropic-compatible providers commonly use this token name
+    # instead of ANTHROPIC_API_KEY. It remains behind the credential opt-in.
+    profile_credential_env_names+=(ANTHROPIC_AUTH_TOKEN)
+    ;;
+esac
+
+# Escape hatch for newly introduced Agent settings. Each name is an explicit
+# authorization; values are inherited by Apple container and never copied into
+# this launcher's argv. Runtime/identity and loader variables stay launcher-
+# managed because overriding them could affect the root entrypoint itself.
+explicit_forward_env_names=()
+explicit_forward_env_value="${AGENT_CONTAINER_FORWARD_ENV:-}"
+if [ -n "$explicit_forward_env_value" ]; then
+  case "$explicit_forward_env_value" in
+    ,*|*,|*,,*|*$'\n'*|*$'\r'*|*$'\t'*)
+      die "AGENT_CONTAINER_FORWARD_ENV must be a comma-separated list of environment-variable names without empty entries."
+      ;;
+  esac
+  IFS=, read -r -a requested_forward_env_names <<EOF
+$explicit_forward_env_value
+EOF
+  for forward_env_name in "${requested_forward_env_names[@]}"; do
+    [ -n "$forward_env_name" ] && validate_env_name "$forward_env_name" \
+      || die "AGENT_CONTAINER_FORWARD_ENV contains an invalid environment-variable name."
+    validate_forward_env_name "$forward_env_name" \
+      || die "AGENT_CONTAINER_FORWARD_ENV contains a launcher-managed name: $forward_env_name"
+    printenv "$forward_env_name" >/dev/null 2>&1 \
+      || die "AGENT_CONTAINER_FORWARD_ENV requested '$forward_env_name', but it is unset or not exported."
+    if [ "${#explicit_forward_env_names[@]}" -eq 0 ] \
+      || ! array_contains_value "$forward_env_name" "${explicit_forward_env_names[@]}"; then
+      explicit_forward_env_names+=("$forward_env_name")
+    fi
+  done
+fi
 
 if [ -n "${AGENT_CONTAINER_IMAGE:-}" ]; then
   die "AGENT_CONTAINER_IMAGE is not supported. Image references are profile-scoped to preserve ownership and uninstall provenance."
@@ -2071,12 +2166,44 @@ fi
 if [ -n "$profile_disable_update_env" ]; then
   create_args+=(--env "$profile_disable_update_env=1")
 fi
+
+forwarded_env_names=()
+inherit_host_env() {
+  local env_name="$1"
+  printenv "$env_name" >/dev/null 2>&1 || return 1
+  if [ "${#forwarded_env_names[@]}" -eq 0 ] \
+    || ! array_contains_value "$env_name" "${forwarded_env_names[@]}"; then
+    # Passing only the name keeps its value out of the Apple CLI argv and the
+    # fake-runtime argument logs used by the contract tests.
+    create_args+=(--env "$env_name")
+    forwarded_env_names+=("$env_name")
+  fi
+}
+
+if [ "${#profile_runtime_env_names[@]}" -gt 0 ]; then
+  for forward_env_name in "${profile_runtime_env_names[@]}"; do
+    inherit_host_env "$forward_env_name" || true
+  done
+fi
+
 if is_true "${AGENT_CONTAINER_FORWARD_API_KEY:-false}"; then
-  [ -n "$profile_api_key_env" ] \
+  [ "${#profile_credential_env_names[@]}" -gt 0 ] \
     || die "Profile '$profile_id' does not declare an API-key environment variable."
-  printenv "$profile_api_key_env" >/dev/null 2>&1 \
-    || die "AGENT_CONTAINER_FORWARD_API_KEY is enabled, but $profile_api_key_env is unset."
-  create_args+=(--env "$profile_api_key_env")
+  forwarded_profile_credential=false
+  for forward_env_name in "${profile_credential_env_names[@]}"; do
+    if inherit_host_env "$forward_env_name"; then
+      forwarded_profile_credential=true
+    fi
+  done
+  [ "$forwarded_profile_credential" = true ] \
+    || die "AGENT_CONTAINER_FORWARD_API_KEY is enabled, but no credential declared by profile '$profile_id' is set and exported."
+fi
+
+if [ "${#explicit_forward_env_names[@]}" -gt 0 ]; then
+  for forward_env_name in "${explicit_forward_env_names[@]}"; do
+    inherit_host_env "$forward_env_name" \
+      || die "Explicitly requested environment variable '$forward_env_name' became unavailable before container creation."
+  done
 fi
 
 [ -n "$http_proxy_value" ] && create_args+=(--env "HTTP_PROXY=$http_proxy_value" --env "http_proxy=$http_proxy_value")

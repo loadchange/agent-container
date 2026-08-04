@@ -28,7 +28,7 @@ In the legacy launch mode, the guest does not receive:
 - host `~/.ssh` private-key files or the SSH agent socket;
 - the host GitHub CLI configuration;
 - the full host Git or XDG Git configuration;
-- arbitrary host environment variables or sockets.
+- arbitrary or prefix-matched host environment variables or sockets.
 
 The workspace and explicitly enabled capability paths can still be selected
 subdirectories of the macOS home. They are mounted separately and do not turn
@@ -67,13 +67,22 @@ hostname allowlist, egress firewall, or policy proxy in this project. A
 malicious process can exfiltrate any workspace or profile-home data it can
 read.
 
+The Claude profile is one narrow environment exception: it inherits an exact,
+reviewed list of non-credential provider, model, telemetry, UI, timeout, and
+team settings documented in the README. It does not scan the `ANTHROPIC_*` or
+`CLAUDE_CODE_*` prefixes. This distinction matters because those prefixes also
+contain OAuth/session tokens, private-key paths, file descriptors, and internal
+host process state. Values are inherited with Apple container's `--env NAME`
+form rather than copied into command arguments.
+
 ## Capabilities are denied by default
 
 Higher-risk host integrations require explicit environment switches:
 
 | Capability | Switch | Exposure |
 |---|---|---|
-| Profile API key | `AGENT_CONTAINER_FORWARD_API_KEY=true` | the profile's declared key environment variable |
+| Profile credential | `AGENT_CONTAINER_FORWARD_API_KEY=true` | the selected profile's declared authentication variables; Claude accepts `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` |
+| Additional exact environment names | `AGENT_CONTAINER_FORWARD_ENV=NAME1,NAME2` | each named, exported host value; launcher identity, shell-loader, proxy, and updater variables are rejected |
 | SSH agent | `AGENT_CONTAINER_FORWARD_SSH_AGENT=true` | signing/authentication through the live agent socket |
 | SSH metadata | `AGENT_CONTAINER_MOUNT_SSH_CONFIG=true` | selected `config`, `known_hosts`, `known_hosts.old`, `allowed_signers` files |
 | GitHub CLI config | `AGENT_CONTAINER_MOUNT_GH=true` | host `~/.config/gh` read-only |
@@ -83,7 +92,9 @@ Higher-risk host integrations require explicit environment switches:
 | Additional directory, read-only | `--share-ro PATH` in `run` mode | directory contents to the guest and brokered host processes without write authorization |
 | Additional directory, read-write | `--share-rw PATH` in `run` mode | read, change, and delete authority for both the guest and brokered host processes |
 
-Enabling a capability authorizes use, not only reading. SSH agent forwarding
+Enabling a capability authorizes use, not only reading. An explicitly named
+environment value may itself be a credential and is fully readable in the
+guest. SSH agent forwarding
 does not reveal private-key bytes, but guest code can request signatures or
 authenticate to reachable systems. Git and GitHub configuration may contain
 tokens, credential helpers, custom commands, extra HTTP headers, or URL
@@ -225,22 +236,26 @@ The resulting credentials remain in that profile's isolated shadow HOME and
 survive image replacement. The launcher does not automatically copy the native
 macOS Agent home or share credentials between profiles.
 
-For a deliberate one-session API-key handoff, export the environment variable
-declared by the profile and enable forwarding:
+For a deliberate one-session credential handoff, export an authentication
+variable declared by the profile and enable forwarding:
 
 ```bash
 export OPENAI_API_KEY='...'
 AGENT_CONTAINER_FORWARD_API_KEY=true agent-container codex
 ```
 
-The core forwards only the selected profile's declared variable. For the
-built-in profiles these are `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and
-`XAI_API_KEY`. Do not put keys in command-line arguments, image build arguments,
-profile JSON, or a repository file.
+The core forwards only the selected profile's declared variables. For the
+built-in profiles these are `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` for
+Claude, `OPENAI_API_KEY` for Codex, and `XAI_API_KEY` for Grok. If more than one
+declared Claude credential is exported, both names are inherited so Claude can
+apply its own precedence rules. Do not put keys or tokens in command-line
+arguments, image build arguments, profile JSON, or a repository file.
 
-The key is still readable by processes in that guest session and can be sent
-over the network. Environment forwarding is convenience, not secret
-brokerage.
+The credential is still readable by processes in that guest session and can be
+sent over the network. Environment forwarding is convenience, not secret
+brokerage. `AGENT_CONTAINER_FORWARD_ENV` is an explicit fallback for newly
+introduced exact settings, but using it with a secret name grants the same
+guest access and does not provide stronger secret handling.
 
 ## Agent permission modes
 

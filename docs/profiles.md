@@ -192,11 +192,22 @@ state rather than Alice's real macOS home. This runtime shadow HOME is separate
 from the `/opt/agent-native` HOME used while building the image.
 
 The Agent's normal login, settings, history, plugins, and cache persist, but
-profiles never share a HOME. API-key forwarding is explicit and uses only the
-profile's `apiKeyEnv`. When declared, the launcher sets the updater-disable
-variable on every session: `DISABLE_AUTOUPDATER=1` for Claude and
+profiles never share a HOME. Credential forwarding is explicit and ordinarily
+uses only the profile's `apiKeyEnv`. The built-in Claude integration also
+recognizes `ANTHROPIC_AUTH_TOKEN`, a common credential for Anthropic-compatible
+providers; this compatibility alias is core policy rather than profile-defined
+host capability. When declared, the launcher sets the updater-disable variable
+on every session: `DISABLE_AUTOUPDATER=1` for Claude and
 `GROK_DISABLE_AUTOUPDATER=1` for Grok. Image replacement, not an in-session
 updater, owns those release changes.
+
+The built-in Claude runtime also has a core-owned exact allowlist of
+non-credential environment settings documented in the README. Profile JSON
+cannot add automatic host environment access: future settings use the explicit
+`AGENT_CONTAINER_FORWARD_ENV=NAME1,NAME2` interface until the reviewed core
+policy is updated. Keeping this authority outside profile data also avoids
+turning a valid-looking custom profile into a request for arbitrary host
+secrets.
 
 ## Adding a profile
 

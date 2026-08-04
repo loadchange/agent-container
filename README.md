@@ -419,8 +419,8 @@ credentials and session state written there survive VM and image replacement.
 Host `~/.claude`, `~/.codex`, `~/.grok`, and other real Agent directories are
 never imported or mounted automatically.
 
-API keys are also denied by default. A profile may forward only its declared
-key name after explicit authorization:
+Credentials are also denied by default. A profile may forward only its
+declared credential names after explicit authorization:
 
 ```bash
 export OPENAI_API_KEY='...'
@@ -428,8 +428,92 @@ AGENT_CONTAINER_FORWARD_API_KEY=true codex-container
 ```
 
 Running Codex this way does not forward `ANTHROPIC_API_KEY`, `XAI_API_KEY`, or
-arbitrary host environment variables. Prefer interactive/device login when
-possible so a long-lived host secret need not enter the VM.
+arbitrary host environment variables. Claude accepts either
+`ANTHROPIC_API_KEY` or the `ANTHROPIC_AUTH_TOKEN` used by many
+Anthropic-compatible providers under the same opt-in. Prefer interactive/device
+login when possible so a long-lived host secret need not enter the VM.
+
+## Claude Code environment inheritance
+
+The Claude profile automatically inherits a reviewed exact list of
+non-credential settings when they are exported in the launching shell. Unset
+names are skipped and an exported empty value remains empty in the guest. The
+launcher passes `--env NAME`, never `--env NAME=value`, so values do not enter
+the Apple CLI argument vector.
+
+The built-in list is:
+
+```text
+_ANTHROPIC_API_PROVIDER
+ANTHROPIC_BASE_URL
+ANTHROPIC_MODEL
+ANTHROPIC_SMALL_FAST_MODEL
+ANTHROPIC_DEFAULT_HAIKU_MODEL
+ANTHROPIC_DEFAULT_SONNET_MODEL
+ANTHROPIC_DEFAULT_OPUS_MODEL
+ANTHROPIC_DEFAULT_FABLE_MODEL
+ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
+ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
+ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
+ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+CLAUDE_CODE_EFFORT_LEVEL
+CLAUDE_CODE_ENABLE_TELEMETRY
+CLAUDE_CODE_ENHANCED_TELEMETRY_BETA
+CLAUDE_CODE_ENABLE_TOKEN_USAGE_ATTACHMENT
+CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS
+CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES
+CLAUDE_CODE_PROFILE_STARTUP
+CLAUDE_CODE_PROFILE_QUERY
+CLAUDE_CODE_PROPAGATE_TRACEPARENT
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK
+CLAUDE_CODE_DISABLE_SESSION_DATA_UPLOAD
+DISABLE_TELEMETRY
+CLAUDE_CODE_DISABLE_POLICY_SKILLS
+DISABLE_ERROR_REPORTING
+API_TIMEOUT_MS
+CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+CLAUDE_CODE_COORDINATOR_MODE
+CLAUDE_CODE_NO_FLICKER
+CLAUDE_CODE_FORCE_FULL_LOGO
+```
+
+For example, an Anthropic-compatible provider can be selected without putting
+its token in a repository or command argument:
+
+```bash
+export _ANTHROPIC_API_PROVIDER='Compatible provider'
+export ANTHROPIC_BASE_URL='https://provider.example/anthropic/'
+export ANTHROPIC_AUTH_TOKEN='...'
+export ANTHROPIC_MODEL='provider-model'
+export ANTHROPIC_SMALL_FAST_MODEL='provider-model'
+export CLAUDE_CODE_EFFORT_LEVEL=max
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+AGENT_CONTAINER_FORWARD_API_KEY=true claude-container
+```
+
+`DISABLE_AUTOUPDATER` is always set to `1` by the Claude profile; a host value
+cannot override that image-management policy. Internal variables such as
+`USER_TYPE` are not inherited automatically. The full-logo setting is
+`CLAUDE_CODE_FORCE_FULL_LOGO`.
+
+The launcher deliberately does not inherit the complete `ANTHROPIC_*` or
+`CLAUDE_CODE_*` prefixes because they also contain credentials, host file
+descriptors, host paths, and process-internal state. If Claude adds a setting
+before this list is updated, authorize its exact exported name explicitly:
+
+```bash
+export CLAUDE_CODE_FUTURE_SETTING=1
+export AGENT_CONTAINER_FORWARD_ENV=CLAUDE_CODE_FUTURE_SETTING
+claude-container
+```
+
+Use a comma-separated list for multiple names. An explicitly requested name
+must be exported; malformed, unset, loader-related, or launcher-managed names
+fail before Apple runtime access. Exact-name forwarding can expose any secret
+stored in a requested variable, so use the profile credential opt-in for the
+known authentication variables.
 
 ## Workspace, Git, SSH, and GitHub CLI
 
@@ -574,7 +658,8 @@ query. Conversely, `proxy_on` alone does not automatically forward its
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGENT_CONTAINER_FORWARD_API_KEY` | `false` | Forward only the selected profile's declared key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `XAI_API_KEY`) |
+| `AGENT_CONTAINER_FORWARD_API_KEY` | `false` | Forward only the selected profile's declared credentials; Claude supports `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` |
+| `AGENT_CONTAINER_FORWARD_ENV` | unset | Comma-separated exact names of additional exported variables to forward; unsafe launcher/loader names are rejected |
 | `AGENT_CONTAINER_FULL_GIT_CONFIG` | `false` | Expose the full host Git config instead of only `user.name`/`user.email` |
 | `AGENT_CONTAINER_MOUNT_GH` | `false` | Mount host GitHub CLI configuration read-only |
 | `AGENT_CONTAINER_FORWARD_SSH_AGENT` | `false` | Forward the live SSH-agent socket; never mounts private-key files |
