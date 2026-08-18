@@ -1,4 +1,5 @@
 .e2e/
 .native-e2e/
 .benchmarks/
+target/
 .DS_Store

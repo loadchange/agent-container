@@ -1,0 +1,10 @@
+ARG BASE_IMAGE=agent-container-grok:latest
+FROM ${BASE_IMAGE}
+
+COPY agent-workspace-session /usr/local/bin/agent-workspace-session
+COPY agent-workspace-connect /usr/local/bin/agent-workspace-connect
+COPY tests/fixtures/workspace-session-test-agent /usr/local/bin/workspace-session-test-agent
+RUN chmod 0755 \
+      /usr/local/bin/agent-workspace-session \
+      /usr/local/bin/agent-workspace-connect \
+      /usr/local/bin/workspace-session-test-agent

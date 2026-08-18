@@ -1,0 +1,204 @@
+#!/bin/bash
+set -euo pipefail
+
+fail() {
+  printf 'agent-workspace-connect: %s\n' "$*" >&2
+  exit 64
+}
+
+endpoint="${AGENT_WORKSPACE_ENDPOINT:-}"
+token="${AGENT_WORKSPACE_TOKEN:-}"
+unset AGENT_WORKSPACE_ENDPOINT AGENT_WORKSPACE_TOKEN
+
+case "$endpoint" in
+  ''|*$'\n'*|*$'\r'*|*$'\t'*|*:*:*)
+    fail 'AGENT_WORKSPACE_ENDPOINT must be one IPv4:port endpoint.'
+    ;;
+esac
+[ "${#endpoint}" -le 21 ] \
+  || fail 'AGENT_WORKSPACE_ENDPOINT is too long for IPv4:port.'
+
+endpoint_host=${endpoint%:*}
+endpoint_port=${endpoint##*:}
+[ -n "$endpoint_host" ] && [ -n "$endpoint_port" ] \
+  && [ "$endpoint_host:$endpoint_port" = "$endpoint" ] \
+  || fail 'AGENT_WORKSPACE_ENDPOINT must be one IPv4:port endpoint.'
+
+IFS=. read -r octet1 octet2 octet3 octet4 octet_extra <<EOF
+$endpoint_host
+EOF
+[ -z "$octet_extra" ] \
+  || fail 'AGENT_WORKSPACE_ENDPOINT contains too many IPv4 octets.'
+for octet in "$octet1" "$octet2" "$octet3" "$octet4"; do
+  case "$octet" in
+    0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;;
+    *) fail 'AGENT_WORKSPACE_ENDPOINT contains an invalid IPv4 octet.' ;;
+  esac
+  [ "$((10#$octet))" -le 255 ] \
+    || fail 'AGENT_WORKSPACE_ENDPOINT contains an out-of-range IPv4 octet.'
+done
+[ "$endpoint_host" != 0.0.0.0 ] \
+  && [ "$endpoint_host" != 255.255.255.255 ] \
+  || fail 'AGENT_WORKSPACE_ENDPOINT uses an unusable IPv4 address.'
+
+case "$endpoint_port" in
+  [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]) ;;
+  *) fail 'AGENT_WORKSPACE_ENDPOINT contains an invalid TCP port.' ;;
+esac
+[ "$((10#$endpoint_port))" -le 65535 ] \
+  || fail 'AGENT_WORKSPACE_ENDPOINT contains an out-of-range TCP port.'
+
+[[ "$token" =~ ^[0-9a-f]{64}$ ]] \
+  || fail 'AGENT_WORKSPACE_TOKEN must contain exactly 64 lowercase hexadecimal characters.'
+auth_line="AGENT-CONTAINER-WORKSPACE/1 $token"
+[ "${#auth_line}" -lt 100 ] \
+  || fail 'workspace authentication frame exceeds its protocol bound.'
+
+# sshfs treats this executable as its SSH transport. Prefix exactly one
+# bounded authentication frame, then leave both directions as an unmodified
+# SFTP byte stream. The private FIFO lets the parent stop a producer blocked on
+# sshfs stdin after the network peer closes. Socat also propagates peer EOF;
+# OpenBSD nc -N only half-closes after *local* stdin EOF and can otherwise stay
+# forever in CLOSE_WAIT after the host broker disappears.
+transport_dir=
+transport_fifo=
+producer_pid=
+transport_pid=
+background_launching=false
+pending_signal_name=
+pending_signal_status=
+
+child_job_is_active() {
+  local wanted_pid=$1
+  local active_pid job_state
+
+  [ -n "$wanted_pid" ] || return 1
+  for job_state in -pr -ps; do
+    while IFS= read -r active_pid; do
+      [ "$active_pid" = "$wanted_pid" ] && return 0
+    done < <(jobs "$job_state" 2>/dev/null)
+  done
+  return 1
+}
+
+cleanup() {
+  local status=$?
+  trap '' INT TERM HUP
+  trap - EXIT
+  set +e
+  if [ -n "$transport_pid" ] && child_job_is_active "$transport_pid"; then
+    kill -TERM "$transport_pid" 2>/dev/null || true
+  fi
+  [ -z "$transport_pid" ] || wait "$transport_pid" 2>/dev/null || true
+  transport_pid=
+  if [ -n "$producer_pid" ] && child_job_is_active "$producer_pid"; then
+    kill -TERM "$producer_pid" 2>/dev/null || true
+  fi
+  [ -z "$producer_pid" ] || wait "$producer_pid" 2>/dev/null || true
+  producer_pid=
+  if [ -n "$transport_fifo" ]; then
+    /bin/rm -f -- "$transport_fifo" 2>/dev/null || true
+  fi
+  if [ -n "$transport_dir" ]; then
+    case "$transport_dir" in
+      /tmp/agent-workspace-connect.*)
+        /bin/rmdir "$transport_dir" 2>/dev/null || true
+        ;;
+    esac
+  fi
+  return "$status"
+}
+
+handle_signal() {
+  local signal_name=$1
+  local signal_status=$2
+  if [ "$background_launching" = true ]; then
+    if [ -z "$pending_signal_status" ]; then
+      pending_signal_name=$signal_name
+      pending_signal_status=$signal_status
+    fi
+    return 0
+  fi
+  if [ -n "$pending_signal_status" ]; then
+    signal_name=$pending_signal_name
+    signal_status=$pending_signal_status
+    pending_signal_name=
+    pending_signal_status=
+  fi
+  trap '' INT TERM HUP
+  set +e
+  if [ -n "$transport_pid" ] && child_job_is_active "$transport_pid"; then
+    kill -s "$signal_name" "$transport_pid" 2>/dev/null || true
+  fi
+  if [ -n "$producer_pid" ] && child_job_is_active "$producer_pid"; then
+    kill -s "$signal_name" "$producer_pid" 2>/dev/null || true
+  fi
+  exit "$signal_status"
+}
+
+complete_background_launch() {
+  background_launching=false
+  if [ -n "$pending_signal_status" ]; then
+    handle_signal "$pending_signal_name" "$pending_signal_status"
+  fi
+}
+
+trap cleanup EXIT
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
+trap 'handle_signal HUP 129' HUP
+
+transport_dir=$(/usr/bin/mktemp -d /tmp/agent-workspace-connect.XXXXXXXX) \
+  || fail 'cannot create the private transport directory.'
+case "$transport_dir" in
+  /tmp/agent-workspace-connect.*) ;;
+  *) fail 'the private transport directory has an unsafe path.' ;;
+esac
+/bin/chmod 0700 "$transport_dir"
+transport_fifo="$transport_dir/input"
+umask 077
+/usr/bin/mkfifo "$transport_fifo"
+
+background_launching=true
+(
+  trap - INT TERM HUP
+  printf '%s\n' "$auth_line"
+  exec /bin/cat
+) <&0 > "$transport_fifo" &
+producer_pid=$!
+complete_background_launch
+background_launching=true
+(
+  trap - INT TERM HUP
+  exec /usr/bin/socat -t 1 STDIO \
+    "TCP4-CONNECT:$endpoint_host:$endpoint_port,connect-timeout=5,nodelay"
+) < "$transport_fifo" &
+transport_pid=$!
+complete_background_launch
+
+token=
+auth_line=
+set +e
+while child_job_is_active "$transport_pid"; do
+  /bin/sleep 0.01
+done
+wait "$transport_pid"
+transport_status=$?
+transport_pid=
+if child_job_is_active "$producer_pid"; then
+  kill -TERM "$producer_pid" 2>/dev/null || true
+fi
+wait "$producer_pid"
+producer_status=$?
+producer_pid=
+set -e
+
+if [ "$transport_status" -ne 0 ]; then
+  exit "$transport_status"
+fi
+# A normal peer close can give the producer SIGPIPE, or our deliberate TERM,
+# after the socat relay has completed.
+case "$producer_status" in
+  0|141|143) exit 0 ;;
+  *) exit "$producer_status" ;;
+esac

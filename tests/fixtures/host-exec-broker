@@ -36,8 +36,6 @@ esac
 printf '%s\n' "$endpoint" > "$endpoint_tmp"
 mv -f "$endpoint_tmp" "$session_dir/host-exec-endpoint"
 
-trap 'exit 0' INT TERM HUP
-while :; do
-  sleep 1 &
-  wait "$!" || true
-done
+# The fixture has no host commands to serve. Publishing the validated endpoint
+# is sufficient; exiting also keeps the shell regression suite fast.
+exit 0

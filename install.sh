@@ -2,7 +2,10 @@
 set -euo pipefail
 
 readonly INSTALL_MARKER_TEXT="managed by agent-container installer v1"
-readonly BASE_URL="${AGENT_CONTAINER_INSTALL_BASE_URL:-https://raw.githubusercontent.com/loadchange/agent-container/main}"
+readonly DEFAULT_BASE_URL="https://raw.githubusercontent.com/loadchange/agent-container/main"
+BASE_URL="$DEFAULT_BASE_URL"
+BASE_URL_EXPLICIT=false
+LOCAL_RELEASE_DIR=""
 
 RELEASE_COMMANDS=(
   agent-container
@@ -18,15 +21,15 @@ AVAILABLE_PROFILES=(
 COMMANDS=()
 SELECTED_PROFILES=()
 ASSETS=(
-  agent-container
-  claude-container
-  codex-container
-  grok-container
+  agent-container-darwin-arm64
+  agent-container-runtime
   Containerfile
   Containerfile.dockerignore
   entrypoint.sh
   host-exec-client
   host-exec-broker.mjs
+  agent-workspace-connect
+  agent-workspace-session
   profiles/claude.json
   profiles/codex.json
   profiles/grok.json
@@ -39,7 +42,7 @@ die() {
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--all | --profile PROFILE ...]
+Usage: install.sh [--all | --profile PROFILE ...] [--base-url URL]
 
 Install agent-container plus selected compatibility commands.
 
@@ -47,6 +50,8 @@ Options:
   --profile PROFILE   Install one profile (claude, codex, or grok).
                       May be repeated to install multiple profiles.
   --all               Install all profiles explicitly (the default).
+  --base-url URL      Download the release manifest and assets from URL.
+                      Intended for an internal mirror or source checkout.
   -h, --help          Show this help.
 
 Examples:
@@ -54,6 +59,7 @@ Examples:
   ./install.sh --all
   ./install.sh --profile grok
   ./install.sh --profile claude --profile codex
+  ./install.sh --profile claude --base-url "file://$PWD"
 
 The selected profiles are the desired managed set. Re-running with a different
 selection removes only unselected commands that this project can prove it
@@ -112,12 +118,8 @@ asset_is_selected() {
   local requested_asset="$1"
   local asset_profile
   case "$requested_asset" in
-    agent-container|Containerfile|Containerfile.dockerignore|entrypoint.sh|host-exec-client|host-exec-broker.mjs)
+    agent-container-darwin-arm64|agent-container-runtime|Containerfile|Containerfile.dockerignore|entrypoint.sh|host-exec-client|host-exec-broker.mjs|agent-workspace-connect|agent-workspace-session)
       return 0
-      ;;
-    *-container)
-      asset_profile=${requested_asset%-container}
-      profile_is_selected "$asset_profile"
       ;;
     profiles/*.json)
       asset_profile=${requested_asset#profiles/}
@@ -166,6 +168,203 @@ marker_matches() {
     && cmp -s "$marker" <(printf '%s\n' "$INSTALL_MARKER_TEXT")
 }
 
+read_single_line() {
+  local file="$1"
+  local value
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  IFS= read -r value < "$file" || return 1
+  [ -n "$value" ] || return 1
+  cmp -s "$file" <(printf '%s\n' "$value") || return 1
+  printf '%s\n' "$value"
+}
+
+valid_lock_owner() {
+  [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1
+  case "$1" in
+    *[!A-Za-z0-9._:-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+lock_directory_has_only() {
+  local lock_root="$1"
+  local allowed_names="$2"
+  local lock_entry lock_name
+
+  for lock_entry in \
+    "$lock_root"/* \
+    "$lock_root"/.[!.]* \
+    "$lock_root"/..?*; do
+    [ -e "$lock_entry" ] || [ -L "$lock_entry" ] || continue
+    lock_name=${lock_entry##*/}
+    case " $allowed_names " in
+      *" $lock_name "*) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+release_install_directory_lock() {
+  local current_pid current_owner
+  if [ "$lock_acquired" = true ] \
+    && [ -n "${install_lock:-}" ] \
+    && [ -d "$install_lock" ] \
+    && [ ! -L "$install_lock" ]; then
+    current_pid=$(read_single_line "$install_lock/pid" || true)
+    current_owner=$(read_single_line "$install_lock/owner" || true)
+    if [ "$current_pid" = "$$" ] \
+      && [ -n "${install_lock_owner:-}" ] \
+      && [ "$current_owner" = "$install_lock_owner" ] \
+      && lock_directory_has_only "$install_lock" "pid owner"; then
+      rm -f -- "$install_lock/pid" "$install_lock/owner"
+      rmdir -- "$install_lock" 2>/dev/null || true
+    fi
+  fi
+  lock_acquired=false
+}
+
+release_install_kernel_lock() {
+  if [ "${install_kernel_lock_acquired:-false}" = true ]; then
+    exec 9<&-
+    install_kernel_lock_acquired=false
+  fi
+}
+
+release_install_lock() {
+  release_install_directory_lock
+  release_install_kernel_lock
+}
+
+acquire_install_kernel_lock() {
+  [ "${install_kernel_lock_acquired:-false}" = false ] || return 0
+  [ -x /usr/bin/lockf ] \
+    || die "macOS /usr/bin/lockf is required for installer serialization."
+  exec 9< "$home_dir" \
+    || die "Unable to open HOME for installer locking."
+  if ! /usr/bin/lockf -t 0 9 2>/dev/null; then
+    exec 9<&-
+    die "Another agent-container transaction is running."
+  fi
+  install_kernel_lock_acquired=true
+}
+
+acquire_install_lock() {
+  local existing_pid existing_owner existing_owner_present
+  local reap_dir reap_pid reap_owner quarantine retry
+
+  install_lock_owner="$$.$RANDOM.$RANDOM"
+  valid_lock_owner "$install_lock_owner" \
+    || die "Unable to generate a safe installer lock owner token."
+  acquire_install_kernel_lock
+  retry=0
+  while ! mkdir -- "$install_lock" 2>/dev/null; do
+    retry=$((retry + 1))
+    [ "$retry" -le 20 ] \
+      || die "Could not acquire the installer lock after repeated concurrent changes: $install_lock"
+    if ! path_exists "$install_lock"; then
+      continue
+    fi
+    [ -d "$install_lock" ] && [ ! -L "$install_lock" ] \
+      || die "Invalid installer lock at $install_lock"
+    existing_pid=$(read_single_line "$install_lock/pid" || true)
+    case "$existing_pid" in
+      ''|0|*[!0-9]*)
+        die "Installer lock has no valid owner PID; inspect and remove it manually if stale: $install_lock"
+        ;;
+    esac
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      die "Another agent-container transaction is running (PID $existing_pid)."
+    fi
+
+    existing_owner=""
+    existing_owner_present=false
+    if path_exists "$install_lock/owner"; then
+      [ -f "$install_lock/owner" ] && [ ! -L "$install_lock/owner" ] \
+        || die "The stale installer lock has an unsafe owner record: $install_lock"
+      existing_owner=$(read_single_line "$install_lock/owner" || true)
+      valid_lock_owner "$existing_owner" \
+        || die "The stale installer lock has an invalid owner record: $install_lock"
+      existing_owner_present=true
+    fi
+    [ "$existing_owner_present" = true ] \
+      || die "A stale legacy installer lock cannot be reclaimed safely while older launchers may still be running. Verify PID $existing_pid is dead, then remove only: $install_lock"
+
+    reap_dir="$install_lock/.reap"
+    if ! mkdir -- "$reap_dir" 2>/dev/null; then
+      path_exists "$install_lock" || continue
+      [ -d "$reap_dir" ] && [ ! -L "$reap_dir" ] \
+        || die "The stale installer lock has an unsafe recovery claim: $install_lock"
+      lock_directory_has_only "$reap_dir" "pid owner" \
+        || die "The stale installer lock recovery claim contains unexpected entries."
+      reap_pid=$(read_single_line "$reap_dir/pid" || true)
+      reap_owner=$(read_single_line "$reap_dir/owner" || true)
+      if case "$reap_pid" in
+          ''|0|*[!0-9]*) false ;;
+          *) true ;;
+        esac \
+        && valid_lock_owner "$reap_owner" \
+        && kill -0 "$reap_pid" 2>/dev/null; then
+        die "Another agent-container transaction is reclaiming a stale installer lock (PID $reap_pid)."
+      fi
+      rm -f -- "$reap_dir/pid" "$reap_dir/owner"
+      rmdir -- "$reap_dir" 2>/dev/null \
+        || die "Could not clear an abandoned installer recovery claim."
+      mkdir -- "$reap_dir" \
+        || die "Could not replace an abandoned installer recovery claim."
+    fi
+    chmod 0700 "$reap_dir"
+    if ! printf '%s\n' "$$" > "$reap_dir/pid" \
+      || ! printf '%s\n' "$install_lock_owner" > "$reap_dir/owner"; then
+      rm -f -- "$reap_dir/pid" "$reap_dir/owner"
+      rmdir -- "$reap_dir" 2>/dev/null || true
+      die "Unable to publish the installer lock recovery claim."
+    fi
+
+    [ "$(read_single_line "$install_lock/pid" || true)" = "$existing_pid" ] \
+      || die "The stale installer lock changed while it was being reclaimed."
+    if [ "$existing_owner_present" = true ]; then
+      [ "$(read_single_line "$install_lock/owner" || true)" = "$existing_owner" ] \
+        || die "The stale installer lock owner changed while it was being reclaimed."
+    else
+      ! path_exists "$install_lock/owner" \
+        || die "The stale installer lock gained an owner while it was being reclaimed."
+    fi
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      rm -f -- "$reap_dir/pid" "$reap_dir/owner"
+      rmdir -- "$reap_dir" 2>/dev/null || true
+      die "The installer lock owner PID $existing_pid became active during recovery."
+    fi
+    lock_directory_has_only "$install_lock" "pid owner .reap" \
+      && lock_directory_has_only "$reap_dir" "pid owner" \
+      || die "The stale installer lock contains unexpected entries; refusing to reclaim it."
+
+    quarantine="$install_lock.reaped.$install_lock_owner"
+    ! path_exists "$quarantine" \
+      || die "The installer lock recovery quarantine already exists: $quarantine"
+    mv -- "$install_lock" "$quarantine" \
+      || die "Could not atomically quarantine the stale installer lock: $install_lock"
+    [ "$(read_single_line "$quarantine/.reap/pid" || true)" = "$$" ] \
+      && [ "$(read_single_line "$quarantine/.reap/owner" || true)" = "$install_lock_owner" ] \
+      || die "Installer lock recovery ownership changed after quarantine."
+    rm -f -- \
+      "$quarantine/pid" \
+      "$quarantine/owner" \
+      "$quarantine/.reap/pid" \
+      "$quarantine/.reap/owner"
+    rmdir -- "$quarantine/.reap" \
+      && rmdir -- "$quarantine" \
+      || die "Could not clear the quarantined stale installer lock: $quarantine"
+  done
+  chmod 0700 "$install_lock"
+  if ! printf '%s\n' "$$" > "$install_lock/pid" \
+    || ! printf '%s\n' "$install_lock_owner" > "$install_lock/owner"; then
+    rm -f -- "$install_lock/pid" "$install_lock/owner"
+    rmdir -- "$install_lock" 2>/dev/null || true
+    die "Unable to publish installer lock ownership."
+  fi
+  lock_acquired=true
+}
+
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" | awk '{print $1}'
@@ -186,12 +385,72 @@ sha256_stream() {
   fi
 }
 
+discover_local_release() {
+  local asset candidate_dir candidate_script
+
+  candidate_script=$0
+  case "$candidate_script" in
+    /*) ;;
+    *) candidate_script="$PWD/$candidate_script" ;;
+  esac
+  [ -f "$candidate_script" ] && [ ! -L "$candidate_script" ] || return 1
+  candidate_dir=$(CDPATH= cd -- "$(dirname -- "$candidate_script")" && pwd -P) \
+    || return 1
+  candidate_script="$candidate_dir/${candidate_script##*/}"
+  [ -f "$candidate_script" ] && [ ! -L "$candidate_script" ] || return 1
+  [ -f "$candidate_dir/release-manifest.sha256" ] \
+    && [ ! -L "$candidate_dir/release-manifest.sha256" ] \
+    && [ -d "$candidate_dir/profiles" ] \
+    && [ ! -L "$candidate_dir/profiles" ] \
+    || return 1
+  for asset in "${ASSETS[@]}"; do
+    [ -f "$candidate_dir/$asset" ] && [ ! -L "$candidate_dir/$asset" ] \
+      || return 1
+  done
+  LOCAL_RELEASE_DIR="$candidate_dir"
+}
+
+download_release_file() {
+  local destination="$2"
+  local relative_path="$1"
+  local source_path
+
+  if [ -n "$LOCAL_RELEASE_DIR" ]; then
+    source_path="$LOCAL_RELEASE_DIR/$relative_path"
+    [ -f "$source_path" ] && [ ! -L "$source_path" ] \
+      || die "Local release asset is unsafe or missing: $relative_path"
+    /bin/cp -- "$source_path" "$destination" \
+      || die "Could not copy local release asset: $relative_path"
+    return
+  fi
+
+  curl --disable --fail --silent --show-error --location --retry 3 \
+    "${BASE_URL%/}/$relative_path" -o "$destination"
+}
+
+validate_native_launcher() {
+  local launcher_path="$1"
+  local description="$2"
+  local file_output
+
+  [ -f "$launcher_path" ] \
+    && [ ! -L "$launcher_path" ] \
+    && [ -x "$launcher_path" ] \
+    || die "$description is not a regular executable file."
+  file_output=$(/usr/bin/file -b "$launcher_path" 2>/dev/null) \
+    || die "$description could not be inspected as a native executable."
+  [ "$file_output" = "Mach-O 64-bit executable arm64" ] \
+    || die "$description is not a thin Mach-O 64-bit arm64 executable."
+  /usr/bin/codesign --verify --strict "$launcher_path" >/dev/null 2>&1 \
+    || die "$description does not have a valid code signature."
+}
+
 is_recognized_regular_command() {
   local command_path="$1"
   local command_name="$2"
 
   [ -f "$command_path" ] && [ ! -L "$command_path" ] || return 1
-  if cmp -s "$command_path" "$tmp_dir/$command_name"; then
+  if cmp -s "$command_path" "$tmp_dir/agent-container-darwin-arm64"; then
     return 0
   fi
 
@@ -209,7 +468,125 @@ is_recognized_regular_command() {
   esac
 }
 
+current_release_selects_profile() {
+  local requested_profile="$1"
+  local current_link current_release_id current_release profiles_dir
+  local selected_profile_file
+
+  [ -L "$asset_root/current" ] || return 1
+  current_link=$(readlink "$asset_root/current") || return 1
+  case "$current_link" in
+    releases/*) current_release_id=${current_link#releases/} ;;
+    *) return 1 ;;
+  esac
+  [ "${#current_release_id}" -eq 64 ] || return 1
+  case "$current_release_id" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+
+  current_release="$asset_root/releases/$current_release_id"
+  [ -d "$current_release" ] && [ ! -L "$current_release" ] || return 1
+  [ "$(physical_dir "$current_release" || true)" = "$current_release" ] \
+    || return 1
+  [ "$(read_single_line "$current_release/.agent-container-release" || true)" \
+      = "$current_release_id" ] \
+    || return 1
+  profiles_dir="$current_release/profiles"
+  [ -d "$profiles_dir" ] && [ ! -L "$profiles_dir" ] || return 1
+  selected_profile_file="$profiles_dir/$requested_profile.json"
+  [ -f "$selected_profile_file" ] && [ ! -L "$selected_profile_file" ]
+}
+
+guard_profile_singleton_before_removal() {
+  local requested_profile="$1"
+  local container_bin osascript_bin list_file singleton_state
+
+  container_bin=container
+  command -v "$container_bin" >/dev/null 2>&1 \
+    || die "Cannot remove profile '$requested_profile' because the Apple container CLI is unavailable. Stop its managed singleton first with: agent-container singleton stop $requested_profile"
+  osascript_bin=$(command -v osascript || true)
+  [ -n "$osascript_bin" ] \
+    || die "Cannot remove profile '$requested_profile' because macOS JavaScriptCore is unavailable to verify singleton absence."
+
+  list_file="$tmp_dir/$requested_profile-singleton-list.json"
+  if ! "$container_bin" list --all --format json > "$list_file" 2>/dev/null; then
+    die "Cannot remove profile '$requested_profile' because Apple container state could not be enumerated. Start the service and stop its managed singleton first with: agent-container singleton stop $requested_profile"
+  fi
+  if ! singleton_state=$("$osascript_bin" -l JavaScript - \
+    "$list_file" "$(id -u)" "$requested_profile" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('container list is not readable UTF-8');
+  const containers = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(containers)) throw new Error('container list must be an array');
+
+  const hostUID = argv[1];
+  const profile = argv[2];
+  if (!/^(?:claude|codex|grok)$/.test(profile)) {
+    throw new Error('profile is not supported');
+  }
+  const expectedID = 'agent-' + profile + '-' + hostUID + '-singleton';
+  let match = null;
+  for (const container of containers) {
+    if (container === null || typeof container !== 'object' || Array.isArray(container)) {
+      throw new Error('container list contains a non-object record');
+    }
+    const id = container.id;
+    if (typeof id !== 'string' || /[\t\r\n]/.test(id)) {
+      throw new Error('container id is not a single-line string');
+    }
+    if (id !== expectedID) continue;
+    if (match !== null) throw new Error('singleton identity is duplicated');
+
+    const configuration = container.configuration;
+    if (configuration === null || typeof configuration !== 'object'
+        || Array.isArray(configuration) || configuration.id !== expectedID) {
+      throw new Error('singleton configuration identity mismatch');
+    }
+    const labels = configuration.labels;
+    const launcherPID = labels && labels['com.loadchange.agent-container.launcher-pid'];
+    const configHash = labels
+      && labels['com.loadchange.agent-container.config-sha256'];
+    if (labels === null || typeof labels !== 'object' || Array.isArray(labels)
+        || labels['com.loadchange.agent-container'] !== 'true'
+        || labels['com.loadchange.agent-container.profile'] !== profile
+        || labels['com.loadchange.agent-container.host-uid'] !== hostUID
+        || labels['com.loadchange.agent-container.mode'] !== 'singleton'
+        || typeof launcherPID !== 'string' || !/^[0-9]+$/.test(launcherPID)
+        || Number(launcherPID) < 2
+        || typeof configHash !== 'string' || !/^[0-9a-f]{64}$/.test(configHash)) {
+      throw new Error('reserved singleton identity has invalid provenance labels');
+    }
+    const state = container.status && typeof container.status === 'object'
+      && !Array.isArray(container.status)
+      ? container.status.state
+      : null;
+    if (!['unknown', 'stopped', 'running', 'stopping'].includes(state)) {
+      throw new Error('singleton has an invalid runtime state');
+    }
+    match = state;
+  }
+  return match === null ? 'absent' : match;
+}
+JXA
+  ); then
+    die "Cannot remove profile '$requested_profile' because its reserved singleton identity or Apple container state could not be verified safely. Stop it first with: agent-container singleton stop $requested_profile"
+  fi
+
+  [ "$singleton_state" = absent ] \
+    || die "Cannot remove profile '$requested_profile' while its managed singleton exists in state '$singleton_state'. Stop it first with: agent-container singleton stop $requested_profile"
+}
+
 selection_mode=default
+[ -z "${AGENT_CONTAINER_INSTALL_BASE_URL+x}" ] \
+  || usage_die "AGENT_CONTAINER_INSTALL_BASE_URL is no longer a public interface; use --base-url URL."
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --all)
@@ -235,6 +612,18 @@ while [ "$#" -gt 0 ]; do
       select_profile "$profile_value"
       shift
       ;;
+    --base-url)
+      [ "$#" -ge 2 ] || usage_die "--base-url requires a URL."
+      BASE_URL="$2"
+      BASE_URL_EXPLICIT=true
+      shift 2
+      ;;
+    --base-url=*)
+      BASE_URL=${1#--base-url=}
+      [ -n "$BASE_URL" ] || usage_die "--base-url requires a URL."
+      BASE_URL_EXPLICIT=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -247,6 +636,21 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$BASE_URL_EXPLICIT" = false ]; then
+  discover_local_release || true
+fi
+
+case "$BASE_URL" in
+  https://*|file:///*) ;;
+  *) usage_die "--base-url must use https:// or an absolute file:/// URL." ;;
+esac
+case "$BASE_URL" in
+  *$'\n'*|*$'\r'*|*$'\t'*)
+    usage_die "--base-url contains unsupported control characters."
+    ;;
+esac
+readonly BASE_URL
 
 if [ "$selection_mode" != profiles ]; then
   for profile_id in "${AVAILABLE_PROFILES[@]}"; do
@@ -317,6 +721,8 @@ root_created=false
 marker_created=false
 releases_created=false
 lock_acquired=false
+install_lock_owner=""
+install_kernel_lock_acquired=false
 transaction_complete=false
 
 current_path=""
@@ -383,14 +789,11 @@ cleanup() {
     fi
   fi
 
-  if [ "$lock_acquired" = true ] && [ -n "${install_lock:-}" ]; then
-    rm -f -- "$install_lock/pid"
-    rmdir -- "$install_lock" 2>/dev/null
-  fi
   if [ "$transaction_complete" != true ] && [ -n "${asset_root:-}" ]; then
     [ "$releases_created" = false ] || rmdir -- "$asset_root/releases" 2>/dev/null
     [ "$root_created" = false ] || rmdir -- "$asset_root" 2>/dev/null
   fi
+  release_install_lock
   [ -z "$tmp_dir" ] || rm -rf -- "$tmp_dir"
   exit "$status"
 }
@@ -403,9 +806,9 @@ restore_signal_traps
 
 echo "Installing profiles: ${SELECTED_PROFILES[*]}"
 
-curl --fail --silent --show-error --location --retry 3 \
-  "${BASE_URL%/}/release-manifest.sha256" \
-  -o "$tmp_dir/release-manifest.sha256"
+download_release_file \
+  release-manifest.sha256 \
+  "$tmp_dir/release-manifest.sha256"
 [ -s "$tmp_dir/release-manifest.sha256" ] \
   || die "Downloaded release manifest is empty."
 [ -f "$tmp_dir/release-manifest.sha256" ] \
@@ -435,23 +838,28 @@ done < "$tmp_dir/release-manifest.sha256"
 mkdir -- "$tmp_dir/profiles"
 for ((asset_index = 0; asset_index < ${#ASSETS[@]}; asset_index++)); do
   asset=${ASSETS[$asset_index]}
-  curl --fail --silent --show-error --location --retry 3 \
-    "${BASE_URL%/}/$asset" -o "$tmp_dir/$asset"
+  download_release_file "$asset" "$tmp_dir/$asset"
   [ -s "$tmp_dir/$asset" ] || die "Downloaded asset is empty: $asset"
   actual_hash=$(sha256_file "$tmp_dir/$asset")
   [ "$actual_hash" = "${manifest_hashes[$asset_index]}" ] \
     || die "Downloaded asset does not match release manifest: $asset"
 done
 
+# curl creates downloads without execute permissions. Set the launcher's final
+# mode before native validation so the staged artifact is exactly what runs.
+chmod 0755 "$tmp_dir/agent-container-darwin-arm64"
+validate_native_launcher \
+  "$tmp_dir/agent-container-darwin-arm64" \
+  "The downloaded agent-container launcher"
+
 # A successful HTTP response can still be an error page. Validate every shell
 # and JSON asset before any installed path is touched.
 bash -n \
-  "$tmp_dir/agent-container" \
-  "$tmp_dir/claude-container" \
-  "$tmp_dir/codex-container" \
-  "$tmp_dir/grok-container" \
+  "$tmp_dir/agent-container-runtime" \
   "$tmp_dir/entrypoint.sh" \
   "$tmp_dir/host-exec-client" \
+  "$tmp_dir/agent-workspace-connect" \
+  "$tmp_dir/agent-workspace-session" \
   || die "A downloaded shell asset failed validation."
 grep -Eq '^[[:space:]]*(ARG[[:space:]]+BASE_IMAGE|FROM[[:space:]])' "$tmp_dir/Containerfile" \
   || die "The downloaded Containerfile failed validation."
@@ -459,6 +867,8 @@ grep -Eq '^[[:space:]]*(ARG[[:space:]]+BASE_IMAGE|FROM[[:space:]])' "$tmp_dir/Co
   && grep -Fqx '**' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!entrypoint.sh' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!host-exec-client' "$tmp_dir/Containerfile.dockerignore" \
+  && grep -Fqx '!agent-workspace-connect' "$tmp_dir/Containerfile.dockerignore" \
+  && grep -Fqx '!agent-workspace-session' "$tmp_dir/Containerfile.dockerignore" \
   || die "The downloaded Containerfile.dockerignore failed validation."
 grep -Fq 'createServer' "$tmp_dir/host-exec-broker.mjs" \
   || die "The downloaded host-exec broker failed validation."
@@ -487,6 +897,9 @@ case "$release_id" in
 esac
 [ "${#release_id}" -eq 64 ] \
   || die "Could not calculate a valid release fingerprint."
+
+ignore_signals
+acquire_install_kernel_lock
 
 local_root_input="$home_input/.local"
 if ! path_exists "$local_root_input"; then
@@ -519,29 +932,7 @@ path_is_within "$home_dir" "$share_dir" \
 # removal transaction. A pidless/malformed lock fails closed because it may be
 # in the tiny owner-publication window.
 install_lock="$share_dir/.agent-container.install.lock"
-ignore_signals
-if ! mkdir -- "$install_lock" 2>/dev/null; then
-  [ -d "$install_lock" ] && [ ! -L "$install_lock" ] \
-    || die "Invalid installer lock at $install_lock"
-  existing_pid=""
-  if [ -f "$install_lock/pid" ] && [ ! -L "$install_lock/pid" ]; then
-    existing_pid=$(sed -n '1p' "$install_lock/pid" 2>/dev/null || true)
-  fi
-  case "$existing_pid" in
-    ''|0|*[!0-9]*)
-      die "Installer lock has no valid owner PID; inspect and remove it manually if stale: $install_lock"
-      ;;
-  esac
-  if kill -0 "$existing_pid" 2>/dev/null; then
-    die "Another agent-container transaction is running (PID $existing_pid)."
-  fi
-  rm -f -- "$install_lock/pid"
-  rmdir -- "$install_lock" 2>/dev/null \
-    || die "Could not clear stale installer lock: $install_lock"
-  mkdir -- "$install_lock"
-fi
-lock_acquired=true
-printf '%s\n' "$$" > "$install_lock/pid"
+acquire_install_lock
 restore_signal_traps
 
 asset_root="$share_dir/agent-container"
@@ -575,6 +966,17 @@ else
   printf '%s\n' "$INSTALL_MARKER_TEXT" > "$install_marker"
   chmod 0600 "$install_marker"
 fi
+
+# Removing a profile's launch record must never strand its persistent
+# container. Enumerate every deselected fixed identity while the HOME
+# transaction lock is held, before switching the current release or commands.
+for profile_id in "${AVAILABLE_PROFILES[@]}"; do
+  if ! profile_is_selected "$profile_id" \
+    && { current_release_selects_profile "$profile_id" \
+      || path_exists "$home_dir/.agent-container/profiles/$profile_id/singleton"; }; then
+    guard_profile_singleton_before_removal "$profile_id"
+  fi
+done
 
 releases_dir="$asset_root/releases"
 if path_exists "$releases_dir"; then
@@ -613,15 +1015,33 @@ if path_exists "$release_dir"; then
         || die "Existing release contains an unselected asset: $release_dir/$asset"
     fi
   done
+  validate_native_launcher \
+    "$release_dir/agent-container-darwin-arm64" \
+    "The installed agent-container launcher"
+  for executable_asset in \
+    agent-container-runtime \
+    entrypoint.sh \
+    host-exec-client \
+    agent-workspace-connect \
+    agent-workspace-session; do
+    [ -f "$release_dir/$executable_asset" ] \
+      && [ ! -L "$release_dir/$executable_asset" ] \
+      && [ -x "$release_dir/$executable_asset" ] \
+      || die "Existing release has a non-executable runtime asset: $release_dir/$executable_asset"
+  done
+  for command_name in "${RELEASE_COMMANDS[@]}"; do
+    [ -L "$release_dir/$command_name" ] \
+      && [ "$(readlink "$release_dir/$command_name")" = agent-container-darwin-arm64 ] \
+      || die "Existing release has an invalid command alias: $release_dir/$command_name"
+  done
   release_root_listing="$tmp_dir/existing-release-root-list"
   find "$release_dir" -mindepth 1 -maxdepth 1 -print \
     > "$release_root_listing" 2>/dev/null \
     || die "Could not safely enumerate the existing release: $release_dir"
   release_root_count=$(wc -l < "$release_root_listing" | tr -d '[:space:]')
-  # Shared runtime files (Containerfile, dockerignore, entrypoint, host client,
-  # and host broker), agent-container, one wrapper per selected profile, the
-  # profiles directory, release manifest, and ownership marker.
-  expected_root_count=$((9 + ${#SELECTED_PROFILES[@]}))
+  # Nine shared regular assets, four command aliases, the profiles directory,
+  # release manifest, and ownership marker.
+  expected_root_count=16
   [ "$release_root_count" = "$expected_root_count" ] \
     || die "Existing release contains unexpected root entries: $release_dir"
   release_profile_listing="$tmp_dir/existing-release-profile-list"
@@ -637,8 +1057,14 @@ else
   stage_created=true
   mkdir -- "$stage_dir/profiles"
   restore_signal_traps
-  for command_name in "${COMMANDS[@]}"; do
-    install -m 0755 "$tmp_dir/$command_name" "$stage_dir/$command_name"
+  install -m 0755 \
+    "$tmp_dir/agent-container-darwin-arm64" \
+    "$stage_dir/agent-container-darwin-arm64"
+  install -m 0755 \
+    "$tmp_dir/agent-container-runtime" \
+    "$stage_dir/agent-container-runtime"
+  for command_name in "${RELEASE_COMMANDS[@]}"; do
+    ln -s agent-container-darwin-arm64 "$stage_dir/$command_name"
   done
   install -m 0644 "$tmp_dir/Containerfile" "$stage_dir/Containerfile"
   install -m 0644 \
@@ -647,6 +1073,12 @@ else
   install -m 0755 "$tmp_dir/entrypoint.sh" "$stage_dir/entrypoint.sh"
   install -m 0755 "$tmp_dir/host-exec-client" "$stage_dir/host-exec-client"
   install -m 0644 "$tmp_dir/host-exec-broker.mjs" "$stage_dir/host-exec-broker.mjs"
+  install -m 0755 \
+    "$tmp_dir/agent-workspace-connect" \
+    "$stage_dir/agent-workspace-connect"
+  install -m 0755 \
+    "$tmp_dir/agent-workspace-session" \
+    "$stage_dir/agent-workspace-session"
   for profile_id in "${SELECTED_PROFILES[@]}"; do
     install -m 0644 "$tmp_dir/profiles/$profile_id.json" "$stage_dir/profiles/$profile_id.json"
   done
@@ -767,8 +1199,7 @@ echo "Installed release:        $release_id"
 echo "Installed assets:         $asset_root/current"
 echo ""
 if command -v container >/dev/null 2>&1; then
-  echo "Before the first run, start Apple container explicitly:"
-  echo "  container system start"
+  echo "Apple container services will be started automatically when needed:"
   echo "  ${SELECTED_PROFILES[0]}-container"
 else
   echo "Apple container is not installed. Get version 1.2.0 or newer from:"

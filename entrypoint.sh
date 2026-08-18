@@ -93,6 +93,26 @@ runtime_passwd_home=$(printf '%s\n' "$runtime_passwd_record" | cut -d: -f6)
     exit 65
   }
 
+# Give every Agent process a guest-local runtime directory. It must live on the
+# VM root filesystem rather than the shared shadow HOME: Unix sockets cannot
+# bridge separate guest kernels, and sharing their lock/socket paths is unsafe.
+runtime_dir_parent=/run/user
+runtime_dir="$runtime_dir_parent/$runtime_uid"
+if [ -L "$runtime_dir_parent" ] \
+  || { [ -e "$runtime_dir_parent" ] && [ ! -d "$runtime_dir_parent" ]; }; then
+  echo "Error: refusing an unsafe runtime-directory parent: $runtime_dir_parent" >&2
+  exit 65
+fi
+mkdir -p -- "$runtime_dir_parent"
+if [ -L "$runtime_dir" ] \
+  || { [ -e "$runtime_dir" ] && [ ! -d "$runtime_dir" ]; }; then
+  echo "Error: refusing an unsafe user runtime directory: $runtime_dir" >&2
+  exit 65
+fi
+mkdir -p -- "$runtime_dir"
+chown "$runtime_uid:$runtime_gid" "$runtime_dir"
+chmod 0700 "$runtime_dir"
+
 runtime_path="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 host_command_manifest=/run/agent-host/host-commands.tsv
 if [ -f "$host_command_manifest" ] && [ ! -L "$host_command_manifest" ]; then
@@ -146,5 +166,6 @@ exec setpriv \
     USER="$runtime_user" \
     LOGNAME="$runtime_user" \
     SHELL=/bin/bash \
+    XDG_RUNTIME_DIR="$runtime_dir" \
     PATH="$runtime_path" \
     "$@"

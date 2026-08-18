@@ -1,806 +1,653 @@
 # agent-container
 
-Run Agent CLIs in Apple's official container runtime on Apple silicon Macs.
-Claude Code, Codex CLI, and future agents are profiles of one standardized,
-macOS-only runtime instead of separate container scripts.
+Run Claude Code, Codex CLI, and Grok CLI in lightweight Linux Micro-VMs on an
+Apple silicon Mac. The normal path keeps one persistent Apple container for
+each `(profile, macOS UID)` pair and starts a fresh Agent process for every
+terminal with `container exec`.
 
 ```text
-agent-container <profile> [agent arguments...]
-agent-container run <profile> [runtime options...] [-- agent arguments...]
-claude-container [claude arguments...]
-codex-container  [codex arguments...]
-grok-container   [grok arguments...]
-<profile>-container run [runtime options...] [-- agent arguments...]
+agent-container [launcher options] <profile> [agent arguments...]
+claude-container [launcher options] [claude arguments...]
+codex-container  [launcher options] [codex arguments...]
+grok-container   [launcher options] [grok arguments...]
+
+agent-container singleton status <profile>
+agent-container singleton stop <profile>
 ```
 
-The host integration is native Swift, Virtualization.framework, and Apple's
-Containerization stack. The Agent itself still runs as an `arm64` **Linux**
-process in a lightweight Micro-VM; a macOS Mach-O Agent binary cannot run in
-the guest.
-
-The legacy form does not reproduce macOS GUI, Keychain, Xcode, Mach-O binaries,
-or the complete host toolchain. The explicit `run` form adds a sandboxed bridge
-to eligible commands already on the host `PATH`; it does not make Mach-O
-binaries executable inside Linux. Agent-specific browser login must support a
-device flow or another guest-compatible mechanism.
-
-## What “physical-machine-like” means
-
-Each session preserves the parts of local CLI use that matter most:
-
-- the repository and current directory appear at the same absolute path;
-- the Agent process uses the host's numeric UID/GID, so created files keep the
-  expected ownership;
-- stdin, a real TTY, terminal resize, exit status, and signals are forwarded;
-- authentication, settings, sessions, and caches persist in a separate home
-  for each Agent;
-- the VM and writable OCI root are disposable after every `--rm` session.
-
-It deliberately does **not** mount the real host home directory. The guest
-`HOME` has the same path string as the host home, but its mount source is an
-isolated profile home under `~/.agent-container/profiles/<id>/home`. A nested
-workspace mount supplies only the selected repository. This preserves familiar
-paths without exposing unrelated documents, browser data, credentials, or
-another Agent's state.
-
-## Status and important safety warning
-
-This project targets Apple `container` 1.2.0+ on macOS 26+. Apple's open
-[`container` issue #1097](https://github.com/apple/container/issues/1097)
-reports VirtioFS file-descriptor retention and exhaustion behavior; reports
-include application failures and a macOS kernel panic. The launcher therefore:
-
-- allows one Agent VM at a time by default, across all profiles;
-- rejects projected shares above 40,000 filesystem entries;
-- checks the host file/vnode tables before launch;
-- stops a running VM when file/vnode use reaches an 80% threshold.
-
-There is no universally proven safe threshold while the upstream issue remains
-open. Do not run million-file stress reproducers on a daily-use Mac. The escape
-hatches are explicit and intentionally verbose:
+The default invocation needs no launcher options:
 
 ```bash
-export AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK=true
-export AGENT_CONTAINER_ALLOW_CONCURRENT=true
+cd /path/to/project-a
+grok-container
 ```
 
-This permits different profiles to overlap. Sessions of the same profile stay
-serialized so two builds cannot race on that profile's provenance-tracked
-image tag.
+Opening another project does **not** start a second Grok VM:
 
-## Install Apple container
+```bash
+# Terminal 1
+cd /path/to/project-a && grok-container
+
+# Terminal 2
+cd /path/to/project-b && grok-container
+```
+
+Both commands use `agent-grok-<uid>-singleton`, but each receives an independent
+Grok process, stdin/stdout, TTY, current directory, workspace transport, and
+exit status. Claude and Codex use the same execution model. This is VM reuse,
+not an Agent-specific background service: there is no shared Grok process and
+no Agent-specific lifecycle or sandbox change.
+
+## Runtime model
+
+The selected Agent is a native `linux/arm64` executable inside an Apple
+Containerization Micro-VM. It is not a macOS Mach-O process. The persistent VM
+provides:
+
+- one inspected image and writable guest root per profile and host UID;
+- one isolated, persistent profile HOME for login, settings, history, and
+  caches;
+- normal outbound guest networking;
+- multiple concurrent `container exec` clients, each with its own TTY and cwd.
+
+The real macOS HOME is never mounted wholesale. If the host HOME is
+`/Users/alice`, the guest uses the same path string, but its contents come from
+`~/.agent-container/profiles/<profile>/home`, not `/Users/alice` itself.
+
+Apple `container` 1.2 cannot add a bind mount to a running container. The
+default path therefore does not pre-mount project A, project B, a common parent,
+or a configured root list. For each invocation, the launcher:
+
+1. resolves the current Git top-level directory, or the current directory when
+   outside Git;
+2. starts a one-connection Rust workspace broker on macOS;
+3. starts `container exec` in a private guest mount namespace;
+4. mounts that one host project at the same absolute path through SSHFS and raw
+   SFTP;
+5. changes to the caller's original cwd and starts a fresh Agent process as the
+   host numeric UID/GID;
+6. unmounts the workspace and exits the broker when that Agent process ends.
+
+This makes project switching dynamic. No root registration, root environment
+variable, or singleton restart is needed when moving between ordinary Git
+repositories.
+
+The private mount namespace prevents one client's SSHFS mount from appearing in
+another client's normal filesystem view. Clients of the same profile still
+share a VM, Linux UID, process table, and mutable profile HOME, so they must be
+treated as one trust boundary. Use a separate macOS account or a separately
+isolated workflow for mutually hostile projects.
+
+## Requirements
 
 - Apple silicon Mac
 - macOS 26 or newer
 - Apple [`container` 1.2.0+](https://github.com/apple/container/releases)
-- system Bash, `plutil`, and macOS JavaScriptCore (`osascript`)
+- Apple's `container` CLI installed (the launcher starts its per-user services
+  automatically when needed)
 
-Download the latest signed `.pkg` from Apple's
-[`container` releases](https://github.com/apple/container/releases), open it,
-and complete the macOS installer. Then verify the version and start its
-per-user services:
+Install Apple's signed package, then verify and start its services:
 
 ```bash
-container --version  # must be 1.2.0 or newer
+container --version
 container system start
 container system status
 ```
 
-If an older `container` installation is already running, stop it before using
-Apple's installed updater:
+You normally do not need to run `container system start` yourself. Every Claude,
+Codex, or Grok launch checks the service, starts it once when it is stopped, and
+verifies that it became ready before touching images or singleton containers.
 
-```bash
-container system stop
-/usr/local/bin/update-container.sh
-container system start
-```
-
-This project never installs, starts, stops, upgrades, or reconfigures Apple's
-service for you.
+`agent-container` does not install, upgrade, or reconfigure Apple's service.
 
 ## Install agent-container
 
-### One-command full install
-
-Once the release assets and `release-manifest.sha256` are published on `main`,
-install or atomically upgrade all three profiles with:
+Install or atomically upgrade all three profiles:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/loadchange/agent-container/main/install.sh | bash
 ```
 
-If macOS cannot reach GitHub directly, run `proxy_on` in that same shell before
-the command. The separate proxy settings needed by the image builder are shown
-in [Host proxy plus container proxy demo](#host-proxy-plus-container-proxy-demo).
-
-The installer validates every asset, publishes a content-addressed release
-under `~/.local/share/agent-container/releases/`, atomically switches `current`,
-and installs commands in `~/.local/bin`. A failed upgrade rolls the complete
-installation back.
-
-Ensure that directory is on `PATH` in the current shell and add the same line
-to `~/.zshrc` for later terminals:
+Add the installed command directory to the current shell and `~/.zshrc`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 agent-container profiles
 ```
 
-### Install from a source checkout
-
-From this source checkout, after generating/verifying the committed release
-manifest:
-
-```bash
-AGENT_CONTAINER_INSTALL_BASE_URL="file://$PWD" ./install.sh
-```
-
-The same selector arguments described below work from a checkout, for example:
-
-```bash
-AGENT_CONTAINER_INSTALL_BASE_URL="file://$PWD" \
-  ./install.sh --profile grok
-```
-
-### Select which profiles to install
-
-Use `--profile` once for a single Agent or repeat it for a chosen set. No
-selector means all profiles; `--all` expresses that default explicitly.
-`--profile=grok` is equivalent to `--profile grok`, and `--all` cannot be
-combined with `--profile`:
+Select a smaller managed profile set with repeatable `--profile` options:
 
 ```bash
 installer_url='https://raw.githubusercontent.com/loadchange/agent-container/main/install.sh'
 
-# Grok only
 curl -fsSL "$installer_url" | bash -s -- --profile grok
-
-# Claude Code only
-curl -fsSL "$installer_url" | bash -s -- --profile claude
-
-# Codex only
-curl -fsSL "$installer_url" | bash -s -- --profile codex
-
-# Claude Code plus Codex
-curl -fsSL "$installer_url" | \
-  bash -s -- --profile claude --profile codex
-
-# All three, explicitly
+curl -fsSL "$installer_url" | bash -s -- --profile claude --profile codex
 curl -fsSL "$installer_url" | bash -s -- --all
 ```
 
-Every selection includes the shared `agent-container`, `Containerfile`, and
-entrypoint. Only the selected compatibility commands and profile definitions
-are published into the current release. The selection is the desired managed
-set: rerunning the installer with another selection removes unselected command
-links only when the installer can prove that this project owns them. It never
-removes an unknown or user-owned command.
-
-Confirm the profiles present in the current managed release with:
+From a complete source checkout, the installer automatically uses the manifest
+and release assets beside `install.sh`:
 
 ```bash
-agent-container profiles
+./install.sh --all
 ```
 
-The project installer does **not** install Claude, Codex, or Grok directly on
-macOS, and selecting a profile does not pull or build its image. Each official
-native Linux CLI is downloaded into its own image only when that profile is
-first invoked.
+`--base-url` remains available for an internal mirror or an explicit alternate
+checkout. It replaces the removed installer environment variable.
 
-### Optionally prebuild the selected images
-
-A version probe is the shortest way to build an installed profile without
-entering its interactive UI. Run the command matching your selection:
+The installer validates the complete release, publishes it below
+`~/.local/share/agent-container/releases/`, and atomically switches `current`.
+Re-running it with a different selection removes only commands and profile
+assets whose ownership it can prove. If a deselected profile still has a
+managed singleton, stop that profile before changing the selection:
 
 ```bash
-# Claude Code only
-claude-container --version
-
-# Codex only
-codex-container --version
-
-# Grok only (experimental opt-in is currently required)
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --version
+agent-container singleton stop grok
 ```
-
-To prebuild all three current native CLIs:
-
-```bash
-claude-container --version
-codex-container --version
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --version
-```
-
-Profiles that are never invoked do not get an Agent image or persistent Agent
-HOME. Changing the installed profile selection does not itself delete an
-existing profile image, credentials, or persistent HOME.
 
 ## Built-in profiles
 
-| Profile | Compatibility command | Official native installer | Channel | Status |
+| Profile | Command | Official native installer | Publisher channel | Status |
 |---|---|---|---|---|
-| `claude` | `claude-container` | `https://claude.ai/install.sh` (`bash`) | Claude `latest` | preview |
-| `codex` | `codex-container` | `https://chatgpt.com/codex/install.sh` (`sh`) | Codex `latest` | preview |
-| `grok` | `grok-container` | `https://x.ai/cli/install.sh` (`bash`) | Grok `stable` | experimental |
+| `claude` | `claude-container` | `https://claude.ai/install.sh` | Claude `latest` | preview |
+| `codex` | `codex-container` | `https://chatgpt.com/codex/install.sh` | Codex `latest` | preview |
+| `grok` | `grok-container` | `https://x.ai/cli/install.sh` | Grok `stable` | preview |
 
-All three profiles follow their publisher's current native release channel.
-On every launch, the host resolves that channel to one exact version and puts
-the exact value into the image recipe fingerprint. An unchanged channel reuses
-the warm image; a channel update rebuilds only that profile. No profile installs
-an npm package, and the Debian guest does not contain Node.js or npm.
+All three profiles are enabled normally; Grok needs no special opt-in. The host
+resolves a floating publisher channel to one exact version before deciding
+whether an image is reusable. Claude and Grok install one native ELF; Codex
+retains its complete standalone tree because its executable depends on adjacent
+helpers and resources. Node.js and npm are not installed in the normal Agent
+image.
 
-The Grok profile remains experimental while Agent-specific login and
-interactive flows are qualified, and it must be enabled explicitly:
+The first invocation may build the image and create the profile singleton. A
+version probe is a convenient prebuild:
 
 ```bash
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --version
+claude-container --version
+codex-container --version
+grok-container --version
 ```
 
-`preview` profiles are enabled by default but have not yet completed the full
-real-Agent qualification matrix. `stable` is reserved for profiles verified on
-Apple container through build, login, TTY/pipes, workspace writes, signals,
-state persistence, and a warm second run.
+The container remains available after the command exits. The Agent process does
+not.
 
-See [docs/profiles.md](docs/profiles.md) for the strict JSON profile contract
-and how to add another native Linux arm64 Agent CLI.
+## Login and normal use
 
-## First run and authentication
-
-The first run builds a local OCI image from a digest-pinned Debian Bookworm slim
-arm64 base. Before the build, the host resolves the profile's official channel
-to an exact version; only that exact version reaches the installer and image
-recipe. Later runs inspect the image identity and reuse it when the resolved
-version is unchanged. On a clone-capable backing filesystem such as APFS,
-Apple's unpacked-root copy path can use copy-on-write cloning.
-
-The build downloads and runs the profile's official installer with a private
-build-only `HOME=/opt/agent-native`. It then requires the installed command to
-be a Linux arm64 ELF and requires its version probe to report the resolved exact
-version. Claude and Grok are reduced to their single native ELF in
-`/usr/local/bin`; Codex keeps its complete standalone release tree because its
-binary depends on adjacent helpers and resources. None of this build state can
-read the runtime profile HOME or workspace because those mounts do not exist
-during image construction.
-
-Each launch creates a stopped auto-remove container first, verifies its frozen
-OCI digest and project provenance, and only then attaches `container start`.
-The session Agent command therefore cannot execute with the workspace,
-profile HOME, or opted-in host capabilities mounted until this verification
-succeeds. Image construction is a separate trusted supply-chain phase: the
-publisher's install script and downloaded release artifacts execute in Apple's
-isolated builder, without those session mounts.
-
-Authenticate each profile inside its isolated guest HOME:
+Authentication is stored in the selected profile's isolated HOME:
 
 ```bash
-# Claude currently has no --device-auth flag. Follow the URL/login prompt.
 claude-container auth login
-
-# Device flows are suitable for a headless Micro-VM.
 codex-container login --device-auth
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
-  grok-container login --device-auth
+grok-container login --device-auth
 ```
 
-Then start an interactive session from the repository you want mounted:
+Then enter any repository:
 
 ```bash
-cd /path/to/your/repository
+cd /path/to/repository
 claude-container
-codex-container
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container
 ```
 
-Arguments after a compatibility command are passed to the native Agent
-unchanged. Use `claude-container --help`, `codex-container --help`, or
-`AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --help` for
-Agent-specific options.
-
-## Explicit run mode: host commands and additional shares
-
-The legacy forms above retain their narrow boundary and exact Agent-argument
-pass-through. Select `run` explicitly when a task needs a host runtime such as
-Node.js or Python, or needs another host directory. The generic and
-profile-specific forms are equivalent. `run` itself requires a working Node.js
-executable on the host to start its per-session broker; legacy launches do not.
-That bootstrap Node runs before the broker sandbox exists, so the launcher
-rejects a Node command or resolved executable inside the workspace, private
-Agent state, an external writable Git directory, or any read-write extra share.
+Arguments are passed to the native Agent without shell reconstruction. Launcher
+options are recognized only at the beginning of the command. The first normal
+Agent argument ends launcher parsing, and a leading `--` explicitly ends it:
 
 ```bash
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
-  grok-container run \
-    --share-ro /path/to/reference-repository \
-    --share-rw /path/to/generated-output \
-    -- --agent-option
-
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
-  agent-container run grok \
-    --share-ro /path/to/reference-repository \
-    -- --agent-option
+codex-container --container-cpus 6 --container-memory 8g -- --agent-option
+agent-container --container-cpus 6 codex --agent-option
 ```
 
-Runtime options must precede the `--`; everything after it is passed to the
-native Agent unchanged. `--share-ro` and `--share-rw` may be repeated. Each
-source must be an existing directory and appears in the guest at the same
-canonical absolute path. Shares may not overlap the workspace, external Git
-directory, runtime assets, private Agent state, the real host HOME as a whole,
-or one another. They also count toward the ordinary VirtioFS file budget.
+Use `--` when an Agent itself ever defines an option beginning with
+`--container-`.
 
-The access mode has two effects. It controls the guest VirtioFS mount, and it
-sets the maximum access that a brokered host command receives through its macOS
-sandbox. A read-only share is still readable and can still be exfiltrated; a
-read-write share allows both guest and brokered host processes to change or
-delete its contents.
+## Multi-project singleton lifecycle
 
-At the beginning of a `run` session, the launcher takes a fixed snapshot of
-eligible executable basenames on the host `PATH`. Most are installed as
-fallback shims after the guest's normal command directories: a Linux guest
-command wins when present, and the sandboxed host command runs only when the
-guest has no command with that name. This makes host Node.js and Python usable
-without trying to execute their macOS binaries in Linux. `git` is deliberately
-host-first so that repository operations match the physical-machine workflow.
-Executable symlinks are canonicalized; a basename whose target falls outside
-its admitted tool runtime is skipped rather than invalidating the whole session.
-The policy can be narrowed or adjusted per command:
-
-```bash
-# Keep guest git and do not expose the host git command.
-codex-container run --no-host-exec git --
-
-# Prefer a particular host command even when the guest has the same basename.
-codex-container run --host-first python3 --
-```
-
-`--no-host-exec COMMAND` may be repeated and takes the named host command out of
-both the host-first and fallback sets. Use the legacy form, without `run`, when
-no host-command broker should exist at all. The selected Agent command,
-compatibility wrappers, `container`, and `sudo` remain excluded independently
-of these options. This flag controls only direct shim routing; it is not a
-security boundary. An allowed shell, Node.js/Python program, Git hook, or
-credential helper can still start child executables. The generated macOS
-filesystem sandbox—not the shim list—confines the resulting process tree to the
-admitted read/write roots.
-
-That filesystem boundary currently uses Apple's deprecated `sandbox-exec`
-interface. `run` fails closed if `/usr/bin/sandbox-exec` is unavailable, and
-compatibility must be revalidated for future macOS releases because Apple may
-change or remove it.
-
-Ordinary host commands receive a separate persistent HOME under
-`~/.agent-container/profiles/<id>/host-home`, not the real macOS HOME. Host Git
-is the exception: it can read the selected real host `.gitconfig`,
-`.config/git`, and the named `.ssh/config`, `.ssh/known_hosts`,
-`.ssh/known_hosts.old`, and `.ssh/allowed_signers` metadata paths. Those SSH
-paths are admitted read-only.
-A symlink at one of those names does not widen access: its target must
-independently fall within a sandbox-authorized root or access fails. `run` also
-makes a live `SSH_AUTH_SOCK` available to the broker when one exists. It never
-admits or copies SSH private-key files, but the socket can authorize network
-authentication or signatures. Values stored directly in the admitted Git
-configuration are readable by host Git and may be returned to the guest; Git
-configuration can also invoke credential helpers. Whether a macOS credential
-helper can reach Keychain through the
-broker sandbox is platform-dependent and must not be assumed either available
-or blocked. Use `--no-host-exec git` when that direct route is not intended,
-while remembering that another allowed host process could still start Git
-inside the same filesystem sandbox.
-
-The host-exec path is non-PTY even when the outer Agent session has a TTY. It
-supports piped stdin and streams stdout and stderr, but interactive host tools
-that require terminal ioctls, raw mode, or a controlling terminal are not
-supported. Run those as guest-native tools instead.
-
-Every `run` invocation starts a fresh authenticated broker and generates a
-one-session token. The broker accepts only the frozen command and filesystem
-manifests for that session and starts each request in its own process group.
-Disconnecting a request, exiting the launcher, or stopping the VM terminates the
-host request process group, including ordinary background children that remain
-in it; host services do not intentionally outlive the Agent session. A program
-that deliberately creates a new session with `setsid` can escape PGID-based
-cleanup and is unsupported—do not use host-exec as a durable daemon manager.
-The token, endpoint metadata, and manifests are removed with the session staging
-directory.
-
-`run` is therefore an explicit, materially broader mode than the legacy
-launcher. The macOS sandbox, command allowlist, per-session authentication, and
-path modes reduce its scope, but invoking an interpreter on host-controlled
-files still executes native code as the macOS user. Review every shared path and
-keep the Agent's own approval controls enabled.
-
-## Authentication persistence and API keys
-
-The Codex/Grok device flows avoid relying on an automatic browser callback from
-the Micro-VM. Claude currently exposes no device-auth flag; follow its prompts
-and open any displayed URL in the host browser. Agent-specific login flows
-remain part of the preview or experimental qualification matrix rather than a
-current compatibility guarantee. Each isolated shadow HOME is persistent, so
-credentials and session state written there survive VM and image replacement.
-Host `~/.claude`, `~/.codex`, `~/.grok`, and other real Agent directories are
-never imported or mounted automatically.
-
-Except for the narrow Claude custom-provider pair described below, credentials
-are denied by default. A profile may forward only its recognized credential
-names after explicit authorization:
-
-```bash
-export OPENAI_API_KEY='...'
-AGENT_CONTAINER_FORWARD_API_KEY=true codex-container
-```
-
-Running Codex this way does not forward `ANTHROPIC_API_KEY`, `XAI_API_KEY`, or
-arbitrary host environment variables. Claude accepts either
-`ANTHROPIC_API_KEY` or the `ANTHROPIC_AUTH_TOKEN` used by many
-Anthropic-compatible providers. A non-empty `ANTHROPIC_BASE_URL` and an
-exported `ANTHROPIC_AUTH_TOKEN` are treated as one intentional custom-provider
-configuration and inherited together; a token without that endpoint still
-requires the explicit opt-in above. Prefer interactive/device login when
-possible so a long-lived host secret need not enter the VM.
-
-## Claude Code environment inheritance
-
-The Claude profile automatically inherits a reviewed exact list of
-non-credential settings when they are exported in the launching shell. Unset
-names are skipped and an exported empty value remains empty in the guest. The
-launcher passes `--env NAME`, never `--env NAME=value`, so values do not enter
-the Apple CLI argument vector.
-
-The built-in list is:
+The stable native identity is:
 
 ```text
-_ANTHROPIC_API_PROVIDER
-ANTHROPIC_BASE_URL
-ANTHROPIC_MODEL
-ANTHROPIC_SMALL_FAST_MODEL
-ANTHROPIC_DEFAULT_HAIKU_MODEL
-ANTHROPIC_DEFAULT_SONNET_MODEL
-ANTHROPIC_DEFAULT_OPUS_MODEL
-ANTHROPIC_DEFAULT_FABLE_MODEL
-ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
-ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
-ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
-ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
-CLAUDE_CODE_EFFORT_LEVEL
-CLAUDE_CODE_ENABLE_TELEMETRY
-CLAUDE_CODE_ENHANCED_TELEMETRY_BETA
-CLAUDE_CODE_ENABLE_TOKEN_USAGE_ATTACHMENT
-CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS
-CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES
-CLAUDE_CODE_PROFILE_STARTUP
-CLAUDE_CODE_PROFILE_QUERY
-CLAUDE_CODE_PROPAGATE_TRACEPARENT
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
-CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK
-CLAUDE_CODE_DISABLE_SESSION_DATA_UPLOAD
-DISABLE_TELEMETRY
-CLAUDE_CODE_DISABLE_POLICY_SKILLS
-DISABLE_ERROR_REPORTING
-API_TIMEOUT_MS
-CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
-CLAUDE_CODE_COORDINATOR_MODE
-CLAUDE_CODE_NO_FLICKER
-CLAUDE_CODE_FORCE_FULL_LOGO
+agent-<profile>-<host-uid>-singleton
 ```
 
-For example, an Anthropic-compatible provider can be selected without putting
-its token in a repository or command argument:
+One user can therefore have up to one managed Claude VM, one Codex VM, and one
+Grok VM at the same time. Multiple terminals may attach to each one. Inspect or
+stop them independently:
 
 ```bash
-export _ANTHROPIC_API_PROVIDER='Compatible provider'
-export ANTHROPIC_BASE_URL='https://provider.example/anthropic/'
-export ANTHROPIC_AUTH_TOKEN='...'
-export ANTHROPIC_MODEL='provider-model'
-export ANTHROPIC_SMALL_FAST_MODEL='provider-model'
-export CLAUDE_CODE_EFFORT_LEVEL=max
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+agent-container singleton status claude
+agent-container singleton status codex
+agent-container singleton status grok
 
-claude-container
+agent-container singleton stop claude
+agent-container singleton stop codex
+agent-container singleton stop grok
 ```
 
-No additional forwarding switch is required for the
-`ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` pair. `ANTHROPIC_API_KEY`, or an
-`ANTHROPIC_AUTH_TOKEN` used without a custom base URL, continues to require
-`AGENT_CONTAINER_FORWARD_API_KEY=true`. When the switch is unset, its default
-mode is `auto`; set it to `false` to suppress even the custom-provider token
-inheritance. An explicitly exported empty value also means `false`, preserving
-the behavior of older launcher versions. In `true` mode, the launcher fails
-before contacting the Apple runtime if no credential name recognized for the
-active profile is exported.
+`stop` deletes the verified container but preserves the profile image and
+profile HOME. The next invocation recreates the singleton. A stopped or
+malformed native resource is never adopted only because its name matches; full
+labels, image digest, state, and managed records must agree.
 
-`DISABLE_AUTOUPDATER` is always set to `1` by the Claude profile; a host value
-cannot override that image-management policy. Internal variables such as
-`USER_TYPE` are not inherited automatically. The full-logo setting is
-`CLAUDE_CODE_FORCE_FULL_LOGO`.
+VM, image, network, CA, and static capability choices are fingerprinted. If a
+running singleton differs from newly requested settings or a publisher channel
+has moved, stop that profile and launch it again. The launcher fails closed
+instead of silently attaching to a differently configured VM.
 
-The launcher deliberately does not inherit the complete `ANTHROPIC_*` or
-`CLAUDE_CODE_*` prefixes because they also contain credentials, host file
-descriptors, host paths, and process-internal state. If Claude adds a setting
-before this list is updated, authorize its exact exported name explicitly:
+### Linked worktrees
+
+The dynamic default transports one Git root. A linked worktree whose Git common
+directory is outside that root currently needs the advanced `run` path, which
+can mount both paths with Apple volumes. Stop the profile singleton first:
 
 ```bash
-export CLAUDE_CODE_FUTURE_SETTING=1
-export AGENT_CONTAINER_FORWARD_ENV=CLAUDE_CODE_FUTURE_SETTING
-claude-container
+agent-container singleton stop codex
+codex-container run --
 ```
 
-Use a comma-separated list for multiple names. An explicitly requested name
-must be exported; malformed, unset, loader-related, or launcher-managed names
-fail before Apple runtime access. Exact-name forwarding can expose any secret
-stored in a requested variable, so outside the documented Claude
-custom-provider pair use the profile credential opt-in for known authentication
-variables.
+Ordinary repositories, nested directories, and switching between unrelated Git
+roots need no special configuration.
 
-## Workspace, Git, SSH, and GitHub CLI
+## Workspace transport and semantics
 
-When invoked within Git, the repository top-level directory is mounted at the
-same absolute path and the original current directory is retained. Linked
-worktrees, submodules, and external Git common directories are handled as
-separate mounts. Apple has no bind-mount UID mapping yet
-([issue #165](https://github.com/apple/container/issues/165)), so the entrypoint
-drops from root to the host numeric UID/GID without recursively changing any
-host mount.
+The default workspace channel is not SSH login. The Rust broker generates a
+random 256-bit token, binds one ephemeral TCP port, accepts one connection, and
+requires a bounded authentication line within five seconds. It then runs
+`/usr/libexec/sftp-server` inside a default-deny macOS `sandbox-exec` profile
+whose writable filesystem scope is the canonical project root. The broker does
+not start a shell, accept commands, expose HOME, or provide a reusable daemon.
 
-For legacy sessions and guest Git, the default Git configuration is a temporary
-file containing only `user.name` and `user.email`. Credential helpers, HTTP
-headers, URL rewrites, and includes do not enter the VM. The host-first Git
-behavior of explicit `run` mode is a separate, broader capability described
-above. The legacy guest capabilities require separate opt-ins:
+The guest's SSHFS transport sends the authentication frame and then forwards an
+unmodified SFTP byte stream. The token is not placed in an argv vector and is
+cleared before the Agent starts. The SFTP mount is created only in that exec's
+private mount namespace. Each Agent tree also receives an independent process
+group and root-owned cgroup v2 leaf. Exit, signal, or broker loss removes the
+whole tree—including detached background descendants—before SSHFS is stopped
+and the private mount is removed.
 
-```bash
-# May expose Git credentials, extra headers, URL rewrites, and includes.
-AGENT_CONTAINER_FULL_GIT_CONFIG=true codex-container
+The host runtime is also the broker's explicit owner. It alone retains the
+write end of a private liveness pipe; the broker owns a close-on-exec reader,
+and the Apple `container exec` child does not inherit the writer. Normal exit,
+a handled signal, or `SIGKILL` of that launcher therefore produces EOF. The
+broker fails closed, stops accepting, and shuts down an active TCP stream. The
+guest observes transport loss and runs the same SSHFS/cgroup cleanup. This
+revokes only that client workspace: the profile singleton and concurrent
+clients remain running.
 
-# Exposes the host gh configuration, including readable tokens, read-only.
-AGENT_CONTAINER_MOUNT_GH=true codex-container
+Files created by the Agent use the host numeric UID/GID. The mount is
+read-write: the Agent can read, modify, rename, or delete anything in the
+selected project. SSHFS caching is intentionally short, but remote/FUSE
+semantics are not identical to a native APFS directory. File-watch tools should
+be tested and may need polling or a restart after host-side edits.
 
-# Forwards only the live SSH-agent socket; host ~/.ssh key files are not mounted.
-AGENT_CONTAINER_FORWARD_SSH_AGENT=true codex-container
+## Configuration: `--container-*`
 
-# Copies config/known_hosts metadata to an ephemeral read-only mount.
-AGENT_CONTAINER_MOUNT_SSH_CONFIG=true codex-container
-```
+Normal use requires no configuration. Public launcher settings are command-line
+options handled by the Rust launcher; users should not export internal runtime
+variables, and legacy public runtime-variable names are rejected. Value options
+accept either `--name VALUE` or `--name=VALUE`.
+Boolean options use `--container-<name>` and `--no-container-<name>`.
 
-Read-only credentials can still be read and exfiltrated. Review
-[docs/security.md](docs/security.md) before enabling them.
+### Runtime, build, and network values
 
-## Permissions and network boundary
-
-The runtime does not inject `--dangerously-skip-permissions`, Codex full-auto,
-or any equivalent bypass. Agent-level approval and sandbox controls stay on by
-default.
-
-Apple's public CLI currently gives the VM normal outbound networking and has no
-hostname allowlist comparable to the experimental `sandboxy` example. This
-project therefore cannot promise protection from exfiltration once a secret or
-sensitive workspace is mounted. Isolation reduces ambient host access and
-contains guest processes; it does not make untrusted instructions harmless.
-
-## Configuration
-
-All launcher settings use the shared `AGENT_CONTAINER_` namespace. An override
-can prefix one command or be exported for later commands:
-
-```bash
-AGENT_CONTAINER_CPUS=6 AGENT_CONTAINER_MEMORY=8g codex-container
-
-export AGENT_CONTAINER_VERSION=0.146.0
-codex-container --version
-unset AGENT_CONTAINER_VERSION
-```
-
-### Runtime, image, and network overrides
-
-| Variable | Default | Purpose |
+| Option | Default | Purpose |
 |---|---|---|
-| `AGENT_CONTAINER_CPUS` | `4` | CPUs for each Agent session VM |
-| `AGENT_CONTAINER_MEMORY` | `4g` | Memory for each Agent session VM |
-| `AGENT_CONTAINER_BUILD_CPUS` | `4` | CPUs used when Apple creates the shared image builder |
-| `AGENT_CONTAINER_BUILD_MEMORY` | `4g` | Memory used when Apple creates the shared image builder |
-| `AGENT_CONTAINER_VERSION` | profile `latest` policy | Use `latest` or one exact native release such as `0.146.0` |
-| `AGENT_CONTAINER_BASE_IMAGE` | pinned Debian Bookworm slim arm64 digest | Use another safe OCI base/mirror reference; included in the image fingerprint |
-| `AGENT_CONTAINER_REBUILD` | `false` | Force a `--no-cache --pull` rebuild of the selected profile |
-| `AGENT_CONTAINER_SKIP_BUILD` | `false` | Never build; fail if the selected profile image is absent or stale |
-| `AGENT_CONTAINER_ENABLE_EXPERIMENTAL` | `false` | Permit experimental profiles such as Grok |
-| `AGENT_CONTAINER_HTTP_PROXY` | unset | Forward `HTTP_PROXY`/`http_proxy` to the builder and Agent VM |
-| `AGENT_CONTAINER_HTTPS_PROXY` | unset | Forward `HTTPS_PROXY`/`https_proxy` to the builder and Agent VM |
-| `AGENT_CONTAINER_ALL_PROXY` | unset | Forward `ALL_PROXY`/`all_proxy` to the builder and Agent VM |
-| `AGENT_CONTAINER_NO_PROXY` | `localhost,127.0.0.1` | Proxy bypass list, forwarded when any Agent proxy is set |
-| `AGENT_CONTAINER_DNS1` | unset | Primary DNS passed to builds and session VMs |
-| `AGENT_CONTAINER_DNS2` | unset | Secondary DNS passed to builds and session VMs |
-| `AGENT_CONTAINER_TZ` | unset | Set the session VM `TZ`, for example `Asia/Singapore` |
+| `--container-cpus VALUE` | `4` | CPUs assigned to the profile singleton |
+| `--container-memory VALUE` | `4g` | Memory assigned to the profile singleton |
+| `--container-build-cpus VALUE` | `4` | CPUs for Apple's shared image builder when created |
+| `--container-build-memory VALUE` | `4g` | Memory for Apple's shared image builder when created |
+| `--container-version VALUE` | profile channel | `latest` or one exact native version |
+| `--container-base-image VALUE` | pinned Debian Bookworm slim digest | Alternate safe OCI base or mirror reference |
+| `--container-http-proxy VALUE` | unset | Builder and guest HTTP proxy |
+| `--container-https-proxy VALUE` | unset | Host HTTPS channel, builder, and guest HTTPS proxy |
+| `--container-all-proxy VALUE` | unset | Host channel fallback, builder, and guest all-protocol proxy |
+| `--container-no-proxy VALUE` | `localhost,127.0.0.1` | Host channel, builder, and guest proxy bypass list |
+| `--container-extra-ca VALUE` | `auto` | macOS-verified-chain bridge or an absolute reviewed PEM bundle |
+| `--container-dns1 VALUE` | unset | Primary build/guest DNS server |
+| `--container-dns2 VALUE` | unset | Secondary build/guest DNS server |
+| `--container-timezone VALUE` | unset | Guest `TZ`, such as `Asia/Singapore` |
+| `--container-forward-env VALUE` | unset | Comma-separated exact exported names for provider, model, token, or Agent settings |
+| `--container-host-alias VALUE` | unset | Comma-separated guest DNS names mapped to the Apple host gateway while preserving URL/SNI |
+| `--container-block-host VALUE` | unset | Comma-separated guest DNS names mapped to IPv4 and IPv6 blackholes |
+| `--container-max-files VALUE` | `40000` | Safety budget for remaining VirtioFS-backed trees and legacy `run` shares |
+| `--container-fd-stop-percent VALUE` | `80` | Legacy `run` file/vnode watchdog threshold, from 50 through 95 |
 
-The default base image reference is already complete and safe. If an older
-shell has a malformed override such as a wrapped value or a missing `/`, clear
-it instead of copying the default by hand:
+### Boolean capabilities and controls
 
-```bash
-unset AGENT_CONTAINER_BASE_IMAGE
-```
-
-Apple reuses its already-running shared `buildkit` helper. Build CPU, memory,
-and DNS flags apply when that helper is created; they do not reconfigure an
-existing helper. Session VM resource and DNS flags apply to each new session.
-
-### Host proxy plus container proxy demo
-
-There are two separate network hops on a cold `latest` launch:
-
-1. The macOS launcher queries the publisher's current version with host
-   `curl`. It follows ordinary host `http_proxy`, `https_proxy`, and
-   `ALL_PROXY` variables; `proxy_on` must be active in the same shell.
-2. Apple's builder downloads Debian packages, the official installer, and the
-   native CLI. The running Agent also needs network access. These two guests
-   use the `AGENT_CONTAINER_*_PROXY` values.
-
-For a local HTTP proxy listening on macOS loopback port `1087`, a complete
-example is:
-
-```bash
-# 1. Host-side install and latest-channel requests.
-proxy_on
-
-# 2. Make the host loopback proxy reachable from Apple container VMs.
-#    This Apple system change needs sudo and may need to be recreated after a
-#    restart. Choose a non-conflicting address if this one conflicts locally.
-container system dns list
-# If host.container.internal is not already listed, create it once:
-sudo container system dns create \
-  host.container.internal --localhost 203.0.113.113
-
-# 3. Builder and running-Agent proxy settings.
-export AGENT_CONTAINER_HTTP_PROXY='http://host.container.internal:1087'
-export AGENT_CONTAINER_HTTPS_PROXY='http://host.container.internal:1087'
-export AGENT_CONTAINER_NO_PROXY='localhost,127.0.0.1'
-
-# Build/reuse Grok and run its native version probe.
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true grok-container --version
-```
-
-If the proxy already listens on an address directly reachable by the VM, use
-that address and skip the DNS/PF bridge. Apple's documented
-[`--localhost` bridge](https://github.com/apple/container/blob/main/docs/how-to.md#access-a-host-service-from-a-container)
-disables Private Relay while present, and its packet-filter redirect is lost
-after a restart. The launcher never creates this administrator-controlled
-system change automatically. `host.docker.internal` is Docker-specific, has
-no Apple container meaning, and is rejected.
-
-Setting only `AGENT_CONTAINER_HTTP_PROXY` or
-`AGENT_CONTAINER_HTTPS_PROXY` cannot bootstrap the host-side latest-channel
-query. Conversely, `proxy_on` alone does not automatically forward its
-`127.0.0.1` endpoint into a VM.
-
-### Capability and safety overrides
-
-| Variable | Default | Purpose |
+| Option | Default | Purpose |
 |---|---|---|
-| `AGENT_CONTAINER_FORWARD_API_KEY` | `auto` | `auto` inherits Claude's custom-provider token pair, `true` forwards all credential names recognized for the active profile, and `false` (or an explicitly empty value) disables the profile credential path |
-| `AGENT_CONTAINER_FORWARD_ENV` | unset | Comma-separated exact names of additional exported variables to forward; unsafe launcher/loader names are rejected |
-| `AGENT_CONTAINER_FULL_GIT_CONFIG` | `false` | Expose the full host Git config instead of only `user.name`/`user.email` |
-| `AGENT_CONTAINER_MOUNT_GH` | `false` | Mount host GitHub CLI configuration read-only |
-| `AGENT_CONTAINER_FORWARD_SSH_AGENT` | `false` | Forward the live SSH-agent socket; never mounts private-key files |
-| `AGENT_CONTAINER_MOUNT_SSH_CONFIG` | `false` | Copy selected SSH metadata into an ephemeral read-only mount |
-| `AGENT_CONTAINER_MAX_FILES` | `40000` | Maximum projected entries across all VirtioFS shares |
-| `AGENT_CONTAINER_FD_STOP_PERCENT` | `80` | Live file/vnode watchdog stop threshold; valid range is 50–95 |
-| `AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK` | `false` | Continue past selected VirtioFS risk checks after explicit acceptance |
-| `AGENT_CONTAINER_ALLOW_CONCURRENT` | `false` | Allow distinct profiles to overlap; also requires risk acceptance |
-| `AGENT_CONTAINER_DISABLE_FD_WATCHDOG` | `false` | Disable the live file/vnode watchdog; intended only for controlled tests |
+| `--container-enable-experimental` | off | Permit an installed custom profile whose schema status is experimental; no current built-in profile needs it |
+| `--container-rebuild` | off | Force a no-cache, pull-refresh image rebuild |
+| `--container-skip-build` | off | Refuse to build; require a matching warm image |
+| `--container-full-git-config` | off | Expose the full selected host Git configuration instead of only identity |
+| `--container-mount-gh` | off | Mount host GitHub CLI configuration read-only |
+| `--container-forward-api-key` | off | Forward only the active profile's exported `apiKeyEnv` |
+| `--container-forward-ssh-agent` | off | Forward the live SSH-agent socket; never mounts private keys |
+| `--container-mount-ssh-config` | off | Copy selected SSH metadata into a read-only staged mount |
+| `--container-accept-virtiofs-risk` | off | Continue past selected Apple VirtioFS risk checks |
+| `--container-allow-concurrent` | off | Permit overlapping legacy `run` VMs; also requires risk acceptance |
+| `--container-disable-fd-watchdog` | off | Disable the legacy `run` live file/vnode watchdog for controlled testing |
 
-Capability flags can expose credentials or weaken host-risk controls. Review
-[docs/security.md](docs/security.md) before enabling them. For example:
+Every boolean has a negative form, for example
+`--no-container-full-git-config`. Repeated settings use the last value.
+Unknown leading `--container-*` names fail as likely typos.
+
+### Development and diagnostic values
+
+These options exist for source development, mirrors, and deterministic tests;
+ordinary users should not need them:
+
+| Option | Purpose |
+|---|---|
+| `--container-assets PATH` | Select another complete runtime asset directory |
+| `--container-bin PATH` | Select another Apple `container` executable |
+| `--container-host-broker PATH` | Select the advanced `run` host-command broker |
+| `--container-host-node PATH` | Select the host Node.js executable used by advanced `run` |
+| `--container-host-gateway IPv4` | Override the inspected Apple network gateway |
+| `--container-openssl PATH` | Select the host OpenSSL executable used for CA validation |
+| `--container-security PATH` | Select the macOS Security executable used by `--container-extra-ca auto` |
+
+## Environment and credential forwarding
+
+The launcher does not copy the complete host environment, and it does not
+automatically inherit Claude, Anthropic, provider, model, token, or Agent
+settings. Login state in the profile HOME remains the default authentication
+path.
+
+`--container-forward-api-key` is off by default. Enabling it expands exactly
+the active profile's declared
+`apiKeyEnv`: `ANTHROPIC_API_KEY` for Claude, `OPENAI_API_KEY` for Codex, or
+`XAI_API_KEY` for Grok. It does not discover alternative token names or
+provider bundles.
 
 ```bash
 export XAI_API_KEY='...'
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
-AGENT_CONTAINER_FORWARD_API_KEY=true \
-  grok-container
+grok-container --container-forward-api-key
 ```
 
-### Installation and development overrides
+Every provider endpoint, model selection, alternative token, and Agent setting
+must instead be exported and named explicitly with `--container-forward-env`.
+For example, an Anthropic-compatible GLM endpoint can be selected with:
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `AGENT_CONTAINER_INSTALL_BASE_URL` | published raw `main` URL | Change where `install.sh` downloads its manifest and immutable asset set |
-| `AGENT_CONTAINER_ASSET_DIR` | installed/current release | Use another complete launcher asset directory, mainly for source development |
-| `AGENT_CONTAINER_BIN` | `container` | Use another Apple `container` executable, mainly for source builds/tests |
+```bash
+export ANTHROPIC_BASE_URL='https://open.bigmodel.cn/api/anthropic'
+export ANTHROPIC_AUTH_TOKEN='replace-with-provider-token'
+export ANTHROPIC_MODEL='glm-5.2'
+export ANTHROPIC_SMALL_FAST_MODEL='glm-5.2'
 
-Arbitrary `AGENT_CONTAINER_IMAGE` values and a custom
-`AGENT_CONTAINER_STATE_DIR` are intentionally unsupported: image references
-must remain profile-scoped for provenance, and state must remain globally
-discoverable under `~/.agent-container` for safe cleanup.
+claude-container \
+  --container-forward-env \
+  ANTHROPIC_BASE_URL,ANTHROPIC_AUTH_TOKEN,ANTHROPIC_MODEL,ANTHROPIC_SMALL_FAST_MODEL
+```
+
+Only the exact names appear in launcher and Apple CLI argument vectors; their
+values are read from the exported environment and passed separately to the
+Agent process. In particular, do not pass secrets as `NAME=VALUE`:
+`--container-forward-env ANTHROPIC_AUTH_TOKEN=secret` is invalid. Unsafe
+loader, launcher-managed, malformed, or unset names are rejected. Forwarding a
+name still exposes its complete value to the Agent and anything it can run.
+
+## Git, SSH, and GitHub capabilities
+
+Guest Git receives a staged configuration containing only host `user.name` and
+`user.email` by default. Broader capabilities are explicit:
+
+```bash
+# May expose credentials, helpers, includes, headers, and URL rewrites.
+codex-container --container-full-git-config
+
+# Includes readable GitHub CLI tokens when present.
+codex-container --container-mount-gh
+
+# Gives signing/authentication authority to the live agent socket.
+codex-container --container-forward-ssh-agent
+
+# Copies config, known_hosts, known_hosts.old, and allowed_signers only.
+codex-container --container-mount-ssh-config
+```
+
+These are static container capabilities. If their requested state differs from
+an already-running singleton, stop that profile before relaunching. Read-only
+credentials can still be read and exfiltrated, and an SSH agent can authorize
+operations without revealing private-key bytes.
+
+## Proxy and DNS example
+
+There are separate host and guest hops on a cold `latest` launch:
+
+1. macOS resolves the publisher channel with host `curl`;
+2. Apple's builder and the running guest perform their own network requests.
+
+All launcher-managed hops use the explicit `--container-http-proxy`,
+`--container-https-proxy`, `--container-all-proxy`, and
+`--container-no-proxy` values. Exported proxy variables are not a public
+container-configuration interface and are not inherited as a substitute for
+those options.
+
+For a proxy on macOS loopback port 1087:
+
+```bash
+# One-time Apple DNS/PF bridge, if it is not already present.
+container system dns list
+sudo container system dns create \
+  host.container.internal --localhost 203.0.113.113
+
+codex-container \
+  --container-http-proxy http://host.container.internal:1087 \
+  --container-https-proxy http://host.container.internal:1087 \
+  --container-no-proxy localhost,127.0.0.1 \
+  --version
+```
+
+If the proxy listens on a VM-reachable address, use it directly. Apple's
+`--localhost` bridge disables Private Relay while present and loses its packet
+filter redirect after restart. The launcher never creates this administrator
+change. `host.docker.internal` is Docker-specific and is rejected.
+
+For the exact `host.container.internal` proxy authority, the launcher keeps the
+URL unchanged for BuildKit and the guest, while host-side latest-channel curl
+uses a scoped DNS override to the macOS loopback listener. A running singleton
+also reuses its recorded Agent version without consulting the latest channel;
+pass `--container-version latest` explicitly when an update check is intended.
+
+Proxy settings configure connectivity; they are not an egress allowlist.
+
+## TLS and enterprise CAs
+
+`--container-extra-ca` defaults to `auto`. In that mode, macOS Security verifies
+the profile's installer endpoint and, for `latest`, the version endpoint. The
+launcher carries only an eligible currently-valid `CA:TRUE` issuer from each
+verified chain to its intended consumer: the version-chain CA for the host
+channel request and the installer-chain CA for the guest trust store. It does
+not copy the complete Keychain. If Security.framework cannot reach an endpoint
+directly, curl may fetch only its peer chain through the explicitly configured
+proxy; Security.framework still performs the hostname and Keychain trust
+evaluation locally. This fallback never disables TLS verification or trusts
+the curl result by itself.
+
+Any CA override must be selected with `--container-extra-ca`; an exported CA
+path or legacy launcher environment variable is not consulted. Proxy and CA
+policy are container settings even when the underlying material or endpoint is
+read from the host.
+
+Use an audited explicit bundle when the publisher redirects through additional
+enterprise-intercepted hosts:
+
+```bash
+codex-container \
+  --container-extra-ca /absolute/path/to/enterprise-ca-bundle.pem \
+  --version
+```
+
+An explicit file must be a non-symlink regular PEM no larger than 1 MiB with
+1–64 currently-valid CA certificates. TLS hostname and chain verification are
+never disabled, and CA material is delivered to the build as a secret rather
+than a build argument.
+
+Diagnose failures by layer:
+
+- `curl: (60)` means certificate-chain verification failed. Fix the host trust
+  path or provide the reviewed CA needed for that endpoint.
+- HTTP `403` means TLS already succeeded and the origin or enterprise web
+  policy denied the request. Add the documented publisher domain to the
+  organization's allowlist. Another CA and `--insecure` cannot fix an access
+  policy denial.
+
+The extra-CA secret arrives after the OCI `FROM` pull, and the current Debian
+bootstrap occurs before that CA is installed. Registry and early apt
+interception still require Apple/system trust, a public mirror, or a
+non-intercepted route. A guest CA expands trust for all software using Debian's
+system store, not only the Agent installer.
+
+## Advanced legacy `run` mode
+
+The normal singleton path intentionally exposes only the dynamic workspace and
+selected static capabilities. `run` is a separate, broader compatibility path
+for tasks that need additional Apple volume mounts or selected native macOS
+commands:
+
+```text
+agent-container [launcher options] run <profile> [run options...] [-- agent arguments...]
+<profile>-container [launcher options] run [run options...] [-- agent arguments...]
+```
+
+Stop that profile's singleton before entering legacy mode:
+
+```bash
+agent-container singleton stop codex
+
+codex-container run \
+  --share-ro /path/to/reference \
+  --share-rw /path/to/output \
+  -- --agent-option
+```
+
+`run` creates a per-launch auto-remove VM and uses Apple VirtioFS for the
+workspace and additional shares. It also starts the older Node.js host-command
+broker. Eligible host commands are snapshotted from host `PATH`; guest commands
+win normally, while host Git is preferred. Tighten the command surface with:
+
+```bash
+codex-container run --no-host-exec git --
+codex-container run --host-first python3 --
+```
+
+The host-command broker authenticates each request and applies a generated
+macOS filesystem sandbox to the process group. It can still run native code as
+the macOS user inside admitted paths, and allowed interpreters or shells may
+start children. Its pipe transport has no PTY. This mode depends on Apple's
+deprecated `sandbox-exec` interface and is intentionally not the default.
+
+`--share-ro` and `--share-rw` may be repeated. They cannot overlap each other,
+private state, runtime assets, the workspace, or the real HOME as a whole. A
+read-only share remains readable and exfiltratable; a read-write share can be
+changed or deleted.
+
+## Security boundary
+
+The Micro-VM reduces ambient macOS access; it does not make untrusted prompts or
+repositories harmless. By default an Agent can:
+
+- read and write the selected project root;
+- read and write its profile HOME;
+- communicate with the network without a hostname allowlist;
+- affect other concurrent clients of the same profile through shared VM and
+  HOME state.
+
+It does not receive the real HOME wholesale, another profile's HOME, host SSH
+private-key files, or arbitrary host environment values. Agent permission and
+sandbox flags are passed through as the user requested; the launcher does not
+inject a permission bypass.
+
+Read [docs/security.md](docs/security.md) before enabling credential or legacy
+host-execution capabilities.
+
+## Apple filesystem risk
+
+Apple [`container#1097`](https://github.com/apple/container/issues/1097)
+reports VirtioFS file-descriptor retention and includes a kernel-panic report.
+The default singleton workspace uses SSHFS/SFTP, so changing from project A to
+project B does not add a large persistent VirtioFS workspace mount. The
+isolated profile HOME and opted-in static configuration mounts still use Apple
+volumes, and legacy `run` uses VirtioFS for its workspace and extra shares.
+
+The launcher retains file-count checks and host file/vnode preflight for those
+paths. The live watchdog belongs to the attached legacy `run` lifecycle; a
+persistent singleton has no launcher process that can monitor it after clients
+disconnect. Risk-acceptance and watchdog-disabling flags are for controlled
+tests, not routine use. See [docs/performance.md](docs/performance.md) for a
+benchmark and safety protocol.
 
 ## Persistent layout
 
 ```text
-~/.local/share/.agent-container.install.lock/  # short launch/transaction gate
 ~/.agent-container/
   .agent-container-owned
-  session.lock/                # global #1097 safety lock while active
-  sessions/session-<pid>/      # ephemeral, secret-capable staging
   profiles/<id>/
-    home/                      # isolated persistent shadow HOME
-    host-home/                 # isolated HOME for ordinary run-mode host tools
-    meta/                      # image ref, recipe hash, inspected identity
-    session.lock/              # same-profile image/session serialization
+    home/                  # persistent isolated guest HOME
+    host-home/             # HOME for advanced run-mode host tools
+    meta/                  # image recipe and inspected identity
+    singleton/             # persistent container lifecycle and static staging
+  sessions/session-<pid>/  # ephemeral broker and launch staging
 ```
 
-Only `profiles/<id>/home` is mounted at the guest's HOME path. `host-home` is
-used only as the HOME of ordinary brokered macOS commands and is not a view of
-the real host HOME. Core state, other profiles, and image provenance never enter
-the guest. Launchers hold the shared lifecycle gate until their PID registration
-is durable; install and uninstall hold it for the whole transaction, closing
-start/remove races. After an uncatchable launcher death, the next launch
-reconciles registrations with Apple container IDs and ownership labels. It
-removes only a proven orphan VM and its secret-capable staging; ambiguous
-resources fail closed.
+The workspace itself is not copied into this tree. Default workspace bytes flow
+between the canonical host project and the per-exec SSHFS mount.
 
 ## Updating an Agent
 
-The built-in profiles select `latest`, meaning the publisher-controlled Claude
-latest, Codex latest, or Grok stable channel. The host queries that profile's
-official version endpoint on every launch, strictly parses one exact version,
-and includes it in the image fingerprint. Test or temporarily pin another
-published exact native release with:
+Profiles follow publisher channels by default. A moved channel changes the
+verified image recipe. Stop the running profile before adopting the new image:
 
 ```bash
-AGENT_CONTAINER_VERSION=0.146.0 codex-container --version
+agent-container singleton stop codex
+codex-container --version
 ```
 
-The recipe fingerprint includes the profile, version, base image,
-Containerfile, its context allowlist, and the entrypoint. A changed input
-rebuilds only that profile.
+Temporarily pin or roll back to an exact release:
 
-An exact `AGENT_CONTAINER_VERSION` bypasses the channel lookup, which permits an
-offline rollback or warm run when its matching image is already cached. A cold
-build still needs network access to the Debian repositories and publisher's
-installer/artifacts. Claude and Grok auto-updaters are disabled in runtime
-sessions, so publisher releases enter through this fingerprinted rebuild path
-instead of mutating a running image.
+```bash
+agent-container singleton stop codex
+codex-container --container-version 0.146.0 --version
+```
 
-Following a publisher channel intentionally trades reproducibility for
-automatic publisher-selected upgrades. Even an exact version is not a
-bit-for-bit reproducible supply chain: the official install script URL and
-Debian package repositories can change. The default Debian base itself is
-digest-pinned. See [docs/security.md](docs/security.md) for the different
-integrity checks performed by the Claude, Codex, and Grok installers.
+An exact version skips the host channel request and can reuse a matching warm
+image offline. A missing image still needs network access for Debian and the
+publisher installer. Exact Agent selection does not make mutable installer
+scripts or Debian repositories bit-for-bit reproducible.
 
-## Performance expectations
+## Performance
 
-Apple's Micro-VM path removes the Docker Desktop daemon/LinuxKit layer and uses
-cached OCI roots, with copy-on-write cloning when the backing filesystem
-supports it. That does not prove a universal speedup: VM boot and VirtioFS
-metadata operations can be slower than a native host process, and Agent
-response time is often network-bound. Measure cold build, warm launch,
-repository scans, and representative Agent tasks separately before claiming a
-gain. See [docs/performance.md](docs/performance.md).
+A warm invocation avoids VM boot but still pays for host validation,
+`container exec`, broker authentication, SSHFS mount readiness, and Agent
+startup. Metadata-heavy work over SFTP may be slower than APFS or VirtioFS;
+online Agent latency is often dominated by the model provider. Measure cold
+build, cold singleton creation, warm attach, workspace I/O, and online task time
+separately. See [docs/performance.md](docs/performance.md).
 
 ## Uninstall
 
 ```bash
-./uninstall.sh
+uninstaller_url='https://raw.githubusercontent.com/loadchange/agent-container/main/uninstall.sh'
+curl -fsSL "$uninstaller_url" | bash
 ```
 
-The default removes installed commands, managed release assets, and only those
-profile images whose stored recipe and inspected identity still match. It
-preserves every profile HOME.
-
-To also remove logins, sessions, caches, and all project-owned state:
+The default removes managed commands, release assets, and only images whose
+recorded provenance still matches. It preserves profile HOME directories.
+For a source checkout, `./uninstall.sh` remains available. If Apple CLI
+discovery needs an override, pass `--container-bin /absolute/path/to/container`
+to that script (or after `bash -s --` in the curl form).
 
 ```bash
-./uninstall.sh --purge
+curl -fsSL "$uninstaller_url" | bash -s -- --purge
 ```
 
-After publication, `uninstall.sh` can equivalently be fetched from the same
-raw `main` URL used by the installer.
+`--purge` also removes logins, settings, sessions, caches, and other managed
+state. Uninstall fails closed if a singleton or legacy session is active or if
+path/image ownership cannot be proved.
 
-Uninstall fails closed before mutation if an Agent session is active or path,
-marker, image, or symlink provenance cannot be proved.
+## More documentation
 
-No Docker compatibility command or Docker runtime asset is shipped. For
-safety, the uninstaller does not claim or delete legacy Docker images or
-volumes, whose names alone cannot prove ownership.
-
-## Architecture
-
-See [docs/architecture.md](docs/architecture.md) for the decision to use Apple's
-versioned `container` CLI instead of embedding the unstable low-level Swift API,
-and for the exact Micro-VM, OCI snapshot, mount, and lifecycle model.
+- [Architecture](docs/architecture.md)
+- [Profiles](docs/profiles.md)
+- [Security model](docs/security.md)
+- [Performance protocol](docs/performance.md)

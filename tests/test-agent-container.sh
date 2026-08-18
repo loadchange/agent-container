@@ -3,48 +3,23 @@ set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 fixture_dir="$repo_root/tests/fixtures"
-test_root=$(mktemp -d)
+command -v cargo >/dev/null 2>&1 \
+  || { printf 'cargo is required for launcher tests\n' >&2; exit 69; }
+cargo build --quiet --locked --offline --release \
+  --manifest-path "$repo_root/Cargo.toml"
+test_root=$(mktemp -d /tmp/agent-container-test.XXXXXX)
 test_root=$(CDPATH= cd -- "$test_root" && pwd -P)
 tests_run=0
 background_pid=""
+secondary_background_pid=""
 
-claude_runtime_env_names=(
+test_forward_env_names=(
   _ANTHROPIC_API_PROVIDER
   ANTHROPIC_BASE_URL
   ANTHROPIC_MODEL
   ANTHROPIC_SMALL_FAST_MODEL
-  ANTHROPIC_DEFAULT_HAIKU_MODEL
-  ANTHROPIC_DEFAULT_SONNET_MODEL
-  ANTHROPIC_DEFAULT_OPUS_MODEL
-  ANTHROPIC_DEFAULT_FABLE_MODEL
-  ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
-  ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
-  ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
-  ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
   CLAUDE_CODE_EFFORT_LEVEL
-  CLAUDE_CODE_ENABLE_TELEMETRY
-  CLAUDE_CODE_ENHANCED_TELEMETRY_BETA
-  CLAUDE_CODE_ENABLE_TOKEN_USAGE_ATTACHMENT
-  CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS
-  CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES
-  CLAUDE_CODE_PROFILE_STARTUP
-  CLAUDE_CODE_PROFILE_QUERY
-  CLAUDE_CODE_PROPAGATE_TRACEPARENT
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
-  CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK
-  CLAUDE_CODE_DISABLE_SESSION_DATA_UPLOAD
-  DISABLE_TELEMETRY
-  CLAUDE_CODE_DISABLE_POLICY_SKILLS
-  DISABLE_ERROR_REPORTING
-  API_TIMEOUT_MS
-  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
-  CLAUDE_CODE_COORDINATOR_MODE
   CLAUDE_CODE_NO_FLICKER
-  CLAUDE_CODE_FORCE_FULL_LOGO
-)
-
-test_forward_env_names=(
-  "${claude_runtime_env_names[@]}"
   CLAUDE_CODE_OAUTH_TOKEN
   ANTHROPIC_WEBHOOK_SIGNING_KEY
   DISABLE_AUTOUPDATER
@@ -52,14 +27,72 @@ test_forward_env_names=(
   TEST_EMPTY_ENV
 )
 
+# The production curl fixture intentionally models only response parsing. This
+# wrapper records and removes the host-policy options before delegating so the
+# runtime contract can also prove curl configuration and proxy isolation.
+curl_wrapper_dir="$test_root/curl-wrapper"
+mkdir "$curl_wrapper_dir"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'first_argument=${1-}'
+  printf '%s\n' 'proxy_set=false'
+  printf '%s\n' 'proxy_value='
+  printf '%s\n' 'noproxy_set=false'
+  printf '%s\n' 'noproxy_value='
+  printf '%s\n' 'resolve_count=0'
+  printf '%s\n' 'resolve_value='
+  printf '%s\n' 'remaining=()'
+  printf '%s\n' 'while [ "$#" -gt 0 ]; do'
+  printf '%s\n' '  case "$1" in'
+  printf '%s\n' '    --disable) shift ;;'
+  printf '%s\n' '    --proxy)'
+  printf '%s\n' '      [ "$#" -ge 2 ] || exit 64'
+  printf '%s\n' '      proxy_set=true'
+  printf '%s\n' '      proxy_value=$2'
+  printf '%s\n' '      shift 2'
+  printf '%s\n' '      ;;'
+  printf '%s\n' '    --resolve)'
+  printf '%s\n' '      [ "$#" -ge 2 ] || exit 64'
+  printf '%s\n' '      resolve_count=$((resolve_count + 1))'
+  printf '%s\n' '      resolve_value=$2'
+  printf '%s\n' '      shift 2'
+  printf '%s\n' '      ;;'
+  printf '%s\n' '    --noproxy)'
+  printf '%s\n' '      [ "$#" -ge 2 ] || exit 64'
+  printf '%s\n' '      noproxy_set=true'
+  printf '%s\n' '      noproxy_value=$2'
+  printf '%s\n' '      shift 2'
+  printf '%s\n' '      ;;'
+  printf '%s\n' '    *) remaining+=("$1"); shift ;;'
+  printf '%s\n' '  esac'
+  printf '%s\n' 'done'
+  printf '%s\n' 'if [ -n "${FAKE_CURL_LOG:-}" ]; then'
+  printf '%s\n' '  printf "FIRST_ARG=%s\n" "$first_argument" >> "$FAKE_CURL_LOG"'
+  printf '%s\n' '  printf "PROXY_SET=%s\n" "$proxy_set" >> "$FAKE_CURL_LOG"'
+  printf '%s\n' '  printf "PROXY=%s\n" "$proxy_value" >> "$FAKE_CURL_LOG"'
+  printf '%s\n' '  printf "NOPROXY_SET=%s\n" "$noproxy_set" >> "$FAKE_CURL_LOG"'
+  printf '%s\n' '  printf "NOPROXY=%s\n" "$noproxy_value" >> "$FAKE_CURL_LOG"'
+  printf '%s\n' '  printf "RESOLVE_COUNT=%s\n" "$resolve_count" >> "$FAKE_CURL_LOG"'
+  printf '%s\n' '  if [ "$resolve_count" -gt 0 ]; then'
+  printf '%s\n' '    printf "RESOLVE=%s\n" "$resolve_value" >> "$FAKE_CURL_LOG"'
+  printf '%s\n' '  fi'
+  printf '%s\n' 'fi'
+  printf 'exec %q "${remaining[@]}"\n' "$fixture_dir/curl"
+} > "$curl_wrapper_dir/curl"
+chmod 0755 "$curl_wrapper_dir/curl"
+
 cleanup() {
   local status=$?
+  local cleanup_pid
   trap - EXIT INT TERM HUP
   set +e
-  if [ -n "$background_pid" ] && kill -0 "$background_pid" 2>/dev/null; then
-    kill -TERM "$background_pid" 2>/dev/null
-    wait "$background_pid" 2>/dev/null
-  fi
+  for cleanup_pid in "$background_pid" "$secondary_background_pid"; do
+    if [ -n "$cleanup_pid" ] && kill -0 "$cleanup_pid" 2>/dev/null; then
+      kill -TERM "$cleanup_pid" 2>/dev/null
+      wait "$cleanup_pid" 2>/dev/null
+    fi
+  done
   rm -rf -- "$test_root"
   exit "$status"
 }
@@ -130,6 +163,53 @@ command_arguments() {
   ' "$file"
 }
 
+assert_command_count() {
+  local file="$1"
+  local command_name="$2"
+  local expected_count="$3"
+  local actual_count
+  actual_count=$(awk -v marker="ARG=$command_name" '
+    previous == "CALL" && $0 == marker { count++ }
+    { previous = $0 }
+    END { print count + 0 }
+  ' "$file")
+  [ "$actual_count" -eq "$expected_count" ] \
+    || fail "expected $expected_count '$command_name' calls in $file, found $actual_count"
+}
+
+call_arguments_containing() {
+  local file="$1"
+  local required_argument="$2"
+  awk -v required="ARG=$required_argument" '
+    function clear_arguments(  argument_index) {
+      for (argument_index in arguments) delete arguments[argument_index]
+      argument_count = 0
+      matched = 0
+    }
+    function emit_arguments(  argument_index) {
+      for (argument_index = 1; argument_index <= argument_count; argument_index++) {
+        print arguments[argument_index]
+      }
+      emitted = 1
+    }
+    $0 == "CALL" {
+      if (matched) {
+        emit_arguments()
+        exit
+      }
+      clear_arguments()
+      next
+    }
+    /^ARG=/ {
+      arguments[++argument_count] = $0
+      if ($0 == required) matched = 1
+    }
+    END {
+      if (!emitted && matched) emit_arguments()
+    }
+  ' "$file"
+}
+
 assert_create_env_name() {
   local file="$1"
   local env_name="$2"
@@ -144,24 +224,35 @@ reset_case_environment() {
   unset \
     AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK \
     AGENT_CONTAINER_ALLOW_CONCURRENT \
+    AGENT_CONTAINER_BASE_IMAGE \
+    AGENT_CONTAINER_BUILD_CPUS \
+    AGENT_CONTAINER_BUILD_MEMORY \
     AGENT_CONTAINER_ENABLE_EXPERIMENTAL \
     AGENT_CONTAINER_FORWARD_ENV \
     AGENT_CONTAINER_FORWARD_API_KEY \
     AGENT_CONTAINER_FORWARD_SSH_AGENT \
     AGENT_CONTAINER_FULL_GIT_CONFIG \
     AGENT_CONTAINER_HOST_BROKER_BIN \
+    AGENT_CONTAINER_HOST_GATEWAY \
     AGENT_CONTAINER_HOST_NODE_BIN \
     AGENT_CONTAINER_HTTP_PROXY \
     AGENT_CONTAINER_IMAGE \
     AGENT_CONTAINER_HTTPS_PROXY \
     AGENT_CONTAINER_ALL_PROXY \
+    AGENT_CONTAINER_CPUS \
     AGENT_CONTAINER_NO_PROXY \
     AGENT_CONTAINER_DNS1 \
     AGENT_CONTAINER_DNS2 \
+    AGENT_CONTAINER_EXTRA_CA_CERTS \
+    AGENT_CONTAINER_OPENSSL_BIN \
+    AGENT_CONTAINER_SECURITY_BIN \
+    AGENT_CONTAINER_REBUILD \
+    AGENT_CONTAINER_SKIP_BUILD \
     AGENT_CONTAINER_TZ \
     AGENT_CONTAINER_VERSION \
     AGENT_CONTAINER_FD_STOP_PERCENT \
     AGENT_CONTAINER_MAX_FILES \
+    AGENT_CONTAINER_MEMORY \
     AGENT_CONTAINER_MOUNT_GH \
     AGENT_CONTAINER_MOUNT_SSH_CONFIG \
     ANTHROPIC_API_KEY \
@@ -171,8 +262,10 @@ reset_case_environment() {
     SSH_AUTH_SOCK \
     FAKE_BUILD_FAIL \
     FAKE_CAPTURE_GITCONFIG \
+    FAKE_CAPTURE_BUILD_CA \
     FAKE_CAPTURE_HOST_STAGE_DIR \
     FAKE_CAPTURE_SSH_DIR \
+    FAKE_CREATE_FAILURE_MODE \
     FAKE_CREATE_STARTED \
     FAKE_CREATE_FOREIGN_AFTER_SUCCESS \
     FAKE_CREATE_FOREIGN_COLLISION \
@@ -195,8 +288,20 @@ reset_case_environment() {
     FAKE_RUN_OUTPUT \
     FAKE_RUN_SLEEP \
     FAKE_RUN_STATUS \
+    FAKE_SECURITY_FAIL \
+    FAKE_SECURITY_CHAIN_FORMAT \
+    FAKE_SECURITY_INSTALLER_ANCHOR_BODY \
+    FAKE_SECURITY_VERSION_ANCHOR_BODY \
     FAKE_START_FAIL \
+    FAKE_SYSTEM_START_FAIL \
     FAKE_SYSTEM_RUNNING \
+    GROK_SANDBOX \
+    TEST_CONTAINER_BIN \
+    TEST_FAKE_BUILD_GATE \
+    TEST_FAKE_BUILD_MARKER \
+    TEST_FAKE_CONTAINER_REAL \
+    TEST_SINGLETON_LAUNCH \
+    TEST_LAUNCH_CWD \
     TEST_RUNNER_PATH \
     2>/dev/null || true
   unset "${test_forward_env_names[@]}" 2>/dev/null || true
@@ -210,10 +315,14 @@ new_case() {
   case_workspace="$case_dir/workspace"
   case_log="$case_dir/container.log"
   case_curl_log="$case_dir/curl.log"
+  case_security_log="$case_dir/security.log"
+  case_openssl_log="$case_dir/openssl.log"
   case_asset_dir="$repo_root"
   mkdir -p "$case_home" "$case_workspace"
   : > "$case_log"
   : > "$case_curl_log"
+  : > "$case_security_log"
+  : > "$case_openssl_log"
 }
 
 copy_case_assets() {
@@ -225,6 +334,8 @@ copy_case_assets() {
     "$repo_root/entrypoint.sh" \
     "$repo_root/host-exec-broker.mjs" \
     "$repo_root/host-exec-client" \
+    "$repo_root/agent-workspace-connect" \
+    "$repo_root/agent-workspace-session" \
     "$case_asset_dir/"
   cp "$repo_root"/profiles/*.json "$case_asset_dir/profiles/"
 }
@@ -232,41 +343,143 @@ copy_case_assets() {
 launch_exec() {
   local program="$1"
   shift
-  local -a runner_env
+  local program_name requested_test_profile
+  local -a runner_env launcher_options program_arguments
+
+  program_arguments=("$@")
+  program_name=${program##*/}
+  if [ "${TEST_SINGLETON_LAUNCH:-false}" != true ]; then
+    case "$program_name" in
+      agent-container)
+        case "${program_arguments[0]:-}" in
+          run|profiles|singleton|-h|--help|'') ;;
+          *)
+            requested_test_profile=${program_arguments[0]}
+            program_arguments=(
+              run "$requested_test_profile" -- "${program_arguments[@]:1}"
+            )
+            ;;
+        esac
+        ;;
+      claude-container|codex-container|grok-container)
+        [ "${program_arguments[0]:-}" = run ] \
+          || program_arguments=(run -- "${program_arguments[@]}")
+        ;;
+    esac
+  fi
+
+  # The test process still uses shell variables as fixture controls, but the
+  # program under test receives every container setting through the public
+  # Rust launcher arguments. No AGENT_CONTAINER_* configuration leaks into
+  # its inherited environment.
+  launcher_options=(
+    --container-bin "${TEST_CONTAINER_BIN:-$fixture_dir/container}"
+    --container-assets "$case_asset_dir"
+    --container-openssl "$fixture_dir/openssl"
+    --container-security "$fixture_dir/security"
+    --container-disable-fd-watchdog
+  )
+
+  [ -z "${AGENT_CONTAINER_CPUS:-}" ] \
+    || launcher_options+=(--container-cpus "$AGENT_CONTAINER_CPUS")
+  [ -z "${AGENT_CONTAINER_MEMORY:-}" ] \
+    || launcher_options+=(--container-memory "$AGENT_CONTAINER_MEMORY")
+  [ -z "${AGENT_CONTAINER_BUILD_CPUS:-}" ] \
+    || launcher_options+=(--container-build-cpus "$AGENT_CONTAINER_BUILD_CPUS")
+  [ -z "${AGENT_CONTAINER_BUILD_MEMORY:-}" ] \
+    || launcher_options+=(--container-build-memory "$AGENT_CONTAINER_BUILD_MEMORY")
+  [ -z "${AGENT_CONTAINER_VERSION:-}" ] \
+    || launcher_options+=(--container-version "$AGENT_CONTAINER_VERSION")
+  [ -z "${AGENT_CONTAINER_BASE_IMAGE:-}" ] \
+    || launcher_options+=(--container-base-image "$AGENT_CONTAINER_BASE_IMAGE")
+  [ -z "${AGENT_CONTAINER_HTTP_PROXY:-}" ] \
+    || launcher_options+=(--container-http-proxy "$AGENT_CONTAINER_HTTP_PROXY")
+  [ -z "${AGENT_CONTAINER_HTTPS_PROXY:-}" ] \
+    || launcher_options+=(--container-https-proxy "$AGENT_CONTAINER_HTTPS_PROXY")
+  [ -z "${AGENT_CONTAINER_ALL_PROXY:-}" ] \
+    || launcher_options+=(--container-all-proxy "$AGENT_CONTAINER_ALL_PROXY")
+  [ -z "${AGENT_CONTAINER_NO_PROXY:-}" ] \
+    || launcher_options+=(--container-no-proxy "$AGENT_CONTAINER_NO_PROXY")
+  [ -z "${AGENT_CONTAINER_EXTRA_CA_CERTS:-}" ] \
+    || launcher_options+=(--container-extra-ca "$AGENT_CONTAINER_EXTRA_CA_CERTS")
+  [ -z "${AGENT_CONTAINER_DNS1:-}" ] \
+    || launcher_options+=(--container-dns1 "$AGENT_CONTAINER_DNS1")
+  [ -z "${AGENT_CONTAINER_DNS2:-}" ] \
+    || launcher_options+=(--container-dns2 "$AGENT_CONTAINER_DNS2")
+  [ -z "${AGENT_CONTAINER_TZ:-}" ] \
+    || launcher_options+=(--container-timezone "$AGENT_CONTAINER_TZ")
+  [ -z "${AGENT_CONTAINER_FORWARD_ENV:-}" ] \
+    || launcher_options+=(--container-forward-env "$AGENT_CONTAINER_FORWARD_ENV")
+  if [ -n "${AGENT_CONTAINER_FORWARD_API_KEY+x}" ]; then
+    case "$AGENT_CONTAINER_FORWARD_API_KEY" in
+      1|true|TRUE|yes|YES|on|ON)
+        launcher_options+=(--container-forward-api-key)
+        ;;
+      0|false|FALSE|no|NO|off|OFF)
+        launcher_options+=(--no-container-forward-api-key)
+        ;;
+      *)
+        # Only malformed-mode tests use this value-bearing legacy shape.
+        launcher_options+=(
+          "--container-forward-api-key=$AGENT_CONTAINER_FORWARD_API_KEY"
+        )
+        ;;
+    esac
+  fi
+  [ -z "${AGENT_CONTAINER_MAX_FILES:-}" ] \
+    || launcher_options+=(--container-max-files "$AGENT_CONTAINER_MAX_FILES")
+  [ -z "${AGENT_CONTAINER_FD_STOP_PERCENT:-}" ] \
+    || launcher_options+=(
+      --container-fd-stop-percent "$AGENT_CONTAINER_FD_STOP_PERCENT"
+    )
+  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
+    launcher_options+=(
+      --container-host-broker "$AGENT_CONTAINER_HOST_BROKER_BIN"
+    )
+  elif [ -n "${AGENT_CONTAINER_HOST_NODE_BIN:-}" ]; then
+    launcher_options+=(--container-host-node "$AGENT_CONTAINER_HOST_NODE_BIN")
+  elif [ "${TEST_SINGLETON_LAUNCH:-false}" != true ]; then
+    launcher_options+=(--container-host-broker "$fixture_dir/host-exec-broker")
+  fi
+  if [ -n "${AGENT_CONTAINER_HOST_GATEWAY:-}" ]; then
+    launcher_options+=(--container-host-gateway "$AGENT_CONTAINER_HOST_GATEWAY")
+  elif [ "${TEST_SINGLETON_LAUNCH:-false}" = true ]; then
+    # Singleton tests start the real Rust workspace broker on the host. The
+    # Apple bridge address is not assigned on every development machine, so
+    # keep the test listener on loopback; the fake guest never connects to it.
+    launcher_options+=(--container-host-gateway 127.0.0.1)
+  fi
+
+  [ "${AGENT_CONTAINER_ENABLE_EXPERIMENTAL:-false}" != true ] \
+    || launcher_options+=(--container-enable-experimental)
+  [ "${AGENT_CONTAINER_REBUILD:-false}" != true ] \
+    || launcher_options+=(--container-rebuild)
+  [ "${AGENT_CONTAINER_SKIP_BUILD:-false}" != true ] \
+    || launcher_options+=(--container-skip-build)
+  [ "${AGENT_CONTAINER_FULL_GIT_CONFIG:-false}" != true ] \
+    || launcher_options+=(--container-full-git-config)
+  [ "${AGENT_CONTAINER_MOUNT_GH:-false}" != true ] \
+    || launcher_options+=(--container-mount-gh)
+  [ "${AGENT_CONTAINER_FORWARD_SSH_AGENT:-false}" != true ] \
+    || launcher_options+=(--container-forward-ssh-agent)
+  [ "${AGENT_CONTAINER_MOUNT_SSH_CONFIG:-false}" != true ] \
+    || launcher_options+=(--container-mount-ssh-config)
+  [ "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}" != true ] \
+    || launcher_options+=(--container-accept-virtiofs-risk)
+  [ "${AGENT_CONTAINER_ALLOW_CONCURRENT:-false}" != true ] \
+    || launcher_options+=(--container-allow-concurrent)
 
   runner_env=(
     "HOME=$case_home"
-    "PATH=${TEST_RUNNER_PATH:-$fixture_dir:/usr/bin:/bin}"
+    "PATH=$curl_wrapper_dir:${TEST_RUNNER_PATH:-$fixture_dir:/usr/bin:/bin}"
     "LANG=C"
     "TERM=xterm-256color"
-    "AGENT_CONTAINER_BIN=$fixture_dir/container"
-    "AGENT_CONTAINER_ASSET_DIR=$case_asset_dir"
-    "AGENT_CONTAINER_DISABLE_FD_WATCHDOG=true"
-    "AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK=${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"
-    "AGENT_CONTAINER_ALLOW_CONCURRENT=${AGENT_CONTAINER_ALLOW_CONCURRENT:-false}"
-    "AGENT_CONTAINER_ENABLE_EXPERIMENTAL=${AGENT_CONTAINER_ENABLE_EXPERIMENTAL:-false}"
-    "AGENT_CONTAINER_FORWARD_ENV=${AGENT_CONTAINER_FORWARD_ENV:-}"
-    "AGENT_CONTAINER_FORWARD_SSH_AGENT=${AGENT_CONTAINER_FORWARD_SSH_AGENT:-false}"
-    "AGENT_CONTAINER_FULL_GIT_CONFIG=${AGENT_CONTAINER_FULL_GIT_CONFIG:-false}"
-    "AGENT_CONTAINER_HOST_BROKER_BIN=${AGENT_CONTAINER_HOST_BROKER_BIN:-}"
-    "AGENT_CONTAINER_HOST_NODE_BIN=${AGENT_CONTAINER_HOST_NODE_BIN:-}"
-    "AGENT_CONTAINER_HTTP_PROXY=${AGENT_CONTAINER_HTTP_PROXY:-}"
-    "AGENT_CONTAINER_IMAGE=${AGENT_CONTAINER_IMAGE:-}"
-    "AGENT_CONTAINER_HTTPS_PROXY=${AGENT_CONTAINER_HTTPS_PROXY:-}"
-    "AGENT_CONTAINER_ALL_PROXY=${AGENT_CONTAINER_ALL_PROXY:-}"
-    "AGENT_CONTAINER_NO_PROXY=${AGENT_CONTAINER_NO_PROXY:-}"
-    "AGENT_CONTAINER_DNS1=${AGENT_CONTAINER_DNS1:-}"
-    "AGENT_CONTAINER_DNS2=${AGENT_CONTAINER_DNS2:-}"
-    "AGENT_CONTAINER_TZ=${AGENT_CONTAINER_TZ:-}"
-    "AGENT_CONTAINER_VERSION=${AGENT_CONTAINER_VERSION:-}"
-    "AGENT_CONTAINER_FD_STOP_PERCENT=${AGENT_CONTAINER_FD_STOP_PERCENT:-80}"
-    "AGENT_CONTAINER_MAX_FILES=${AGENT_CONTAINER_MAX_FILES:-40000}"
-    "AGENT_CONTAINER_MOUNT_GH=${AGENT_CONTAINER_MOUNT_GH:-false}"
-    "AGENT_CONTAINER_MOUNT_SSH_CONFIG=${AGENT_CONTAINER_MOUNT_SSH_CONFIG:-false}"
     "FAKE_BUILD_FAIL=${FAKE_BUILD_FAIL:-false}"
     "FAKE_CAPTURE_GITCONFIG=${FAKE_CAPTURE_GITCONFIG:-}"
+    "FAKE_CAPTURE_BUILD_CA=${FAKE_CAPTURE_BUILD_CA:-}"
     "FAKE_CAPTURE_HOST_STAGE_DIR=${FAKE_CAPTURE_HOST_STAGE_DIR:-}"
     "FAKE_CAPTURE_SSH_DIR=${FAKE_CAPTURE_SSH_DIR:-}"
+    "FAKE_CREATE_FAILURE_MODE=${FAKE_CREATE_FAILURE_MODE:-}"
     "FAKE_CREATE_STARTED=${FAKE_CREATE_STARTED:-false}"
     "FAKE_CREATE_FOREIGN_AFTER_SUCCESS=${FAKE_CREATE_FOREIGN_AFTER_SUCCESS:-false}"
     "FAKE_CREATE_FOREIGN_COLLISION=${FAKE_CREATE_FOREIGN_COLLISION:-false}"
@@ -293,12 +506,25 @@ launch_exec() {
     "FAKE_RUN_OUTPUT=${FAKE_RUN_OUTPUT:-}"
     "FAKE_RUN_SLEEP=${FAKE_RUN_SLEEP:-}"
     "FAKE_RUN_STATUS=${FAKE_RUN_STATUS:-0}"
+    "FAKE_SECURITY_FAIL=${FAKE_SECURITY_FAIL:-false}"
+    "FAKE_SECURITY_CHAIN_FORMAT=${FAKE_SECURITY_CHAIN_FORMAT:-nul-cr}"
+    "FAKE_SECURITY_INSTALLER_ANCHOR_BODY=${FAKE_SECURITY_INSTALLER_ANCHOR_BODY:-}"
+    "FAKE_SECURITY_LOG=$case_security_log"
+    "FAKE_SECURITY_VERSION_ANCHOR_BODY=${FAKE_SECURITY_VERSION_ANCHOR_BODY:-}"
+    "FAKE_OPENSSL_LOG=$case_openssl_log"
     "FAKE_START_FAIL=${FAKE_START_FAIL:-false}"
+    "FAKE_SYSTEM_START_FAIL=${FAKE_SYSTEM_START_FAIL:-false}"
     "FAKE_SYSTEM_RUNNING=${FAKE_SYSTEM_RUNNING:-true}"
+    "FAKE_SYSTEM_STARTED_STATE=$case_home/fake-system-started"
+    "TEST_FAKE_BUILD_GATE=${TEST_FAKE_BUILD_GATE:-}"
+    "TEST_FAKE_BUILD_MARKER=${TEST_FAKE_BUILD_MARKER:-}"
+    "TEST_FAKE_CONTAINER_REAL=${TEST_FAKE_CONTAINER_REAL:-}"
   )
 
-  if [ -n "${AGENT_CONTAINER_FORWARD_API_KEY+x}" ]; then
-    runner_env+=("AGENT_CONTAINER_FORWARD_API_KEY=$AGENT_CONTAINER_FORWARD_API_KEY")
+  if [ -n "${AGENT_CONTAINER_IMAGE:-}" ]; then
+    # Removed settings are intentionally injected only by their migration
+    # tests so the Rust launcher can prove they fail closed.
+    runner_env+=("AGENT_CONTAINER_IMAGE=$AGENT_CONTAINER_IMAGE")
   fi
   if [ -n "${ANTHROPIC_API_KEY+x}" ]; then
     runner_env+=("ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
@@ -321,12 +547,34 @@ launch_exec() {
     fi
   done
 
-  cd "$case_workspace"
-  exec /usr/bin/env -i "${runner_env[@]}" /bin/bash "$program" "$@"
+  cd "${TEST_LAUNCH_CWD:-$case_workspace}"
+  exec /usr/bin/env -i "${runner_env[@]}" \
+    /bin/bash "$program" "${launcher_options[@]}" "${program_arguments[@]}"
 }
 
 run_program() {
   (launch_exec "$@")
+}
+
+run_program_from() {
+  local launch_directory="$1"
+  shift
+  (TEST_LAUNCH_CWD="$launch_directory" launch_exec "$@")
+}
+
+write_build_gated_container() {
+  local helper_path="$1"
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf '%s\n' ': "${TEST_FAKE_CONTAINER_REAL:?}"'
+    printf '%s\n' 'if [ "${1:-}" = build ] && [ -n "${TEST_FAKE_BUILD_MARKER:-}" ]; then'
+    printf '%s\n' '  printf "%s\n" "$$" >> "$TEST_FAKE_BUILD_MARKER"'
+    printf '%s\n' '  while [ -e "${TEST_FAKE_BUILD_GATE:-}" ]; do sleep 0.02; done'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'exec "$TEST_FAKE_CONTAINER_REAL" "$@"'
+  } > "$helper_path"
+  chmod 0755 "$helper_path"
 }
 
 valid_fingerprint() {
@@ -335,6 +583,26 @@ valid_fingerprint() {
   case "$value" in
     *[!0-9a-f]*) return 1 ;;
   esac
+}
+
+write_test_certificate() {
+  local destination="$1"
+  local body="$2"
+
+  printf '%s\n' \
+    '-----BEGIN CERTIFICATE-----' \
+    "$body" \
+    '-----END CERTIFICATE-----' \
+    > "$destination"
+}
+
+test_sha256_file() {
+  local source="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$source" | awk '{print $1}'
+  else
+    sha256sum "$source" | awk '{print $1}'
+  fi
 }
 
 assert_native_installer_build_args() {
@@ -371,8 +639,8 @@ grep -Eq '^claude[[:space:]]+preview[[:space:]]+Claude Code$' "$case_dir/out" \
   || fail "profiles did not list preview Claude"
 grep -Eq '^codex[[:space:]]+preview[[:space:]]+Codex CLI$' "$case_dir/out" \
   || fail "profiles did not list preview Codex"
-grep -Eq '^grok[[:space:]]+experimental[[:space:]]+Grok CLI$' "$case_dir/out" \
-  || fail "profiles did not identify experimental Grok"
+grep -Eq '^grok[[:space:]]+preview[[:space:]]+Grok CLI$' "$case_dir/out" \
+  || fail "profiles did not list preview Grok"
 [ ! -s "$case_log" ] || fail "profile listing contacted the Apple runtime"
 pass "profiles are listed from validated declarative metadata"
 
@@ -474,6 +742,72 @@ assert_no_line "$case_log" "ARG==1"
 pass "empty optional profile fields retain their schema positions"
 
 tests_run=$((tests_run + 1))
+new_case unsafe_profile_environment_fields
+copy_case_assets
+
+sed \
+  -e 's/"id": "claude"/"id": "unsafe-api"/' \
+  -e 's/"apiKeyEnv": "ANTHROPIC_API_KEY"/"apiKeyEnv": "SSH_AUTH_SOCK"/' \
+  "$repo_root/profiles/claude.json" \
+  > "$case_asset_dir/profiles/unsafe-api.json"
+if run_program "$repo_root/agent-container" unsafe-api --version \
+  >"$case_dir/api.out" 2>"$case_dir/api.err"; then
+  fail "profile apiKeyEnv accepted a launcher-managed socket name"
+fi
+assert_contains "$case_dir/api.err" "unsafe apiKeyEnv"
+
+sed \
+  -e 's/"id": "claude"/"id": "unsafe-update"/' \
+  -e 's/"disableAutoUpdateEnv": "DISABLE_AUTOUPDATER"/"disableAutoUpdateEnv": "PATH"/' \
+  "$repo_root/profiles/claude.json" \
+  > "$case_asset_dir/profiles/unsafe-update.json"
+if run_program "$repo_root/agent-container" unsafe-update --version \
+  >"$case_dir/update.out" 2>"$case_dir/update.err"; then
+  fail "profile disableAutoUpdateEnv accepted a launcher-managed path name"
+fi
+assert_contains "$case_dir/update.err" "unsafe disableAutoUpdateEnv"
+
+sed \
+  -e 's/"id": "claude"/"id": "unsafe-installer"/' \
+  -e 's/"installerVersionEnv": ""/"installerVersionEnv": "HOME"/' \
+  "$repo_root/profiles/claude.json" \
+  > "$case_asset_dir/profiles/unsafe-installer.json"
+if run_program "$repo_root/agent-container" unsafe-installer --version \
+  >"$case_dir/installer.out" 2>"$case_dir/installer.err"; then
+  fail "profile installerVersionEnv accepted a launcher-managed home name"
+fi
+assert_contains "$case_dir/installer.err" "unsafe installerVersionEnv"
+
+sed \
+  -e 's/"id": "claude"/"id": "unsafe-reuse"/' \
+  -e 's/"apiKeyEnv": "ANTHROPIC_API_KEY"/"apiKeyEnv": "PROFILE_SETTING"/' \
+  -e 's/"disableAutoUpdateEnv": "DISABLE_AUTOUPDATER"/"disableAutoUpdateEnv": "PROFILE_SETTING"/' \
+  "$repo_root/profiles/claude.json" \
+  > "$case_asset_dir/profiles/unsafe-reuse.json"
+if run_program "$repo_root/agent-container" unsafe-reuse --version \
+  >"$case_dir/reuse.out" 2>"$case_dir/reuse.err"; then
+  fail "profile reused one environment name for credentials and update control"
+fi
+assert_contains "$case_dir/reuse.err" \
+  "reuses one environment name for credentials and update control"
+
+sed \
+  -e 's/"id": "claude"/"id": "dynamic-update"/' \
+  -e 's/"disableAutoUpdateEnv": "DISABLE_AUTOUPDATER"/"disableAutoUpdateEnv": "PROFILE_UPDATE"/' \
+  "$repo_root/profiles/claude.json" \
+  > "$case_asset_dir/profiles/dynamic-update.json"
+AGENT_CONTAINER_FORWARD_ENV=PROFILE_UPDATE
+if run_program "$repo_root/agent-container" dynamic-update --version \
+  >"$case_dir/dynamic.out" 2>"$case_dir/dynamic.err"; then
+  fail "profile update-control environment name was explicitly forwarded"
+fi
+assert_contains "$case_dir/dynamic.err" \
+  "launcher-managed name: PROFILE_UPDATE"
+[ ! -s "$case_log" ] \
+  || fail "unsafe profile environment metadata contacted the Apple runtime"
+pass "profile environment metadata and dynamic update controls stay launcher-managed"
+
+tests_run=$((tests_run + 1))
 new_case malicious_profile
 copy_case_assets
 malicious_sentinel="$case_dir/json-was-executed"
@@ -512,6 +846,7 @@ pass "profile JSON remains inert data"
 
 tests_run=$((tests_run + 1))
 new_case wrapper_boundaries
+TEST_SINGLETON_LAUNCH=true
 AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
 for wrapper_profile in \
   "claude-container claude" \
@@ -520,10 +855,14 @@ for wrapper_profile in \
   wrapper=${wrapper_profile%% *}
   profile=${wrapper_profile#* }
   : > "$case_log"
-  run_program "$repo_root/$wrapper" -- "two words" "" '*' \
-    >"$case_dir/$profile.out" 2>"$case_dir/$profile.err"
-  expected_tail=$(printf 'ARG=%s\n' "$profile" '--' 'two words' '' '*')
-  actual_tail=$(command_arguments "$case_log" create | tail -n 5)
+  if ! run_program "$repo_root/$wrapper" -- "two words" "" '*' \
+    >"$case_dir/$profile.out" 2>"$case_dir/$profile.err"; then
+    sed -n '1,120p' "$case_dir/$profile.err" >&2
+    fail "$wrapper failed before its argument boundary could be checked"
+  fi
+  expected_tail=$(printf 'ARG=%s\n' "$profile" 'two words' '' '*')
+  actual_tail=$(call_arguments_containing \
+    "$case_log" /usr/local/bin/agent-workspace-session | tail -n 4)
   [ "$actual_tail" = "$expected_tail" ] \
     || fail "$wrapper changed profile or argument boundaries"
 done
@@ -531,6 +870,7 @@ pass "all compatibility wrappers preserve exact argument boundaries"
 
 tests_run=$((tests_run + 1))
 new_case legacy_wrapper_runtime_words
+TEST_SINGLETON_LAUNCH=true
 AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
 legacy_share="$case_dir/not-mounted"
 mkdir "$legacy_share"
@@ -539,7 +879,8 @@ run_program "$repo_root/grok-container" \
   >"$case_dir/out" 2>"$case_dir/err"
 expected_tail=$(printf 'ARG=%s\n' \
   grok --share-ro "$legacy_share" -- 'two words' '' '*')
-actual_tail=$(command_arguments "$case_log" create | tail -n 7)
+actual_tail=$(call_arguments_containing \
+  "$case_log" /usr/local/bin/agent-workspace-session | tail -n 7)
 [ "$actual_tail" = "$expected_tail" ] \
   || fail "legacy wrapper invocation consumed new runtime words"
 assert_no_line "$case_log" "ARG=$legacy_share:$legacy_share:ro"
@@ -552,9 +893,11 @@ AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
 FAKE_CAPTURE_HOST_STAGE_DIR="$case_dir/captured-host-stage"
 read_only_share="$case_dir/read only sibling"
 mkdir "$read_only_share"
-run_program "$repo_root/agent-container" run grok \
+if ! run_program "$repo_root/agent-container" run grok \
   --share-ro "$read_only_share" -- "two words" "" '*' \
-  >"$case_dir/out" 2>"$case_dir/err"
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "generic run-mode launch failed: $(tr '\n' ' ' < "$case_dir/err")"
+fi
 assert_line "$case_log" "ARG=$read_only_share:$read_only_share:ro"
 expected_tail=$(printf 'ARG=%s\n' grok 'two words' '' '*')
 actual_tail=$(command_arguments "$case_log" create | tail -n 4)
@@ -759,6 +1102,11 @@ run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/claude.out" 2>"$case_dir/claude.err"
 assert_contains "$case_dir/claude.err" "Resolved Claude Code latest channel to 2.1.220"
 assert_line "$case_curl_log" "URL=https://downloads.claude.ai/claude-code-releases/latest"
+assert_line "$case_curl_log" "FIRST_ARG=--disable"
+assert_line "$case_curl_log" "PROXY_SET=true"
+assert_line "$case_curl_log" "PROXY="
+assert_line "$case_curl_log" "NOPROXY_SET=true"
+assert_line "$case_curl_log" "NOPROXY=localhost,127.0.0.1"
 assert_native_installer_build_args \
   "$case_log" \
   claude \
@@ -849,7 +1197,7 @@ if run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "an arbitrary image reference should be rejected"
 fi
-assert_contains "$case_dir/err" "Image references are profile-scoped"
+assert_contains "$case_dir/err" "custom image references are unsupported"
 [ ! -e "$case_home/.agent-container" ] \
   || fail "image-reference rejection occurred after state mutation"
 [ ! -s "$case_log" ] || fail "an arbitrary image reference contacted the Apple runtime"
@@ -922,110 +1270,107 @@ assert_not_contains "$case_dir/staged.gitconfig" "SECRET"
 pass "default runtime boundary excludes credentials, prefix-only variables, SSH, GH, and full Git config"
 
 tests_run=$((tests_run + 1))
-new_case claude_runtime_environment
-runtime_env_value='runtime value with spaces = opus[1M] MUST_NOT_BE_LOGGED'
-for runtime_env_name in "${claude_runtime_env_names[@]}"; do
-  export "$runtime_env_name=$runtime_env_value"
+new_case claude_environment_requires_explicit_names
+claude_setting_value='runtime value with spaces = opus[1M] MUST_NOT_BE_LOGGED'
+claude_setting_names=(
+  _ANTHROPIC_API_PROVIDER
+  ANTHROPIC_BASE_URL
+  ANTHROPIC_MODEL
+  ANTHROPIC_SMALL_FAST_MODEL
+  CLAUDE_CODE_EFFORT_LEVEL
+  CLAUDE_CODE_NO_FLICKER
+)
+for claude_setting_name in "${claude_setting_names[@]}"; do
+  export "$claude_setting_name=$claude_setting_value"
 done
-# Empty is different from unset and must still reach the guest.
-export CLAUDE_CODE_NO_FLICKER=
 export DISABLE_AUTOUPDATER=0
 export CLAUDE_CODE_OAUTH_TOKEN='PREFIX_SECRET_MUST_NOT_BE_LOGGED'
 export ANTHROPIC_WEBHOOK_SIGNING_KEY='ANTHROPIC_PREFIX_SECRET_MUST_NOT_BE_LOGGED'
-ANTHROPIC_API_KEY='AUTO_API_KEY_MUST_NOT_BE_LOGGED'
-ANTHROPIC_AUTH_TOKEN='AUTH_TOKEN_MUST_NOT_BE_LOGGED'
+ANTHROPIC_API_KEY='DEFAULT_API_KEY_MUST_NOT_BE_LOGGED'
+ANTHROPIC_AUTH_TOKEN='DEFAULT_AUTH_TOKEN_MUST_NOT_BE_LOGGED'
 run_program "$repo_root/agent-container" claude --version \
-  >"$case_dir/out" 2>"$case_dir/err"
-for runtime_env_name in "${claude_runtime_env_names[@]}"; do
-  [ "$(grep -Fxc -- "ARG=$runtime_env_name" "$case_log")" -eq 1 ] \
-    || fail "Claude runtime environment did not forward $runtime_env_name exactly once"
+  >"$case_dir/default.out" 2>"$case_dir/default.err"
+for claude_setting_name in "${claude_setting_names[@]}"; do
+  assert_no_line "$case_log" "ARG=$claude_setting_name"
 done
 assert_line "$case_log" "ARG=DISABLE_AUTOUPDATER=1"
 assert_no_line "$case_log" "ARG=DISABLE_AUTOUPDATER=0"
-assert_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
-assert_create_env_name "$case_log" ANTHROPIC_AUTH_TOKEN
 assert_no_line "$case_log" "ARG=ANTHROPIC_API_KEY"
+assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
 assert_no_line "$case_log" "ARG=CLAUDE_CODE_OAUTH_TOKEN"
 assert_no_line "$case_log" "ARG=ANTHROPIC_WEBHOOK_SIGNING_KEY"
-assert_secret_absent "$case_log" "$runtime_env_value" "Claude runtime environment"
+
+: > "$case_log"
+AGENT_CONTAINER_FORWARD_ENV='_ANTHROPIC_API_PROVIDER,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_SMALL_FAST_MODEL,CLAUDE_CODE_EFFORT_LEVEL,CLAUDE_CODE_NO_FLICKER,_ANTHROPIC_API_PROVIDER'
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/explicit.out" 2>"$case_dir/explicit.err"
+for claude_setting_name in "${claude_setting_names[@]}"; do
+  [ "$(grep -Fxc -- "ARG=$claude_setting_name" "$case_log")" -eq 1 ] \
+    || fail "explicit Claude setting $claude_setting_name was not forwarded exactly once"
+done
+assert_secret_absent "$case_log" "$claude_setting_value" "Claude setting"
 assert_secret_absent "$case_log" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
 assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
 assert_secret_absent "$case_log" "$CLAUDE_CODE_OAUTH_TOKEN" CLAUDE_CODE_OAUTH_TOKEN
 assert_secret_absent "$case_log" "$ANTHROPIC_WEBHOOK_SIGNING_KEY" ANTHROPIC_WEBHOOK_SIGNING_KEY
-assert_secret_absent "$case_dir/out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-pass "Claude inherits reviewed settings and custom-provider auth without values or prefix expansion"
+pass "Claude endpoints, models, and settings require exact name-only forwarding"
 
 tests_run=$((tests_run + 1))
-new_case claude_provider_credential_modes
+new_case custom_provider_requires_explicit_names
+export _ANTHROPIC_API_PROVIDER='custom-provider'
+export ANTHROPIC_BASE_URL='https://provider.example.test/anthropic'
+export ANTHROPIC_MODEL='provider-model'
 ANTHROPIC_AUTH_TOKEN='PROVIDER_AUTH_MUST_NOT_BE_LOGGED'
-export ANTHROPIC_BASE_URL=
 run_program "$repo_root/agent-container" claude --version \
-  >"$case_dir/empty-base.out" 2>"$case_dir/empty-base.err"
-assert_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
-assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
-assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/empty-base.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/empty-base.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+  >"$case_dir/default.out" 2>"$case_dir/default.err"
+for provider_env_name in \
+  _ANTHROPIC_API_PROVIDER ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN; do
+  assert_no_line "$case_log" "ARG=$provider_env_name"
+done
 
 : > "$case_log"
-export ANTHROPIC_BASE_URL='https://provider.example.test/anthropic'
+AGENT_CONTAINER_FORWARD_ENV='_ANTHROPIC_API_PROVIDER,ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,ANTHROPIC_AUTH_TOKEN'
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/explicit.out" 2>"$case_dir/explicit.err"
+for provider_env_name in \
+  _ANTHROPIC_API_PROVIDER ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN; do
+  assert_line "$case_log" "ARG=$provider_env_name"
+done
+assert_create_env_name "$case_log" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/explicit.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_secret_absent "$case_dir/explicit.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+pass "custom providers require every endpoint, model, provider, and token name explicitly"
+
+tests_run=$((tests_run + 1))
+new_case api_key_forward_boolean_modes
+ANTHROPIC_API_KEY='BOOLEAN_API_KEY_MUST_NOT_BE_LOGGED'
 AGENT_CONTAINER_FORWARD_API_KEY=false
 run_program "$repo_root/agent-container" claude --version \
-  >"$case_dir/disabled.out" 2>"$case_dir/disabled.err"
-assert_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
-assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
-assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/disabled.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/disabled.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+  >"$case_dir/false.out" 2>"$case_dir/false.err"
+assert_no_line "$case_log" "ARG=ANTHROPIC_API_KEY"
 
 : > "$case_log"
-AGENT_CONTAINER_FORWARD_API_KEY=
+AGENT_CONTAINER_FORWARD_API_KEY=true
 run_program "$repo_root/agent-container" claude --version \
-  >"$case_dir/empty-mode.out" 2>"$case_dir/empty-mode.err"
-assert_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
-assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
-assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/empty-mode.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/empty-mode.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+  >"$case_dir/true.out" 2>"$case_dir/true.err"
+assert_line "$case_log" "ARG=ANTHROPIC_API_KEY"
+assert_create_env_name "$case_log" ANTHROPIC_API_KEY
+assert_secret_absent "$case_log" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
 
 : > "$case_log"
 AGENT_CONTAINER_FORWARD_API_KEY=auto
-run_program "$repo_root/agent-container" claude --version \
-  >"$case_dir/auto.out" 2>"$case_dir/auto.err"
-assert_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
-assert_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
-assert_create_env_name "$case_log" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/auto.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/auto.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-
-: > "$case_log"
-AGENT_CONTAINER_FORWARD_API_KEY=invalid
 if run_program "$repo_root/agent-container" claude --version \
-  >"$case_dir/invalid.out" 2>"$case_dir/invalid.err"; then
-  fail "an invalid credential forwarding mode should fail"
+  >"$case_dir/auto.out" 2>"$case_dir/auto.err"; then
+  fail "the removed auto credential mode should fail"
 fi
-assert_contains "$case_dir/invalid.err" \
-  "AGENT_CONTAINER_FORWARD_API_KEY must be auto, true, or false"
-assert_secret_absent "$case_dir/invalid.out" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-assert_secret_absent "$case_dir/invalid.err" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
+assert_contains "$case_dir/auto.err" \
+  "forward-api-key"
+assert_secret_absent "$case_dir/auto.out" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
+assert_secret_absent "$case_dir/auto.err" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
 [ ! -s "$case_log" ] \
-  || fail "invalid credential forwarding mode contacted the Apple runtime"
-pass "Claude provider auth honors empty endpoints and explicit auto, disabled, and invalid modes"
-
-tests_run=$((tests_run + 1))
-new_case claude_environment_is_profile_scoped
-export ANTHROPIC_BASE_URL='https://provider.example.test/claude'
-ANTHROPIC_AUTH_TOKEN='PROFILE_SCOPED_AUTH_MUST_NOT_BE_LOGGED'
-export CLAUDE_CODE_EFFORT_LEVEL=max
-run_program "$repo_root/agent-container" codex --version \
-  >"$case_dir/out" 2>"$case_dir/err"
-assert_no_line "$case_log" "ARG=ANTHROPIC_BASE_URL"
-assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
-assert_no_line "$case_log" "ARG=CLAUDE_CODE_EFFORT_LEVEL"
-assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-pass "Claude runtime settings do not cross into another Agent profile"
+  || fail "removed auto credential mode contacted the Apple runtime"
+pass "API-key forwarding defaults off, uses public boolean flags, and rejects auto"
 
 tests_run=$((tests_run + 1))
 new_case explicit_profile_api_key
@@ -1044,24 +1389,17 @@ assert_secret_absent "$case_log" "$XAI_API_KEY" XAI_API_KEY
 pass "API-key opt-in forwards only the active profile variable name"
 
 tests_run=$((tests_run + 1))
-new_case explicit_claude_auth_token
+new_case profile_json_is_only_api_key_authority
+ANTHROPIC_API_KEY='CLAUDE_API_KEY_MUST_NOT_BE_LOGGED'
 ANTHROPIC_AUTH_TOKEN='CLAUDE_AUTH_VALUE_MUST_NOT_BE_LOGGED'
 AGENT_CONTAINER_FORWARD_API_KEY=true
 run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"
-assert_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
-assert_no_line "$case_log" "ARG=ANTHROPIC_API_KEY"
-assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-
-: > "$case_log"
-ANTHROPIC_API_KEY='CLAUDE_API_KEY_MUST_NOT_BE_LOGGED'
-run_program "$repo_root/agent-container" claude --version \
-  >"$case_dir/both.out" 2>"$case_dir/both.err"
 assert_line "$case_log" "ARG=ANTHROPIC_API_KEY"
-assert_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
+assert_no_line "$case_log" "ARG=ANTHROPIC_AUTH_TOKEN"
 assert_secret_absent "$case_log" "$ANTHROPIC_API_KEY" ANTHROPIC_API_KEY
 assert_secret_absent "$case_log" "$ANTHROPIC_AUTH_TOKEN" ANTHROPIC_AUTH_TOKEN
-pass "credential opt-in supports Anthropic-compatible auth tokens without exposing values"
+pass "API-key opt-in forwards only the active profile JSON apiKeyEnv"
 
 tests_run=$((tests_run + 1))
 new_case missing_profile_credential
@@ -1087,16 +1425,53 @@ run_program "$repo_root/agent-container" claude --version \
 [ "$(grep -Fxc -- 'ARG=TEST_EMPTY_ENV' "$case_log")" -eq 1 ] \
   || fail "explicit empty environment variable was not forwarded exactly once"
 [ "$(grep -Fxc -- 'ARG=CLAUDE_CODE_EFFORT_LEVEL' "$case_log")" -eq 1 ] \
-  || fail "automatic and explicit environment overlap was not deduplicated"
+  || fail "explicit environment duplicate was not deduplicated"
 assert_secret_absent "$case_log" "$TEST_EXPLICIT_ENV" TEST_EXPLICIT_ENV
-pass "explicit forwarding supports future and empty settings and deduplicates automatic names"
+pass "explicit forwarding supports future and empty settings and deduplicates exact names"
 
 tests_run=$((tests_run + 1))
 new_case invalid_explicit_environment
 for managed_env_name in \
   HOME \
+  AGENT_CONTAINER \
   AGENT_CONTAINER_CPUS \
+  AGENT_CONTAINER_HOST_EXEC \
+  AGENT_WORKSPACE_TOKEN \
+  AGENT_PROFILE \
+  AGENT_VERSION \
+  AGENT_COMMAND \
+  AGENT_PROBE_ARG \
+  AGENT_CA_FINGERPRINT \
+  AGENT_INSTALLER_URL \
+  AGENT_INSTALLER_SHELL \
+  AGENT_INSTALLER_VERSION_ENV \
+  AGENT_INSTALLER_BIN_DIR_ENV \
+  AGENT_INSTALLER_HOME_ENV \
+  AGENT_INSTALLER_NONINTERACTIVE_ENV \
+  HOST_UID \
+  HOST_GID \
+  HOST_HOME \
+  XDG_RUNTIME_DIR \
+  IS_SANDBOX \
+  BASE_IMAGE \
+  DEFAULT_BASE_IMAGE \
   HTTP_PROXY \
+  FTP_PROXY \
+  BASH_COMPAT \
+  CURL_HOME \
+  GIT_CONFIG_COUNT \
+  OPENSSL_CONF \
+  SSL_CERT_FILE \
+  SSLKEYLOGFILE \
+  XDG_CONFIG_HOME \
+  SSH_ASKPASS_REQUIRE \
+  SSH_AUTH_SOCK \
+  POSIXLY_CORRECT \
+  CDPATH \
+  GLOBIGNORE \
+  IFS \
+  PS4 \
+  PROMPT_COMMAND \
   DISABLE_AUTOUPDATER \
   LD_PRELOAD \
   DYLD_INSERT_LIBRARIES \
@@ -1140,16 +1515,7 @@ assert_contains "$case_dir/empty.err" "without empty entries"
 pass "explicit forwarding rejects reserved, unset, invalid, and malformed names before runtime access"
 
 tests_run=$((tests_run + 1))
-new_case experimental_grok
-if run_program "$repo_root/grok-container" --version \
-  >"$case_dir/disabled.out" 2>"$case_dir/disabled.err"; then
-  fail "experimental Grok should require an explicit gate"
-fi
-assert_contains "$case_dir/disabled.err" "Profile 'grok' is experimental"
-[ ! -s "$case_log" ] || fail "disabled Grok contacted the Apple runtime"
-[ ! -s "$case_curl_log" ] || fail "disabled Grok contacted its version channel"
-
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
+new_case preview_grok
 run_program "$repo_root/grok-container" "argument with spaces" \
   >"$case_dir/enabled.out" 2>"$case_dir/enabled.err"
 assert_contains "$case_dir/enabled.err" "Resolved Grok CLI latest channel to 0.2.114"
@@ -1168,7 +1534,7 @@ assert_native_installer_build_args \
 assert_line "$case_log" "ARG=agent-container-grok:latest"
 assert_line "$case_log" "ARG=grok"
 assert_line "$case_log" "ARG=argument with spaces"
-pass "experimental Grok gates its official native channel and installer metadata"
+pass "preview Grok uses its official native channel and installer metadata without a profile-specific gate"
 
 tests_run=$((tests_run + 1))
 new_case floating_native_latest
@@ -1197,6 +1563,27 @@ assert_line "$case_curl_log" "URL=https://x.ai/cli/stable"
 assert_line "$case_log" "ARG=build"
 assert_line "$case_log" "ARG=AGENT_VERSION=0.2.115"
 pass "an unchanged native latest channel is warm and a moved channel rebuilds"
+
+tests_run=$((tests_run + 1))
+new_case workspace_helpers_invalidate_image_recipe
+copy_case_assets
+AGENT_CONTAINER_VERSION=0.146.0
+run_program "$repo_root/codex-container" --version \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+
+printf '%s\n' '# fingerprint mutation: connect' \
+  >> "$case_asset_dir/agent-workspace-connect"
+run_program "$repo_root/codex-container" --version \
+  >"$case_dir/connect.out" 2>"$case_dir/connect.err"
+
+printf '%s\n' '# fingerprint mutation: session' \
+  >> "$case_asset_dir/agent-workspace-session"
+run_program "$repo_root/codex-container" --version \
+  >"$case_dir/session.out" 2>"$case_dir/session.err"
+
+[ "$(grep -Fxc -- 'ARG=build' "$case_log")" -eq 3 ] \
+  || fail "workspace helper changes did not invalidate the image recipe independently"
+pass "both workspace helpers participate in image reuse and singleton configuration"
 
 tests_run=$((tests_run + 1))
 new_case malicious_plain_version_response
@@ -1272,7 +1659,7 @@ pass "only the official latest channel or an exact native version is accepted"
 tests_run=$((tests_run + 1))
 new_case global_profile_lock
 first_log="$case_log"
-FAKE_RUN_SLEEP=30
+FAKE_RUN_SLEEP=300
 launch_exec "$repo_root/claude-container" --version \
   >"$case_dir/claude.out" 2>"$case_dir/claude.err" &
 launcher_pid=$!
@@ -1284,7 +1671,7 @@ while ! grep -Fqx 'ARG=start' "$first_log"; do
     fail "Claude session exited before acquiring the global lock"
   fi
   attempt=$((attempt + 1))
-  [ "$attempt" -lt 100 ] \
+  [ "$attempt" -lt 1200 ] \
     || fail "Claude session did not reach the fake runtime"
   sleep 0.05
 done
@@ -1409,7 +1796,7 @@ tests_run=$((tests_run + 1))
 new_case same_profile_concurrency
 AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK=true
 AGENT_CONTAINER_ALLOW_CONCURRENT=true
-FAKE_RUN_SLEEP=30
+FAKE_RUN_SLEEP=300
 first_log="$case_log"
 launch_exec "$repo_root/claude-container" --version \
   >"$case_dir/first.out" 2>"$case_dir/first.err" &
@@ -1422,7 +1809,7 @@ while ! grep -Fqx 'ARG=start' "$first_log"; do
     fail "first concurrent session exited before reaching the runtime"
   fi
   attempt=$((attempt + 1))
-  [ "$attempt" -lt 100 ] || fail "first concurrent session did not start"
+  [ "$attempt" -lt 1200 ] || fail "first concurrent session did not start"
   sleep 0.05
 done
 
@@ -1435,14 +1822,19 @@ if run_program "$repo_root/claude-container" --version \
 fi
 assert_contains "$case_dir/same.err" "Same-profile sessions are serialized"
 assert_no_line "$case_log" "ARG=start"
+kill -0 "$launcher_pid" 2>/dev/null \
+  || fail "first same-profile session exited before the distinct-profile check"
 
 case_log="$case_dir/other-profile.log"
 : > "$case_log"
 run_program "$repo_root/codex-container" --version \
   >"$case_dir/other.out" 2>"$case_dir/other.err"
 assert_line "$case_log" "ARG=start"
+kill -0 "$launcher_pid" 2>/dev/null \
+  || fail "first same-profile session exited during the distinct-profile check"
 
-kill -TERM "$launcher_pid"
+kill -TERM "$launcher_pid" \
+  || fail "unable to terminate the first same-profile session"
 set +e
 wait "$launcher_pid"
 set -e
@@ -1474,23 +1866,33 @@ new_case piped_stdin_tty_stdout
 run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/warm.out" 2>"$case_dir/warm.err"
 : > "$case_log"
-(
+if ! (
   cd "$case_workspace"
   exec /usr/bin/env -i \
     HOME="$case_home" \
-    PATH="$fixture_dir:/usr/bin:/bin" \
+    PATH="$curl_wrapper_dir:$fixture_dir:/usr/bin:/bin" \
     LANG=C \
     TERM=xterm-256color \
-    AGENT_CONTAINER_BIN="$fixture_dir/container" \
-    AGENT_CONTAINER_ASSET_DIR="$repo_root" \
-    AGENT_CONTAINER_DISABLE_FD_WATCHDOG=true \
     FAKE_CONTAINER_LOG="$case_log" \
     FAKE_CREATED_CONTAINER_STATE="$case_home/fake-created-container.json" \
     FAKE_IMAGE_STATE_DIR="$case_home/fake-images" \
     FAKE_READ_STDIN=true \
     /usr/bin/python3 "$repo_root/tests/pty-run.py" --pipe-stdin \
-      /bin/bash "$repo_root/agent-container" claude --version
-) >"$case_dir/pty.out" 2>"$case_dir/pty.err"
+      /bin/bash "$repo_root/agent-container" \
+        --container-bin "$fixture_dir/container" \
+        --container-assets "$repo_root" \
+        --container-host-gateway 127.0.0.1 \
+        --container-openssl "$fixture_dir/openssl" \
+        --container-security "$fixture_dir/security" \
+        --container-disable-fd-watchdog \
+        --container-version 2.1.220 \
+        claude --version
+) >"$case_dir/pty.out" 2>"$case_dir/pty.err"; then
+  sed -n '1,120p' "$case_dir/pty.out" >&2
+  sed -n '1,120p' "$case_dir/pty.err" >&2
+  sed -n '1,160p' "$case_log" >&2
+  fail "piped-stdin PTY run failed"
+fi
 assert_line "$case_log" "ARG=--interactive"
 assert_no_line "$case_log" "ARG=--tty"
 assert_line "$case_log" "STDIN_TTY=false"
@@ -1526,14 +1928,25 @@ pass "VirtioFS issue #1097 retains a fail-closed workspace gate"
 tests_run=$((tests_run + 1))
 new_case service_preflight
 FAKE_SYSTEM_RUNNING=false
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_contains "$case_dir/err" "starting them now"
+assert_command_count "$case_log" system 3
+assert_line "$case_log" "ARG=start"
+assert_line "$case_log" "ARG=build"
+pass "stopped Apple services are started automatically and rechecked"
+
+tests_run=$((tests_run + 1))
+new_case service_start_failure
+FAKE_SYSTEM_RUNNING=false
+FAKE_SYSTEM_START_FAIL=true
 if run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"; then
-  fail "a stopped Apple container service should be rejected"
+  fail "a failed Apple service start should stop the launch"
 fi
-assert_contains "$case_dir/err" "container system start"
+assert_contains "$case_dir/err" "Unable to start Apple container services"
 assert_no_line "$case_log" "ARG=build"
-assert_no_line "$case_log" "ARG=start"
-pass "stopped Apple services fail before build with actionable guidance"
+pass "Apple service auto-start failures remain actionable and fail closed"
 
 tests_run=$((tests_run + 1))
 new_case version_preflight
@@ -1561,7 +1974,99 @@ assert_line "$case_log" "ARG=NO_PROXY=localhost,127.0.0.1,example.test"
 assert_line "$case_log" "ARG=--dns"
 assert_line "$case_log" "ARG=1.1.1.1"
 assert_line "$case_log" "ARG=TZ=Asia/Singapore"
-pass "proxy, DNS, and timezone enter only through explicit generic settings"
+assert_line "$case_curl_log" "FIRST_ARG=--disable"
+assert_line "$case_curl_log" "PROXY_SET=true"
+assert_line "$case_curl_log" "PROXY="
+assert_line "$case_curl_log" "NOPROXY=localhost,127.0.0.1,example.test"
+pass "HTTP proxy, DNS, and timezone enter only through explicit generic settings"
+
+tests_run=$((tests_run + 1))
+new_case latest_lookup_https_proxy_policy
+AGENT_CONTAINER_HTTPS_PROXY='https://https-proxy.example.test:8443'
+AGENT_CONTAINER_ALL_PROXY='socks5://fallback-proxy.example.test:1080'
+AGENT_CONTAINER_NO_PROXY='localhost,127.0.0.1,internal.example.test'
+run_program "$repo_root/agent-container" codex --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_curl_log" "FIRST_ARG=--disable"
+assert_line "$case_curl_log" "PROXY_SET=true"
+assert_line "$case_curl_log" "PROXY=https://https-proxy.example.test:8443"
+assert_line "$case_curl_log" "NOPROXY_SET=true"
+assert_line "$case_curl_log" "NOPROXY=localhost,127.0.0.1,internal.example.test"
+assert_not_contains "$case_curl_log" "fallback-proxy.example.test"
+pass "latest lookup uses only the explicit HTTPS proxy and no-proxy policy"
+
+tests_run=$((tests_run + 1))
+new_case latest_lookup_all_proxy_fallback
+AGENT_CONTAINER_ALL_PROXY='socks5://all-proxy.example.test:1080'
+AGENT_CONTAINER_NO_PROXY='localhost,metadata.example.test'
+run_program "$repo_root/agent-container" grok --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_curl_log" "FIRST_ARG=--disable"
+assert_line "$case_curl_log" "PROXY_SET=true"
+assert_line "$case_curl_log" "PROXY=socks5://all-proxy.example.test:1080"
+assert_line "$case_curl_log" "NOPROXY_SET=true"
+assert_line "$case_curl_log" "NOPROXY=localhost,metadata.example.test"
+pass "latest lookup falls back to the explicit all-protocol proxy"
+
+tests_run=$((tests_run + 1))
+new_case latest_lookup_apple_host_proxy_bridge
+AGENT_CONTAINER_HTTPS_PROXY='http://host.container.internal:1087'
+AGENT_CONTAINER_ALL_PROXY='socks5h://host.container.internal:1080'
+run_program "$repo_root/agent-container" grok --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_curl_log" \
+  'PROXY=http://host.container.internal:1087'
+assert_line "$case_curl_log" 'RESOLVE_COUNT=1'
+assert_line "$case_curl_log" \
+  'RESOLVE=host.container.internal:1087:127.0.0.1'
+assert_not_contains "$case_curl_log" \
+  'RESOLVE=host.container.internal:1080:127.0.0.1'
+assert_line "$case_log" \
+  'ARG=HTTPS_PROXY=http://host.container.internal:1087'
+assert_line "$case_log" \
+  'ARG=ALL_PROXY=socks5h://host.container.internal:1080'
+assert_not_contains "$case_log" 'ARG=HTTPS_PROXY=http://127.0.0.1:1087'
+assert_not_contains "$case_log" 'ARG=ALL_PROXY=socks5h://127.0.0.1:1080'
+pass "Apple host proxy bridge is loopback-resolved only for host curl"
+
+tests_run=$((tests_run + 1))
+new_case network_control_characters_rejected
+AGENT_CONTAINER_VERSION=0.146.0
+for control_setting_name in \
+  AGENT_CONTAINER_HTTP_PROXY \
+  AGENT_CONTAINER_NO_PROXY \
+  AGENT_CONTAINER_TZ \
+  AGENT_CONTAINER_CPUS \
+  AGENT_CONTAINER_MEMORY; do
+  control_setting_value=$(printf 'safe\nforged-field=value')
+  export "$control_setting_name=$control_setting_value"
+  if run_program "$repo_root/codex-container" --version \
+    >"$case_dir/$control_setting_name.out" \
+    2>"$case_dir/$control_setting_name.err"; then
+    fail "$control_setting_name with a control character should fail closed"
+  fi
+  assert_contains "$case_dir/$control_setting_name.err" \
+    "contains unsupported control characters"
+  assert_no_line "$case_log" "ARG=build"
+  assert_no_line "$case_log" "ARG=create"
+  unset "$control_setting_name"
+  : > "$case_log"
+done
+
+control_setting_name=AGENT_CONTAINER_HTTP_PROXY
+control_setting_value=$(printf 'safe\033forged-field=value')
+export "$control_setting_name=$control_setting_value"
+if run_program "$repo_root/codex-container" --version \
+  >"$case_dir/non-line-control.out" \
+  2>"$case_dir/non-line-control.err"; then
+  fail "$control_setting_name with a non-line control character should fail closed"
+fi
+assert_contains "$case_dir/non-line-control.err" \
+  "contains unsupported control characters"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=create"
+unset "$control_setting_name"
+pass "runtime network and sizing values cannot inject singleton hash fields"
 
 tests_run=$((tests_run + 1))
 new_case docker_proxy_rejected
@@ -1614,6 +2119,59 @@ fi
 pass "Git, GH, and SSH metadata capabilities remain explicit and ephemeral"
 
 tests_run=$((tests_run + 1))
+new_case legacy_broker_ssh_agent_is_explicit
+capture_broker="$case_dir/capture-host-broker"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'if [ "${SSH_AUTH_SOCK+x}" = x ]; then'
+  printf '%s\n' '  printf "SSH_AUTH_SOCK=%s\n" "$SSH_AUTH_SOCK" > "$0.env"'
+  printf '%s\n' 'else'
+  printf '%s\n' '  printf "SSH_AUTH_SOCK_UNSET\n" > "$0.env"'
+  printf '%s\n' 'fi'
+  printf 'exec %q "$@"\n' "$fixture_dir/host-exec-broker"
+} > "$capture_broker"
+chmod 0755 "$capture_broker"
+SSH_AUTH_SOCK="$case_dir/live-ssh-agent.sock"
+/usr/bin/python3 - "$SSH_AUTH_SOCK" <<'PY' &
+import socket
+import sys
+
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1])
+listener.listen()
+while True:
+    connection, _ = listener.accept()
+    connection.close()
+PY
+background_pid=$!
+socket_attempt=0
+while [ ! -S "$SSH_AUTH_SOCK" ] && [ "$socket_attempt" -lt 100 ]; do
+  sleep 0.02
+  socket_attempt=$((socket_attempt + 1))
+done
+[ -S "$SSH_AUTH_SOCK" ] || fail "SSH-agent fixture did not publish its socket"
+
+AGENT_CONTAINER_HOST_BROKER_BIN="$capture_broker"
+run_program "$repo_root/agent-container" run codex -- --version \
+  >"$case_dir/default.out" 2>"$case_dir/default.err"
+assert_line "$capture_broker.env" "SSH_AUTH_SOCK_UNSET"
+assert_no_line "$case_log" "ARG=--ssh"
+
+: > "$case_log"
+AGENT_CONTAINER_FORWARD_SSH_AGENT=true
+run_program "$repo_root/agent-container" run codex -- --version \
+  >"$case_dir/explicit.out" 2>"$case_dir/explicit.err"
+assert_line "$capture_broker.env" "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+assert_line "$case_log" "ARG=--ssh"
+kill -TERM "$background_pid"
+set +e
+wait "$background_pid"
+set -e
+background_pid=""
+pass "legacy broker receives SSH_AUTH_SOCK only through the explicit launcher option"
+
+tests_run=$((tests_run + 1))
 new_case lifecycle_gate
 mkdir -p "$case_home/.local/share/.agent-container.install.lock"
 printf '%s\n' "$$" \
@@ -1644,6 +2202,60 @@ assert_no_line "$case_log" "ARG=start"
 [ ! -e "$case_home/.agent-container" ] \
   || fail "malformed lifecycle lock was rejected after state mutation"
 pass "lifecycle lock ownership requires one exact PID record"
+
+tests_run=$((tests_run + 1))
+new_case stale_owned_lifecycle_lock
+stale_lifecycle_pid=900000
+while kill -0 "$stale_lifecycle_pid" 2>/dev/null; do
+  stale_lifecycle_pid=$((stale_lifecycle_pid + 1))
+done
+stale_reaper_pid=$((stale_lifecycle_pid + 1000))
+while kill -0 "$stale_reaper_pid" 2>/dev/null; do
+  stale_reaper_pid=$((stale_reaper_pid + 1))
+done
+stale_lifecycle_lock="$case_home/.local/share/.agent-container.install.lock"
+mkdir -p "$stale_lifecycle_lock/.reap"
+printf '%s\n' "$stale_lifecycle_pid" > "$stale_lifecycle_lock/pid"
+printf '%s\n' "stale.$stale_lifecycle_pid.owner" \
+  > "$stale_lifecycle_lock/owner"
+# Model a reclaimer killed between publishing its PID and its owner token.
+printf '%s\n' "$stale_reaper_pid" > "$stale_lifecycle_lock/.reap/pid"
+run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" "ARG=start"
+if find "$case_home/.local/share" -maxdepth 1 \
+  \( -name '.agent-container.install.lock' \
+     -o -name '.agent-container.install.lock.reaped.*' \) \
+  -print -quit | grep -q .; then
+  fail "stale lifecycle recovery left a lock or quarantine directory"
+fi
+pass "dead owned lifecycle locks recover abandoned incomplete reaper claims"
+
+tests_run=$((tests_run + 1))
+new_case stale_legacy_lifecycle_lock
+legacy_lifecycle_pid=910000
+while kill -0 "$legacy_lifecycle_pid" 2>/dev/null; do
+  legacy_lifecycle_pid=$((legacy_lifecycle_pid + 1))
+done
+legacy_lifecycle_lock="$case_home/.local/share/.agent-container.install.lock"
+mkdir -p "$legacy_lifecycle_lock"
+printf '%s\n' "$legacy_lifecycle_pid" > "$legacy_lifecycle_lock/pid"
+if run_program "$repo_root/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a dead PID-only legacy lifecycle lock should fail closed"
+fi
+assert_contains "$case_dir/err" \
+  "A stale legacy lifecycle lock cannot be reclaimed safely"
+for mutating_command in build create start stop delete rm; do
+  assert_no_line "$case_log" "ARG=$mutating_command"
+done
+[ "$(cat "$legacy_lifecycle_lock/pid")" = "$legacy_lifecycle_pid" ] \
+  && [ ! -e "$legacy_lifecycle_lock/owner" ] \
+  && [ ! -e "$legacy_lifecycle_lock/.reap" ] \
+  || fail "legacy lifecycle rejection mutated the stale lock"
+[ ! -e "$case_home/.agent-container" ] \
+  || fail "legacy lifecycle rejection published managed runtime state"
+pass "dead PID-only legacy lifecycle locks remain fail-closed and untouched"
 
 tests_run=$((tests_run + 1))
 new_case exact_state_marker
@@ -1967,6 +2579,505 @@ assert_contains "$case_home/fake-created-container.json" '"reference":"foreign:l
 pass "post-start foreign name reuse is warned, retained, and never deleted"
 
 tests_run=$((tests_run + 1))
+new_case singleton_default_all_profiles
+TEST_SINGLETON_LAUNCH=true
+for singleton_profile_version in \
+  'claude 2.1.220' \
+  'codex 0.146.0' \
+  'grok 0.2.114'; do
+  singleton_profile=${singleton_profile_version%% *}
+  AGENT_CONTAINER_VERSION=${singleton_profile_version#* }
+  run_program "$repo_root/$singleton_profile-container" "from-$singleton_profile" \
+    >"$case_dir/$singleton_profile.out" \
+    2>"$case_dir/$singleton_profile.err"
+  assert_line "$case_log" \
+    "ARG=agent-$singleton_profile-$(id -u)-singleton"
+  assert_line "$case_log" \
+    'ARG=com.loadchange.agent-container.mode=singleton'
+  assert_line "$case_log" 'ARG=/bin/sleep'
+  assert_line "$case_log" 'ARG=infinity'
+  assert_line "$case_log" "ARG=from-$singleton_profile"
+  assert_not_contains "$case_log" 'workspace-roots-sha256'
+
+  run_program "$repo_root/agent-container" singleton status "$singleton_profile" \
+    >"$case_dir/$singleton_profile.status.out" \
+    2>"$case_dir/$singleton_profile.status.err"
+  grep -Eq \
+    "^$singleton_profile singleton: running \\(container=agent-$singleton_profile-$(id -u)-singleton phase=ready config-sha256=[0-9a-f]{64}\\)$" \
+    "$case_dir/$singleton_profile.status.out" \
+    || fail "$singleton_profile singleton status did not report its ready container and configuration fingerprint"
+  run_program "$repo_root/agent-container" singleton stop "$singleton_profile" \
+    >"$case_dir/$singleton_profile.stop.out" \
+    2>"$case_dir/$singleton_profile.stop.err"
+done
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 3 ] \
+  || fail "default singleton launches did not create exactly one VM per profile"
+[ "$(grep -Fxc -- 'ARG=start' "$case_log")" -eq 3 ] \
+  || fail "default singleton launches did not start exactly one VM per profile"
+pass "Claude, Codex, and Grok all default to one profile singleton"
+
+tests_run=$((tests_run + 1))
+new_case singleton_two_workspaces
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+singleton_project_a="$case_dir/project-a"
+singleton_project_b="$case_dir/project-b"
+mkdir -p "$singleton_project_a" "$singleton_project_b"
+
+run_program_from "$singleton_project_a" \
+  "$repo_root/grok-container" from-a "two words" \
+  >"$case_dir/a.out" 2>"$case_dir/a.err"
+run_program_from "$singleton_project_b" \
+  "$repo_root/grok-container" from-b "" \
+  >"$case_dir/b.out" 2>"$case_dir/b.err"
+
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 1 ] \
+  || fail "two Grok workspaces created more than one singleton"
+[ "$(grep -Fxc -- 'ARG=start' "$case_log")" -eq 1 ] \
+  || fail "the warm Grok attach restarted its singleton"
+[ "$(grep -Fxc -- 'ARG=/usr/local/bin/agent-workspace-session' "$case_log")" -eq 2 ] \
+  || fail "two Grok workspaces did not receive two isolated exec sessions"
+[ "$(grep -Fxc -- "ARG=$singleton_project_a" "$case_log")" -eq 2 ] \
+  || fail "workspace A root and cwd were not isolated in its exec"
+[ "$(grep -Fxc -- "ARG=$singleton_project_b" "$case_log")" -eq 2 ] \
+  || fail "workspace B root and cwd were not isolated in its exec"
+assert_line "$case_log" 'ARG=from-a'
+assert_line "$case_log" 'ARG=two words'
+assert_line "$case_log" 'ARG=from-b'
+assert_no_line "$case_log" "ARG=$singleton_project_a:$singleton_project_a"
+assert_no_line "$case_log" "ARG=$singleton_project_b:$singleton_project_b"
+run_program "$repo_root/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "A and B reuse one Grok VM with independent cwd, arguments, and exec sessions"
+
+tests_run=$((tests_run + 1))
+new_case singleton_warm_latest_is_pinned
+TEST_SINGLETON_LAUNCH=true
+FAKE_GROK_LATEST_VERSION=0.2.114
+run_program "$repo_root/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+: > "$case_curl_log"
+FAKE_GROK_LATEST_VERSION=0.2.115
+run_program "$repo_root/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"
+[ ! -s "$case_curl_log" ] \
+  || fail "warm singleton attach queried the latest version channel"
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 1 ] \
+  || fail "warm latest attach created a second singleton"
+[ "$(grep -Fxc -- 'ARG=/usr/local/bin/agent-workspace-session' "$case_log")" -eq 2 ] \
+  || fail "warm latest attach did not create a second isolated exec session"
+run_program "$repo_root/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "warm singleton reuses its pinned Agent version without a latest lookup"
+
+tests_run=$((tests_run + 1))
+new_case singleton_slow_workspace_broker
+copy_case_assets
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+slow_release="$case_dir/slow-release"
+slow_test_bin="$slow_release/test-bin"
+slow_broker_gate="$case_dir/slow-broker.gate"
+slow_broker_active="$case_dir/slow-broker.active"
+slow_broker_marker="$case_dir/slow-broker.started"
+slow_poll_count="$case_dir/slow-broker.poll-count"
+slow_watchdog_marker="$case_dir/slow-broker.watchdog-stopped"
+slow_broker_lock_fd_marker="$case_dir/slow-broker.lock-fd-closed"
+slow_watchdog_lock_fd_marker="$case_dir/slow-broker-watchdog.lock-fd-closed"
+mkdir -p "$slow_release" "$slow_test_bin"
+cp "$repo_root/target/release/agent-container-launcher" \
+  "$slow_release/agent-container-bin"
+cp "$repo_root/agent-container-runtime" \
+  "$slow_release/agent-container-runtime"
+: > "$slow_broker_gate"
+printf '%s\n' 0 > "$slow_poll_count"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf 'exec -a agent-container %q "$@"\n' \
+    "$slow_release/agent-container-bin"
+} > "$slow_release/agent-container"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'if { : <&9; } 2>/dev/null; then exit 71; fi'
+  printf 'printf "%%s\\n" closed > %q\n' \
+    "$slow_broker_lock_fd_marker"
+  printf ': > %q\n' "$slow_broker_active"
+  printf 'while [ -e %q ]; do /bin/sleep 0.01; done\n' \
+    "$slow_broker_gate"
+  printf 'rm -f -- %q\n' "$slow_broker_active"
+  printf 'printf "%%s\\n" started > %q\n' "$slow_broker_marker"
+  printf 'exec %q "$@"\n' \
+    "$repo_root/target/release/agent-container-launcher"
+} > "$slow_release/agent-container-darwin-arm64"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'if [ "$#" -eq 1 ] && [ "$1" = 30 ]; then'
+  printf '%s\n' '  if { : <&9; } 2>/dev/null; then exit 72; fi'
+  printf '  printf "%%s\\n" closed > %q\n' \
+    "$slow_watchdog_lock_fd_marker"
+  printf '%s\n' '  /bin/sleep "$1" &'
+  printf '%s\n' '  watchdog_child=$!'
+  printf '  trap '\''kill -TERM "$watchdog_child" 2>/dev/null || true; wait "$watchdog_child" 2>/dev/null || true; printf "%%s\\n" stopped > %q; exit 0'\'' TERM\n' \
+    "$slow_watchdog_marker"
+  printf '%s\n' '  wait "$watchdog_child"'
+  printf '%s\n' '  exit 0'
+  printf '%s\n' 'fi'
+  printf 'if [ "$#" -eq 1 ] && [ "$1" = 0.05 ] && [ -e %q ]; then\n' \
+    "$slow_broker_active"
+  printf '  IFS= read -r poll_count < %q\n' "$slow_poll_count"
+  printf '%s\n' \
+    '  case "$poll_count" in ""|*[!0-9]*) exit 65 ;; esac'
+  printf '%s\n' '  poll_count=$((poll_count + 1))'
+  printf '  printf "%%s\\n" "$poll_count" > %q\n' "$slow_poll_count"
+  printf '%s\n' '  if [ "$poll_count" -eq 101 ]; then'
+  printf '    rm -f -- %q %q\n' \
+    "$slow_broker_active" "$slow_broker_gate"
+  printf '%s\n' '  fi'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'exec /bin/sleep "$@"'
+} > "$slow_test_bin/sleep"
+chmod 0755 \
+  "$slow_release/agent-container-bin" \
+  "$slow_release/agent-container" \
+  "$slow_release/agent-container-runtime" \
+  "$slow_release/agent-container-darwin-arm64" \
+  "$slow_test_bin/sleep"
+TEST_RUNNER_PATH="$slow_test_bin:$fixture_dir:/usr/bin:/bin"
+
+run_program "$slow_release/agent-container" grok delayed-broker-client \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$slow_broker_marker" started
+assert_line "$slow_watchdog_marker" stopped
+assert_line "$slow_broker_lock_fd_marker" closed
+assert_line "$slow_watchdog_lock_fd_marker" closed
+IFS= read -r slow_poll_total < "$slow_poll_count"
+case "$slow_poll_total" in
+  ''|*[!0-9]*) fail "slow workspace-broker poll count was not numeric" ;;
+esac
+[ "$slow_poll_total" -ge 101 ] \
+  || fail "workspace broker started before crossing the legacy 100-poll cutoff"
+assert_line "$case_log" 'ARG=delayed-broker-client'
+assert_line "$case_log" 'WORKSPACE_CONNECT_STATUS=0'
+run_program "$slow_release/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "singleton attach outlives the old polling cutoff without leaking its lifecycle lock"
+
+tests_run=$((tests_run + 1))
+new_case singleton_concurrent_clients
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+singleton_project_a="$case_dir/project-a"
+singleton_project_b="$case_dir/project-b"
+mkdir -p "$singleton_project_a" "$singleton_project_b"
+FAKE_RUN_SLEEP=300
+TEST_LAUNCH_CWD="$singleton_project_a" launch_exec \
+  "$repo_root/grok-container" slow-client \
+  >"$case_dir/slow.out" 2>"$case_dir/slow.err" &
+singleton_first_pid=$!
+background_pid="$singleton_first_pid"
+for singleton_wait_attempt in $(seq 1 3000); do
+  grep -Fq 'ARG=slow-client' "$case_log" && break
+  kill -0 "$singleton_first_pid" 2>/dev/null \
+    || fail "the first singleton client exited before its exec began"
+  sleep 0.02
+done
+grep -Fq 'ARG=slow-client' "$case_log" \
+  || fail "the first singleton client did not begin within sixty seconds"
+singleton_exec_child_pid=""
+for singleton_child_wait_attempt in $(seq 1 500); do
+  singleton_exec_child_pid=$(pgrep -P "$singleton_first_pid" -f 'sleep 300' \
+    | head -n 1 || true)
+  [ -z "$singleton_exec_child_pid" ] || break
+  kill -0 "$singleton_first_pid" 2>/dev/null \
+    || fail "the first singleton launcher exited before its Apple CLI child was observed"
+  sleep 0.02
+done
+[ -n "$singleton_exec_child_pid" ] \
+  || fail "the first singleton launcher did not retain a test Apple CLI child"
+secondary_background_pid="$singleton_exec_child_pid"
+unset FAKE_RUN_SLEEP
+run_program_from "$singleton_project_b" \
+  "$repo_root/grok-container" fast-client \
+  >"$case_dir/fast.out" 2>"$case_dir/fast.err"
+kill -0 "$singleton_first_pid" 2>/dev/null \
+  || fail "the second attach waited for the first Agent process to exit"
+kill -TERM "$singleton_first_pid" \
+  || fail "unable to terminate the first concurrent singleton client"
+set +e
+wait "$singleton_first_pid"
+singleton_first_status=$?
+set -e
+background_pid=""
+[ "$singleton_first_status" -ne 0 ] \
+  || fail "TERM unexpectedly produced a successful singleton client status"
+for singleton_child_wait_attempt in $(seq 1 500); do
+  kill -0 "$singleton_exec_child_pid" 2>/dev/null || break
+  sleep 0.02
+done
+if kill -0 "$singleton_exec_child_pid" 2>/dev/null; then
+  kill -TERM "$singleton_exec_child_pid" 2>/dev/null || true
+  secondary_background_pid=""
+  fail "TERM left the singleton Apple CLI child running after its launcher exited"
+fi
+secondary_background_pid=""
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 1 ] \
+  || fail "concurrent clients created more than one Grok singleton"
+[ "$(grep -Fxc -- 'ARG=/usr/local/bin/agent-workspace-session' "$case_log")" -eq 2 ] \
+  || fail "concurrent clients did not receive separate exec sessions"
+assert_line "$case_log" 'ARG=slow-client'
+assert_line "$case_log" 'ARG=fast-client'
+run_program "$repo_root/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "two Grok clients attach concurrently after the singleton lifecycle lock is released"
+
+tests_run=$((tests_run + 1))
+new_case singleton_stopped_recreation
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+run_program "$repo_root/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+cp "$case_home/fake-created-container.json.stopped" \
+  "$case_home/fake-created-container.json"
+run_program "$repo_root/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 2 ] \
+  || fail "a verified stopped singleton was not recreated exactly once"
+assert_line "$case_log" 'ARG=delete'
+assert_line "$case_log" 'ARG=--force'
+assert_contains "$case_dir/second.err" \
+  "Removing a verified stopped 'grok' singleton before recreation"
+run_program "$repo_root/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "a verified stopped singleton is safely deleted and recreated"
+
+tests_run=$((tests_run + 1))
+new_case singleton_config_change_fails_closed
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+run_program "$repo_root/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+AGENT_CONTAINER_VERSION=0.2.115
+if run_program "$repo_root/grok-container" changed-version \
+  >"$case_dir/changed.out" 2>"$case_dir/changed.err"; then
+  fail "an active singleton accepted a different Agent version"
+fi
+assert_contains "$case_dir/changed.err" \
+  "singleton image is stale or a rebuild was requested"
+assert_contains "$case_dir/changed.err" \
+  "agent-container singleton stop grok"
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 1 ] \
+  || fail "a configuration change created a second singleton"
+run_program "$repo_root/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "singleton configuration changes fail closed instead of creating another VM"
+
+tests_run=$((tests_run + 1))
+new_case singleton_linked_worktree_fails_closed
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+singleton_main="$case_dir/main"
+singleton_worktree="$case_dir/worktree"
+mkdir "$singleton_main"
+/usr/bin/git -C "$singleton_main" init -q
+/usr/bin/git -C "$singleton_main" config user.email test@example.test
+/usr/bin/git -C "$singleton_main" config user.name Test
+printf '%s\n' base > "$singleton_main/file.txt"
+/usr/bin/git -C "$singleton_main" add file.txt
+/usr/bin/git -C "$singleton_main" commit -qm base
+/usr/bin/git -C "$singleton_main" worktree add \
+  -q "$singleton_worktree" -b singleton-worktree
+if run_program_from "$singleton_worktree" \
+  "$repo_root/grok-container" linked-client \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "default singleton accepted an external Git common directory"
+fi
+assert_contains "$case_dir/err" \
+  'Dynamic singleton sharing currently supports one workspace root'
+assert_contains "$case_dir/err" \
+  'agent-container run grok --'
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 0 ] \
+  || fail "linked-worktree rejection occurred after singleton creation"
+pass "external Git common directories fail closed before singleton startup"
+tests_run=$((tests_run + 1))
+new_case auto_extra_ca_consumer_split
+AGENT_CONTAINER_EXTRA_CA_CERTS=auto
+FAKE_SECURITY_CHAIN_FORMAT=three-ca-nul-cr
+FAKE_CAPTURE_BUILD_CA="$case_dir/build-ca.pem"
+run_program "$repo_root/codex-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+
+assert_line "$case_security_log" "ARG=https://chatgpt.com/codex/install.sh"
+assert_line "$case_security_log" "ARG=https://releases.openai.com/codex/channels/latest"
+assert_line "$case_curl_log" "CA_NATIVE=true"
+assert_line "$case_curl_log" "PROXY_CA_NATIVE=true"
+assert_line "$case_curl_log" "CACERT_BODY=VkVSU0lPTi1BTkNIT1I="
+assert_line "$case_curl_log" "PROXY_CACERT_BODY=VkVSU0lPTi1BTkNIT1I="
+assert_not_contains "$case_curl_log" "SU5TVEFMTEVSLUFOQ0hPUg=="
+assert_line "$case_dir/build-ca.pem" "SU5TVEFMTEVSLUFOQ0hPUg=="
+assert_not_contains "$case_dir/build-ca.pem" "VkVSU0lPTi1BTkNIT1I="
+assert_not_contains "$case_dir/build-ca.pem" "Uk9PVC1DQQ=="
+auto_build_ca_fingerprint=$(test_sha256_file "$case_dir/build-ca.pem")
+assert_line "$case_log" "ARG=AGENT_CA_FINGERPRINT=$auto_build_ca_fingerprint"
+assert_contains "$case_log" "ARG=id=agent_ca_bundle,src="
+assert_secret_absent \
+  "$case_log" \
+  'SU5TVEFMTEVSLUFOQ0hPUg==' \
+  auto_installer_anchor
+assert_secret_absent \
+  "$case_log" \
+  'VkVSU0lPTi1BTkNIT1I=' \
+  auto_version_anchor
+pass "auto CA routes the narrowest verified issuers to host curl and BuildKit"
+
+tests_run=$((tests_run + 1))
+new_case auto_extra_ca_exact_version_skips_version_chain
+AGENT_CONTAINER_EXTRA_CA_CERTS=auto
+AGENT_CONTAINER_VERSION=0.146.0
+FAKE_CAPTURE_BUILD_CA="$case_dir/build-ca.pem"
+run_program "$repo_root/codex-container" --version \
+  >"$case_dir/cold.out" 2>"$case_dir/cold.err"
+
+assert_line "$case_security_log" "ARG=https://chatgpt.com/codex/install.sh"
+assert_no_line "$case_security_log" \
+  "ARG=https://releases.openai.com/codex/channels/latest"
+[ ! -s "$case_curl_log" ] \
+  || fail "an exact Agent version unexpectedly queried the version channel"
+assert_line "$case_dir/build-ca.pem" "SU5TVEFMTEVSLUFOQ0hPUg=="
+assert_not_contains "$case_dir/build-ca.pem" "VkVSU0lPTi1BTkNIT1I="
+
+: > "$case_log"
+: > "$case_curl_log"
+: > "$case_security_log"
+run_program "$repo_root/codex-container" --version \
+  >"$case_dir/warm.out" 2>"$case_dir/warm.err"
+assert_line "$case_security_log" "ARG=https://chatgpt.com/codex/install.sh"
+assert_no_line "$case_security_log" \
+  "ARG=https://releases.openai.com/codex/channels/latest"
+[ ! -s "$case_curl_log" ] \
+  || fail "an exact warm-image run unexpectedly queried the version channel"
+assert_no_line "$case_log" "ARG=build"
+pass "exact auto CA extracts only the installer anchor and skips cold and warm version lookups"
+
+tests_run=$((tests_run + 1))
+new_case explicit_extra_ca_secret_and_fingerprint
+explicit_ca="$case_dir/explicit-ca.pem"
+write_test_certificate "$explicit_ca" 'VkFMSUQtQ0E='
+AGENT_CONTAINER_EXTRA_CA_CERTS="$explicit_ca"
+FAKE_CAPTURE_BUILD_CA="$case_dir/build-ca.pem"
+
+run_program "$repo_root/claude-container" --version \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+explicit_ca_first_fingerprint=$(test_sha256_file "$explicit_ca")
+cmp -s "$explicit_ca" "$case_dir/build-ca.pem" \
+  || fail "explicit CA content did not reach the BuildKit secret"
+assert_line "$case_curl_log" "CACERT_BODY=VkFMSUQtQ0E="
+assert_line "$case_log" "ARG=AGENT_CA_FINGERPRINT=$explicit_ca_first_fingerprint"
+assert_contains "$case_log" "ARG=id=agent_ca_bundle,src="
+assert_secret_absent "$case_log" 'VkFMSUQtQ0E=' explicit_ca
+
+write_test_certificate "$explicit_ca" 'VkFMSUQtQ0EtMg=='
+run_program "$repo_root/claude-container" --version \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"
+explicit_ca_second_fingerprint=$(test_sha256_file "$explicit_ca")
+[ "$explicit_ca_first_fingerprint" != "$explicit_ca_second_fingerprint" ] \
+  || fail "test CA mutation did not change its digest"
+assert_line "$case_log" "ARG=AGENT_CA_FINGERPRINT=$explicit_ca_second_fingerprint"
+[ "$(grep -Fxc -- 'ARG=build' "$case_log")" -eq 2 ] \
+  || fail "changing explicit CA content did not invalidate the warm image"
+cmp -s "$explicit_ca" "$case_dir/build-ca.pem" \
+  || fail "rebuilt image did not receive the changed explicit CA"
+pass "explicit CA uses a BuildKit secret and its public fingerprint invalidates image reuse"
+
+tests_run=$((tests_run + 1))
+new_case invalid_expired_future_and_nonca_bundles
+AGENT_CONTAINER_VERSION=2.1.220
+invalid_ca="$case_dir/invalid-ca.pem"
+
+printf '%s\n' 'not a PEM certificate' > "$invalid_ca"
+AGENT_CONTAINER_EXTRA_CA_CERTS="$invalid_ca"
+if run_program "$repo_root/claude-container" --version \
+  >"$case_dir/invalid.out" 2>"$case_dir/invalid.err"; then
+  fail "non-PEM extra CA input should fail"
+fi
+assert_contains "$case_dir/invalid.err" "currently-valid CA certificates"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=create"
+
+: > "$case_log"
+: > "$case_openssl_log"
+write_test_certificate "$invalid_ca" 'RVhQSVJFRC1DQQ=='
+if run_program "$repo_root/claude-container" --version \
+  >"$case_dir/expired.out" 2>"$case_dir/expired.err"; then
+  fail "an expired extra CA should fail"
+fi
+assert_contains "$case_dir/expired.err" "currently-valid CA certificates"
+assert_line "$case_openssl_log" "ARG=-checkend"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=create"
+
+: > "$case_log"
+: > "$case_openssl_log"
+write_test_certificate "$invalid_ca" 'RlVUVVJFLUNB'
+if run_program "$repo_root/claude-container" --version \
+  >"$case_dir/future.out" 2>"$case_dir/future.err"; then
+  fail "a not-yet-valid extra CA should fail"
+fi
+assert_contains "$case_dir/future.err" "currently-valid CA certificates"
+assert_line "$case_openssl_log" "ARG=-startdate"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=create"
+
+: > "$case_log"
+: > "$case_openssl_log"
+write_test_certificate "$invalid_ca" 'Tk9OQ0E='
+if run_program "$repo_root/claude-container" --version \
+  >"$case_dir/nonca.out" 2>"$case_dir/nonca.err"; then
+  fail "a certificate without CA:TRUE should fail"
+fi
+assert_contains "$case_dir/nonca.err" "currently-valid CA certificates"
+assert_line "$case_openssl_log" "ARG=-ext"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=create"
+pass "extra CA validation rejects invalid PEM, expired, future, and non-CA certificates before build"
+
+tests_run=$((tests_run + 1))
+new_case auto_future_installer_anchor_rejected
+AGENT_CONTAINER_EXTRA_CA_CERTS=auto
+AGENT_CONTAINER_VERSION=2.1.220
+FAKE_SECURITY_INSTALLER_ANCHOR_BODY=RlVUVVJFLUNB
+if run_program "$repo_root/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "auto should reject a not-yet-valid installer-chain CA"
+fi
+assert_contains "$case_dir/err" \
+  "could not verify and export the TLS trust anchor for https://claude.ai/install.sh"
+assert_line "$case_openssl_log" "ARG=-startdate"
+assert_no_line "$case_security_log" \
+  "ARG=https://downloads.claude.ai/claude-code-releases/latest"
+[ ! -s "$case_curl_log" ] \
+  || fail "a rejected exact-version auto anchor unexpectedly queried the version channel"
+assert_no_line "$case_log" "ARG=build"
+pass "auto rejects a not-yet-valid installer anchor before build"
+
+tests_run=$((tests_run + 1))
+new_case default_extra_ca_uses_auto_trust_bridge
+AGENT_CONTAINER_VERSION=0.146.0
+FAKE_CAPTURE_BUILD_CA="$case_dir/build-ca.pem"
+run_program "$repo_root/codex-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_security_log" "ARG=https://chatgpt.com/codex/install.sh"
+assert_no_line "$case_security_log" \
+  "ARG=https://releases.openai.com/codex/channels/latest"
+assert_line "$case_dir/build-ca.pem" "SU5TVEFMTEVSLUFOQ0hPUg=="
+default_ca_fingerprint=$(test_sha256_file "$case_dir/build-ca.pem")
+assert_line "$case_log" "ARG=AGENT_CA_FINGERPRINT=$default_ca_fingerprint"
+assert_contains "$case_log" "ARG=id=agent_ca_bundle,src="
+pass "default extra CA mode uses the verified macOS trust bridge"
+
+tests_run=$((tests_run + 1))
 new_case linked_worktree
 main_repo="$case_dir/main repo"
 case_workspace="$case_dir/linked worktree/subdir"
@@ -1991,23 +3102,33 @@ new_case real_pty
 run_program "$repo_root/agent-container" claude --version \
   >"$case_dir/warm.out" 2>"$case_dir/warm.err"
 : > "$case_log"
-(
+if ! (
   cd "$case_workspace"
   exec /usr/bin/env -i \
     HOME="$case_home" \
-    PATH="$fixture_dir:/usr/bin:/bin" \
+    PATH="$curl_wrapper_dir:$fixture_dir:/usr/bin:/bin" \
     LANG=C \
     TERM=xterm-256color \
-    AGENT_CONTAINER_BIN="$fixture_dir/container" \
-    AGENT_CONTAINER_ASSET_DIR="$repo_root" \
-    AGENT_CONTAINER_DISABLE_FD_WATCHDOG=true \
     FAKE_CONTAINER_LOG="$case_log" \
     FAKE_CREATED_CONTAINER_STATE="$case_home/fake-created-container.json" \
     FAKE_IMAGE_STATE_DIR="$case_home/fake-images" \
     FAKE_READ_STDIN=true \
     /usr/bin/python3 "$repo_root/tests/pty-run.py" \
-      /bin/bash "$repo_root/agent-container" claude --version
-) >"$case_dir/pty.out" 2>"$case_dir/pty.err"
+      /bin/bash "$repo_root/agent-container" \
+        --container-bin "$fixture_dir/container" \
+        --container-assets "$repo_root" \
+        --container-host-gateway 127.0.0.1 \
+        --container-openssl "$fixture_dir/openssl" \
+        --container-security "$fixture_dir/security" \
+        --container-disable-fd-watchdog \
+        --container-version 2.1.220 \
+        claude --version
+) >"$case_dir/pty.out" 2>"$case_dir/pty.err"; then
+  sed -n '1,120p' "$case_dir/pty.out" >&2
+  sed -n '1,120p' "$case_dir/pty.err" >&2
+  sed -n '1,160p' "$case_log" >&2
+  fail "real PTY run failed"
+fi
 assert_line "$case_log" "ARG=--interactive"
 assert_line "$case_log" "ARG=--tty"
 assert_line "$case_log" "STDIN_TTY=true"

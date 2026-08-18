@@ -2,7 +2,7 @@
   "schema": 2,
   "id": "grok",
   "displayName": "Grok CLI",
-  "status": "experimental",
+  "status": "preview",
   "installerKind": "native-script",
   "installerUrl": "https://x.ai/cli/install.sh",
   "installerShell": "bash",

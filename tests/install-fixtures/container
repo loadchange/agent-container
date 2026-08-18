@@ -50,6 +50,8 @@ case "${1:-}" in
     }
     if [ "${FAKE_LIST_INVALID_JSON:-false}" = true ]; then
       printf '%s\n' 'not-json'
+    elif [ -n "${FAKE_CONTAINER_LIST_JSON:-}" ]; then
+      printf '%s\n' "$FAKE_CONTAINER_LIST_JSON"
     elif [ "${FAKE_ACTIVE_LABELED_CONTAINER:-false}" = true ]; then
       printf '%s\n' '[{"configuration":{"labels":{"com.loadchange.agent-container":"true"}}}]'
     else

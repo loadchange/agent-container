@@ -118,6 +118,21 @@ capture_staged_capabilities() {
   fi
 }
 
+capture_build_ca_secret() {
+  local argument secret_source=""
+
+  [ -n "${FAKE_CAPTURE_BUILD_CA:-}" ] || return 0
+  for argument in "$@"; do
+    case "$argument" in
+      id=agent_ca_bundle,src=*)
+        secret_source=${argument#id=agent_ca_bundle,src=}
+        ;;
+    esac
+  done
+  [ -n "$secret_source" ] && [ -f "$secret_source" ] || return 75
+  cp "$secret_source" "$FAKE_CAPTURE_BUILD_CA"
+}
+
 set_post_start_state() {
   local mode="$1"
   local container_id="$2"
@@ -157,8 +172,14 @@ case "${1:-}" in
     ;;
   system)
     case "${2:-}" in
-      status) [ "${FAKE_SYSTEM_RUNNING:-true}" = true ] ;;
-      start) exit 0 ;;
+      status)
+        [ "${FAKE_SYSTEM_RUNNING:-true}" = true ] \
+          || [ -f "${FAKE_SYSTEM_STARTED_STATE:-/nonexistent}" ]
+        ;;
+      start)
+        [ "${FAKE_SYSTEM_START_FAIL:-false}" != true ] || exit 71
+        : > "${FAKE_SYSTEM_STARTED_STATE:?}"
+        ;;
     esac
     ;;
   list)
@@ -195,7 +216,10 @@ case "${1:-}" in
       if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ]; then
         rm -f \
           "$FAKE_CREATED_CONTAINER_STATE" \
-          "$FAKE_CREATED_CONTAINER_STATE.inspect-error"
+          "$FAKE_CREATED_CONTAINER_STATE.inspect-error" \
+          "$FAKE_CREATED_CONTAINER_STATE.mode" \
+          "$FAKE_CREATED_CONTAINER_STATE.running" \
+          "$FAKE_CREATED_CONTAINER_STATE.stopped"
       fi
       exit 1
     fi
@@ -206,7 +230,10 @@ case "${1:-}" in
     if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ]; then
       rm -f \
         "$FAKE_CREATED_CONTAINER_STATE" \
-        "$FAKE_CREATED_CONTAINER_STATE.inspect-error"
+        "$FAKE_CREATED_CONTAINER_STATE.inspect-error" \
+        "$FAKE_CREATED_CONTAINER_STATE.mode" \
+        "$FAKE_CREATED_CONTAINER_STATE.running" \
+        "$FAKE_CREATED_CONTAINER_STATE.stopped"
     fi
     ;;
   image)
@@ -253,6 +280,7 @@ case "${1:-}" in
     ;;
   build)
     [ "${FAKE_BUILD_FAIL:-false}" != true ] || exit 1
+    capture_build_ca_secret "$@" || exit $?
     image_ref=$(image_ref_from_build_arguments "$@") || exit 64
     fake_image_state=$(fake_image_state_for_ref "$image_ref")
     fake_image_inspect_for_ref "$image_ref" > "$fake_image_state"
@@ -264,6 +292,8 @@ case "${1:-}" in
     created_pid=""
     created_image=""
     created_tty=false
+    created_mode=""
+    created_config_hash=""
     previous=""
     for argument in "$@"; do
       case "$previous" in
@@ -279,6 +309,12 @@ case "${1:-}" in
             com.loadchange.agent-container.launcher-pid=*)
               created_pid=${argument#*=}
               ;;
+            com.loadchange.agent-container.mode=*)
+              created_mode=${argument#*=}
+              ;;
+            com.loadchange.agent-container.config-sha256=*)
+              created_config_hash=${argument#*=}
+              ;;
           esac
           ;;
       esac
@@ -288,7 +324,15 @@ case "${1:-}" in
       esac
       previous="$argument"
     done
-    if [ "${FAKE_CREATE_FOREIGN_COLLISION:-false}" = true ]; then
+    case "${FAKE_CREATE_FAILURE_MODE:-}" in
+      '') ;;
+      absent) exit 1 ;;
+      owned) ;;
+      foreign) ;;
+      *) exit 78 ;;
+    esac
+    if [ "${FAKE_CREATE_FAILURE_MODE:-}" = foreign ] \
+      || [ "${FAKE_CREATE_FOREIGN_COLLISION:-false}" = true ]; then
       [ -n "$created_id" ] || exit 71
       printf '%s\n' \
         "[{\"id\":\"$created_id\",\"configuration\":{\"id\":\"$created_id\",\"labels\":{},\"image\":{\"reference\":\"foreign:latest\",\"descriptor\":{\"digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}},\"initProcess\":{\"terminal\":false}},\"status\":{\"state\":\"stopped\"}}]" \
@@ -320,10 +364,28 @@ case "${1:-}" in
     if [ "${FAKE_CREATE_STARTED:-false}" = true ]; then
       created_started_date=',"startedDate":"2026-07-29T00:00:00Z"'
     fi
+    created_singleton_labels=""
+    if [ -n "$created_mode" ]; then
+      [ "$created_mode" = singleton ] \
+        && [ -n "$created_config_hash" ] \
+        || exit 76
+      created_singleton_labels=",\"com.loadchange.agent-container.mode\":\"$created_mode\",\"com.loadchange.agent-container.config-sha256\":\"$created_config_hash\""
+    fi
     rm -f "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}.inspect-error"
     printf '%s\n' \
-      "[{\"id\":\"$created_id\",\"configuration\":{\"id\":\"$created_id\",\"labels\":{\"com.loadchange.agent-container\":\"true\",\"com.loadchange.agent-container.profile\":\"$created_profile\",\"com.loadchange.agent-container.host-uid\":\"$created_uid\",\"com.loadchange.agent-container.launcher-pid\":\"$created_pid\"},\"image\":{\"reference\":\"$created_image\",\"descriptor\":{\"digest\":\"$created_digest\"}},\"initProcess\":{\"terminal\":$created_tty}},\"status\":{\"state\":\"stopped\"$created_started_date}}]" \
+      "[{\"id\":\"$created_id\",\"configuration\":{\"id\":\"$created_id\",\"labels\":{\"com.loadchange.agent-container\":\"true\",\"com.loadchange.agent-container.profile\":\"$created_profile\",\"com.loadchange.agent-container.host-uid\":\"$created_uid\",\"com.loadchange.agent-container.launcher-pid\":\"$created_pid\"$created_singleton_labels},\"image\":{\"reference\":\"$created_image\",\"descriptor\":{\"digest\":\"$created_digest\"}},\"initProcess\":{\"terminal\":$created_tty}},\"status\":{\"state\":\"stopped\"$created_started_date}}]" \
       > "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}"
+    if [ "$created_mode" = singleton ]; then
+      cp \
+        "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}" \
+        "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}.stopped"
+      printf '%s\n' \
+        "[{\"id\":\"$created_id\",\"configuration\":{\"id\":\"$created_id\",\"labels\":{\"com.loadchange.agent-container\":\"true\",\"com.loadchange.agent-container.profile\":\"$created_profile\",\"com.loadchange.agent-container.host-uid\":\"$created_uid\",\"com.loadchange.agent-container.launcher-pid\":\"$created_pid\"$created_singleton_labels},\"image\":{\"reference\":\"$created_image\",\"descriptor\":{\"digest\":\"$created_digest\"}},\"initProcess\":{\"terminal\":false}},\"status\":{\"state\":\"running\",\"startedDate\":\"2026-07-29T00:00:00Z\"}}]" \
+        > "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}.running"
+      printf '%s\n' singleton \
+        > "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}.mode"
+    fi
+    [ "${FAKE_CREATE_FAILURE_MODE:-}" != owned ] || exit 1
     printf '%s\n' "$created_id"
     ;;
   start)
@@ -333,6 +395,13 @@ case "${1:-}" in
         "${FAKE_POST_START_INSPECT_MODE:-retain}" \
         "$started_id"
       exit 73
+    fi
+    if [ -f "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}.mode" ] \
+      && [ "$(cat "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}.mode")" = singleton ]; then
+      cp \
+        "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}.running" \
+        "${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}"
+      exit 0
     fi
     if [ -t 0 ]; then
       echo "STDIN_TTY=true" >> "$FAKE_CONTAINER_LOG"
@@ -354,8 +423,55 @@ case "${1:-}" in
       "$started_id"
     exit "${FAKE_RUN_STATUS:-0}"
     ;;
+  exec)
+    state_file="${FAKE_CREATED_CONTAINER_STATE:-$FAKE_CONTAINER_LOG.container}"
+    [ -f "$state_file.mode" ] \
+      && [ "$(cat "$state_file.mode")" = singleton ] \
+      && [ -f "$state_file" ] \
+      && grep -Fq '"state":"running"' "$state_file" \
+      || exit 77
+    if printf '%s\n' "$@" | grep -Fqx '/usr/bin/test'; then
+      exit 0
+    fi
+    if printf '%s\n' "$@" \
+      | grep -Fqx '/usr/local/bin/agent-workspace-session'; then
+      workspace_host=${AGENT_WORKSPACE_ENDPOINT%:*}
+      workspace_port=${AGENT_WORKSPACE_ENDPOINT##*:}
+      set +e
+      printf 'AGENT-CONTAINER-WORKSPACE/1 %s\n' "$AGENT_WORKSPACE_TOKEN" \
+        | /usr/bin/nc -n -w 2 "$workspace_host" "$workspace_port" \
+          >/dev/null 2>&1 &
+      workspace_connect_pid=$!
+      wait "$workspace_connect_pid"
+      workspace_connect_status=$?
+      set -e
+      printf 'WORKSPACE_CONNECT_STATUS=%s\n' "$workspace_connect_status" \
+        >> "$FAKE_CONTAINER_LOG"
+    fi
+    if [ -t 0 ]; then
+      echo "STDIN_TTY=true" >> "$FAKE_CONTAINER_LOG"
+    else
+      echo "STDIN_TTY=false" >> "$FAKE_CONTAINER_LOG"
+    fi
+    if [ "${FAKE_READ_STDIN:-false}" = true ]; then
+      IFS= read -r input_line
+      printf 'READ=%s\n' "$input_line" >> "$FAKE_CONTAINER_LOG"
+    fi
+    if [ -n "${FAKE_RUN_OUTPUT:-}" ]; then
+      printf '%s\n' "$FAKE_RUN_OUTPUT"
+    fi
+    if [ -n "${FAKE_RUN_SLEEP:-}" ]; then
+      exec sleep "$FAKE_RUN_SLEEP"
+    fi
+    exit "${FAKE_RUN_STATUS:-0}"
+    ;;
   stop)
-    if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ]; then
+    if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ] \
+      && [ -f "$FAKE_CREATED_CONTAINER_STATE.mode" ] \
+      && [ "$(cat "$FAKE_CREATED_CONTAINER_STATE.mode")" = singleton ] \
+      && [ -f "$FAKE_CREATED_CONTAINER_STATE.stopped" ]; then
+      cp "$FAKE_CREATED_CONTAINER_STATE.stopped" "$FAKE_CREATED_CONTAINER_STATE"
+    elif [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ]; then
       rm -f \
         "$FAKE_CREATED_CONTAINER_STATE" \
         "$FAKE_CREATED_CONTAINER_STATE.inspect-error"

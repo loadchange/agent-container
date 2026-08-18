@@ -7,15 +7,15 @@ test_root=$(mktemp -d)
 trap 'rm -rf "$test_root"' EXIT
 
 ASSETS=(
-  agent-container
-  claude-container
-  codex-container
-  grok-container
+  agent-container-darwin-arm64
+  agent-container-runtime
   Containerfile
   Containerfile.dockerignore
   entrypoint.sh
   host-exec-client
   host-exec-broker.mjs
+  agent-workspace-connect
+  agent-workspace-session
   profiles/claude.json
   profiles/codex.json
   profiles/grok.json
@@ -87,6 +87,13 @@ make_release_source() {
   for asset in "${ASSETS[@]}"; do
     cp "$repo_root/$asset" "$source_root/$asset"
   done
+  chmod 0755 \
+    "$source_root/agent-container-darwin-arm64" \
+    "$source_root/agent-container-runtime" \
+    "$source_root/entrypoint.sh" \
+    "$source_root/host-exec-client" \
+    "$source_root/agent-workspace-connect" \
+    "$source_root/agent-workspace-session"
   write_manifest "$source_root"
 }
 
@@ -96,8 +103,8 @@ run_install() {
   shift 2
   HOME="$case_home" \
     PATH="$fixture_path" \
-    AGENT_CONTAINER_INSTALL_BASE_URL="file://$source_root" \
-    bash "$repo_root/install.sh" "$@"
+    FAKE_CONTAINER_LOG="${FAKE_CONTAINER_LOG:-$test_root/install-container.log}" \
+    bash "$repo_root/install.sh" --base-url "file://$source_root" "$@"
 }
 
 run_uninstall() {
@@ -106,9 +113,8 @@ run_uninstall() {
   shift 2
   HOME="$case_home" \
     PATH="$fixture_path" \
-    AGENT_CONTAINER_BIN=container \
     FAKE_CONTAINER_LOG="$container_log" \
-    bash "$repo_root/uninstall.sh" "$@"
+    bash "$repo_root/uninstall.sh" "$@" --container-bin container
 }
 
 default_inspect_identity() {
@@ -163,6 +169,23 @@ HOME="$argument_home" PATH="/usr/bin:/bin" \
 assert_contains "$test_root/help.out" 'Usage: install.sh [--all | --profile PROFILE ...]'
 assert_contains "$test_root/help.out" './install.sh --profile grok'
 
+checkout_home="$test_root/checkout-home"
+mkdir -p "$checkout_home"
+HOME="$checkout_home" \
+  PATH="$fixture_path" \
+  FAKE_CONTAINER_LOG="$test_root/checkout-container.log" \
+  bash "$repo_root/install.sh" --profile claude \
+  > "$test_root/checkout-install.out" \
+  2> "$test_root/checkout-install.err"
+assert_contains "$test_root/checkout-install.out" \
+  'Installed commands:       agent-container claude-container'
+[ -x "$checkout_home/.local/bin/agent-container" ] \
+  && [ -x "$checkout_home/.local/bin/claude-container" ] \
+  || fail "source checkout did not install the selected commands"
+assert_path_absent "$checkout_home/.local/bin/codex-container"
+assert_path_absent "$checkout_home/.local/bin/grok-container"
+pass "source checkout automatically uses its adjacent release"
+
 if run_install "$source_v1" "$argument_home" --profile unknown \
   > "$test_root/unknown-profile.out" 2> "$test_root/unknown-profile.err"; then
   fail "installer accepted an unknown profile"
@@ -187,6 +210,103 @@ assert_contains "$test_root/positional.err" "Unknown argument 'unexpected'"
   || fail "argument rejection mutated the install home"
 pass "installer help and profile-selection errors are deterministic and pre-mutation"
 
+for legacy_base_case in value empty; do
+  case "$legacy_base_case" in
+    value)
+      legacy_base_assignment='AGENT_CONTAINER_INSTALL_BASE_URL=https://legacy.invalid'
+      ;;
+    empty)
+      legacy_base_assignment='AGENT_CONTAINER_INSTALL_BASE_URL='
+      ;;
+  esac
+  if env HOME="$argument_home" PATH="/usr/bin:/bin" \
+    "$legacy_base_assignment" \
+    bash "$repo_root/install.sh" \
+      --base-url 'file:///does-not-exist' --profile claude \
+    > "$test_root/install-base-env-$legacy_base_case.out" \
+    2> "$test_root/install-base-env-$legacy_base_case.err"; then
+    fail "installer accepted legacy base URL environment case $legacy_base_case"
+  fi
+  assert_contains "$test_root/install-base-env-$legacy_base_case.err" \
+    'AGENT_CONTAINER_INSTALL_BASE_URL is no longer a public interface; use --base-url URL'
+  [ ! -e "$argument_home/.local" ] \
+    || fail "legacy base URL rejection mutated the install home"
+done
+pass "installer rejects set and empty legacy base URL environment values"
+
+# Uninstall runtime selection is explicit CLI state. Legacy environment knobs
+# fail before path creation, including when they are present with empty values.
+HOME="$argument_home" PATH="/usr/bin:/bin" \
+  bash "$repo_root/uninstall.sh" --help \
+  > "$test_root/uninstall-help.out" 2> "$test_root/uninstall-help.err"
+assert_contains "$test_root/uninstall-help.out" \
+  'Usage: uninstall.sh [--purge] [--container-bin PATH]'
+assert_contains "$test_root/uninstall-help.out" \
+  '--container-bin PATH'
+
+if HOME="$argument_home" PATH="/usr/bin:/bin" \
+  bash "$repo_root/uninstall.sh" --container-bin --purge \
+  > "$test_root/uninstall-bin-missing.out" \
+  2> "$test_root/uninstall-bin-missing.err"; then
+  fail "uninstaller accepted --container-bin without a value"
+fi
+assert_contains "$test_root/uninstall-bin-missing.err" \
+  '--container-bin requires a path'
+if HOME="$argument_home" PATH="/usr/bin:/bin" \
+  bash "$repo_root/uninstall.sh" --container-bin= \
+  > "$test_root/uninstall-bin-empty.out" \
+  2> "$test_root/uninstall-bin-empty.err"; then
+  fail "uninstaller accepted an empty --container-bin value"
+fi
+assert_contains "$test_root/uninstall-bin-empty.err" \
+  '--container-bin requires a path'
+if HOME="$argument_home" PATH="/usr/bin:/bin" \
+  bash "$repo_root/uninstall.sh" \
+    --container-bin container --container-bin=container \
+  > "$test_root/uninstall-bin-duplicate.out" \
+  2> "$test_root/uninstall-bin-duplicate.err"; then
+  fail "uninstaller accepted duplicate --container-bin options"
+fi
+assert_contains "$test_root/uninstall-bin-duplicate.err" \
+  '--container-bin may only be specified once'
+if HOME="$argument_home" PATH="/usr/bin:/bin" \
+  bash "$repo_root/uninstall.sh" --purge --purge \
+  > "$test_root/uninstall-purge-duplicate.out" \
+  2> "$test_root/uninstall-purge-duplicate.err"; then
+  fail "uninstaller accepted duplicate --purge options"
+fi
+assert_contains "$test_root/uninstall-purge-duplicate.err" \
+  '--purge may only be specified once'
+
+for legacy_env_case in bin bin_empty state state_empty; do
+  case "$legacy_env_case" in
+    bin) legacy_env_assignment='AGENT_CONTAINER_BIN=container' ;;
+    bin_empty) legacy_env_assignment='AGENT_CONTAINER_BIN=' ;;
+    state) legacy_env_assignment="AGENT_CONTAINER_STATE_DIR=$argument_home/.agent-container" ;;
+    state_empty) legacy_env_assignment='AGENT_CONTAINER_STATE_DIR=' ;;
+  esac
+  if env HOME="$argument_home" PATH="/usr/bin:/bin" \
+    "$legacy_env_assignment" \
+    bash "$repo_root/uninstall.sh" --container-bin container \
+    > "$test_root/uninstall-env-$legacy_env_case.out" \
+    2> "$test_root/uninstall-env-$legacy_env_case.err"; then
+    fail "uninstaller accepted legacy environment case $legacy_env_case"
+  fi
+  case "$legacy_env_case" in
+    bin*)
+      assert_contains "$test_root/uninstall-env-$legacy_env_case.err" \
+        'AGENT_CONTAINER_BIN is no longer supported; use --container-bin PATH'
+      ;;
+    state*)
+      assert_contains "$test_root/uninstall-env-$legacy_env_case.err" \
+        'AGENT_CONTAINER_STATE_DIR is unsupported; unset it'
+      ;;
+  esac
+done
+[ ! -e "$argument_home/.local" ] \
+  || fail "uninstaller argument or environment rejection mutated HOME"
+pass "uninstaller CLI validates runtime selection and rejects legacy environment knobs"
+
 # Platform checks happen before even a release-manifest fetch.
 for platform_case in non_darwin non_arm64 old_macos; do
   platform_home="$test_root/platform-$platform_case-home"
@@ -196,8 +316,8 @@ for platform_case in non_darwin non_arm64 old_macos; do
     non_darwin)
       if HOME="$platform_home" PATH="$fixture_path" \
         FAKE_UNAME_SYSTEM=Linux \
-        AGENT_CONTAINER_INSTALL_BASE_URL='file:///does-not-exist' \
-        bash "$repo_root/install.sh" > /dev/null 2> "$platform_err"; then
+        bash "$repo_root/install.sh" --base-url 'file:///does-not-exist' \
+        > /dev/null 2> "$platform_err"; then
         fail "installer accepted a non-macOS host"
       fi
       assert_contains "$platform_err" 'supported only on macOS'
@@ -205,8 +325,8 @@ for platform_case in non_darwin non_arm64 old_macos; do
     non_arm64)
       if HOME="$platform_home" PATH="$fixture_path" \
         FAKE_UNAME_MACHINE=x86_64 \
-        AGENT_CONTAINER_INSTALL_BASE_URL='file:///does-not-exist' \
-        bash "$repo_root/install.sh" > /dev/null 2> "$platform_err"; then
+        bash "$repo_root/install.sh" --base-url 'file:///does-not-exist' \
+        > /dev/null 2> "$platform_err"; then
         fail "installer accepted a non-Apple-silicon host"
       fi
       assert_contains "$platform_err" 'requires Apple silicon'
@@ -214,8 +334,8 @@ for platform_case in non_darwin non_arm64 old_macos; do
     old_macos)
       if HOME="$platform_home" PATH="$fixture_path" \
         FAKE_MACOS_VERSION=15.6 \
-        AGENT_CONTAINER_INSTALL_BASE_URL='file:///does-not-exist' \
-        bash "$repo_root/install.sh" > /dev/null 2> "$platform_err"; then
+        bash "$repo_root/install.sh" --base-url 'file:///does-not-exist' \
+        > /dev/null 2> "$platform_err"; then
         fail "installer accepted macOS older than 26"
       fi
       assert_contains "$platform_err" 'macOS 26 or newer'
@@ -225,6 +345,18 @@ for platform_case in non_darwin non_arm64 old_macos; do
     || fail "platform rejection mutated the install home"
 done
 pass "installer rejects unsupported hosts before downloads or install mutation"
+
+# The installer owns its transfer policy. A user curl configuration must not
+# silently disable the reviewed file:// release source used by this test (or
+# alter proxy/TLS behavior for a real HTTPS release).
+curlrc_home="$test_root/curlrc-home"
+mkdir -p "$curlrc_home"
+printf '%s\n' 'proto =https' > "$curlrc_home/.curlrc"
+run_install "$source_v1" "$curlrc_home" --profile claude \
+  > "$test_root/curlrc.out" 2> "$test_root/curlrc.err"
+[ -x "$curlrc_home/.local/bin/claude-container" ] \
+  || fail "installer did not publish Claude while ignoring the ambient .curlrc"
+pass "installer ignores ambient curl configuration"
 
 # The manifest is an allowlist as well as a mixed-release integrity boundary.
 manifest_home="$test_root/manifest-home"
@@ -253,9 +385,52 @@ assert_contains "$test_root/manifest-extra.err" 'unexpected entries'
   || fail "extra manifest entry published install paths"
 pass "release manifest is strict and hash mismatches fail before publication"
 
+# Manifest integrity does not make an arbitrary payload a trusted launcher.
+# Require the published binary to be the expected thin signed Apple artifact.
+native_format_home="$test_root/native-format-home"
+native_format_source="$test_root/native-format-source"
+mkdir -p "$native_format_home"
+make_release_source "$native_format_source"
+printf '%s\n' '#!/bin/bash' 'exit 0' \
+  > "$native_format_source/agent-container-darwin-arm64"
+chmod 0755 "$native_format_source/agent-container-darwin-arm64"
+write_manifest "$native_format_source"
+if run_install "$native_format_source" "$native_format_home" --profile claude \
+  > "$test_root/native-format.out" 2> "$test_root/native-format.err"; then
+  fail "installer accepted a signed-manifest shell script as the native launcher"
+fi
+assert_contains "$test_root/native-format.err" \
+  'is not a thin Mach-O 64-bit arm64 executable'
+[ ! -e "$native_format_home/.local" ] \
+  || fail "native-format rejection published install paths"
+
+signature_home="$test_root/signature-home"
+signature_source="$test_root/signature-source"
+mkdir -p "$signature_home"
+make_release_source "$signature_source"
+/usr/bin/codesign --remove-signature \
+  "$signature_source/agent-container-darwin-arm64"
+[ "$(/usr/bin/file -b "$signature_source/agent-container-darwin-arm64")" = \
+  'Mach-O 64-bit executable arm64' ] \
+  || fail "unsigned launcher fixture stopped being a thin arm64 Mach-O"
+if /usr/bin/codesign --verify --strict \
+  "$signature_source/agent-container-darwin-arm64" >/dev/null 2>&1; then
+  fail "launcher signature-removal fixture remained signed"
+fi
+write_manifest "$signature_source"
+if run_install "$signature_source" "$signature_home" --profile claude \
+  > "$test_root/signature.out" 2> "$test_root/signature.err"; then
+  fail "installer accepted an unsigned launcher with a matching manifest"
+fi
+assert_contains "$test_root/signature.err" \
+  'does not have a valid code signature'
+[ ! -e "$signature_home/.local" ] \
+  || fail "signature rejection published install paths"
+pass "launcher publication requires thin arm64 Mach-O format and a valid signature"
+
 # A profile selection is the complete desired managed set. Releases contain
-# only shared assets plus the selected wrappers/profiles, and changing the set
-# removes only commands whose project provenance is known.
+# all command aliases plus only the selected profiles, and changing the set
+# removes only top-level commands whose project provenance is known.
 selective_home="$test_root/selective-home"
 mkdir -p "$selective_home"
 run_install "$source_v1" "$selective_home" --profile grok \
@@ -271,14 +446,21 @@ for command_name in claude-container codex-container; do
   assert_path_absent "$selective_home/.local/bin/$command_name"
 done
 for asset in \
-  agent-container grok-container Containerfile Containerfile.dockerignore \
-  entrypoint.sh host-exec-client host-exec-broker.mjs profiles/grok.json; do
+  agent-container-darwin-arm64 agent-container-runtime \
+  Containerfile Containerfile.dockerignore entrypoint.sh host-exec-client \
+  host-exec-broker.mjs agent-workspace-connect agent-workspace-session \
+  profiles/grok.json; do
   [ -f "$selective_grok_release/$asset" ] \
     && [ ! -L "$selective_grok_release/$asset" ] \
     || fail "single-profile release omitted $asset"
 done
-for asset in \
-  claude-container codex-container profiles/claude.json profiles/codex.json; do
+for command_name in "${COMMANDS[@]}"; do
+  [ -L "$selective_grok_release/$command_name" ] \
+    && [ "$(readlink "$selective_grok_release/$command_name")" = \
+      agent-container-darwin-arm64 ] \
+    || fail "single-profile release has an invalid $command_name alias"
+done
+for asset in profiles/claude.json profiles/codex.json; do
   assert_path_absent "$selective_grok_release/$asset"
 done
 [ -f "$selective_grok_release/release-manifest.sha256" ] \
@@ -303,13 +485,17 @@ for command_name in agent-container claude-container codex-container; do
     || fail "multi-profile install omitted $command_name"
 done
 assert_path_absent "$selective_home/.local/bin/grok-container"
-for asset in claude-container codex-container profiles/claude.json profiles/codex.json; do
+for command_name in "${COMMANDS[@]}"; do
+  [ -L "$selective_multiple_release/$command_name" ] \
+    && [ "$(readlink "$selective_multiple_release/$command_name")" = \
+      agent-container-darwin-arm64 ] \
+    || fail "multi-profile release has an invalid $command_name alias"
+done
+for asset in profiles/claude.json profiles/codex.json; do
   [ -f "$selective_multiple_release/$asset" ] \
     || fail "multi-profile release omitted $asset"
 done
-for asset in grok-container profiles/grok.json; do
-  assert_path_absent "$selective_multiple_release/$asset"
-done
+assert_path_absent "$selective_multiple_release/profiles/grok.json"
 
 run_install "$source_v1" "$selective_home" --all \
   > "$test_root/selective-all.out" 2> "$test_root/selective-all.err"
@@ -334,8 +520,8 @@ assert_contains "$selective_home/.local/bin/codex-container" 'echo user-owned co
 selective_uninstall_log="$test_root/selective-uninstall.log"
 : > "$selective_uninstall_log"
 HOME="$selective_home" PATH="/usr/bin:/bin" \
-  AGENT_CONTAINER_BIN=definitely-missing-container \
   bash "$repo_root/uninstall.sh" \
+    --container-bin definitely-missing-container \
   > "$test_root/selective-uninstall.out" 2> "$test_root/selective-uninstall.err"
 for command_name in agent-container claude-container grok-container; do
   assert_path_absent "$selective_home/.local/bin/$command_name"
@@ -343,6 +529,42 @@ done
 assert_path_absent "$selective_root"
 assert_contains "$selective_home/.local/bin/codex-container" 'echo user-owned codex command'
 pass "single, multiple, all, replacement, and selective uninstall sets are exact"
+
+# A profile-set replacement must retain a profile command until its fixed
+# singleton resource is absent. Both a running and a stopped VM still occupy
+# the managed identity and therefore block deselection.
+singleton_hash=$(printf '%064d' 0)
+for singleton_state in running stopped; do
+  singleton_guard_home="$test_root/singleton-guard-$singleton_state-home"
+  singleton_guard_log="$test_root/singleton-guard-$singleton_state.log"
+  mkdir -p "$singleton_guard_home"
+  : > "$singleton_guard_log"
+  run_install "$source_v1" "$singleton_guard_home" --profile grok \
+    > "$test_root/singleton-guard-$singleton_state-install.out" \
+    2> "$test_root/singleton-guard-$singleton_state-install.err"
+  singleton_guard_root="$singleton_guard_home/.local/share/agent-container"
+  singleton_guard_current=$(readlink "$singleton_guard_root/current")
+  singleton_guard_json="[{\"id\":\"agent-grok-$(id -u)-singleton\",\"configuration\":{\"id\":\"agent-grok-$(id -u)-singleton\",\"labels\":{\"com.loadchange.agent-container\":\"true\",\"com.loadchange.agent-container.profile\":\"grok\",\"com.loadchange.agent-container.host-uid\":\"$(id -u)\",\"com.loadchange.agent-container.launcher-pid\":\"$$\",\"com.loadchange.agent-container.mode\":\"singleton\",\"com.loadchange.agent-container.workspace-roots-sha256\":\"$singleton_hash\",\"com.loadchange.agent-container.config-sha256\":\"$singleton_hash\"}},\"status\":{\"state\":\"$singleton_state\"}}]"
+
+  if FAKE_CONTAINER_LOG="$singleton_guard_log" \
+    FAKE_CONTAINER_LIST_JSON="$singleton_guard_json" \
+    run_install "$source_v1" "$singleton_guard_home" --profile claude \
+    > "$test_root/singleton-guard-$singleton_state.out" \
+    2> "$test_root/singleton-guard-$singleton_state.err"; then
+    fail "$singleton_state Grok singleton did not block profile replacement"
+  fi
+  assert_contains "$test_root/singleton-guard-$singleton_state.err" \
+    "managed singleton exists in state '$singleton_state'"
+  assert_contains "$test_root/singleton-guard-$singleton_state.err" \
+    'agent-container singleton stop grok'
+  [ "$(readlink "$singleton_guard_root/current")" = "$singleton_guard_current" ] \
+    || fail "$singleton_state singleton guard switched the current release"
+  [ -L "$singleton_guard_home/.local/bin/grok-container" ] \
+    || fail "$singleton_state singleton guard removed grok-container"
+  assert_path_absent "$singleton_guard_home/.local/bin/claude-container"
+  assert_contains "$singleton_guard_log" 'ARG=--all'
+done
+pass "running and stopped Grok singletons block profile replacement before mutation"
 
 # All generic assets and compatibility commands publish through one release.
 install_home="$test_root/install-home"
@@ -363,16 +585,37 @@ for asset in "${ASSETS[@]}"; do
 done
 [ -f "$release_dir/release-manifest.sha256" ] \
   || fail "release does not retain its verified manifest"
+release_launcher="$release_dir/agent-container-darwin-arm64"
+[ -f "$release_launcher" ] \
+  && [ ! -L "$release_launcher" ] \
+  && [ -x "$release_launcher" ] \
+  || fail "release launcher is not a regular executable"
+[ "$(/usr/bin/file -b "$release_launcher")" = \
+  'Mach-O 64-bit executable arm64' ] \
+  || fail "release launcher is not a thin arm64 Mach-O"
+/usr/bin/codesign --verify --strict "$release_launcher" >/dev/null 2>&1 \
+  || fail "release launcher does not have a valid code signature"
+launcher_identity=$(/usr/bin/stat -L -f '%d:%i' "$release_launcher")
 for command_name in "${COMMANDS[@]}"; do
+  release_command="$release_dir/$command_name"
+  [ -L "$release_command" ] \
+    || fail "$command_name is not a release alias"
+  [ "$(readlink "$release_command")" = agent-container-darwin-arm64 ] \
+    || fail "$command_name has the wrong release alias target"
+  [ "$(/usr/bin/stat -L -f '%d:%i' "$release_command")" = \
+    "$launcher_identity" ] \
+    || fail "$command_name does not resolve to the shared launcher inode"
+  cmp -s "$release_launcher" "$release_command" \
+    || fail "$command_name does not resolve to the shared launcher content"
+
   command_path="$install_home/.local/bin/$command_name"
   [ -x "$command_path" ] || fail "$command_name is not executable"
   [ -L "$command_path" ] || fail "$command_name is not a stable symlink"
   [ "$(readlink "$command_path")" = "$asset_root/current/$command_name" ] \
     || fail "$command_name targets the wrong release root"
-done
-for wrapper_name in claude-container codex-container grok-container; do
-  [ -x "$(dirname -- "$(readlink "$install_home/.local/bin/$wrapper_name")")/agent-container" ] \
-    || fail "$wrapper_name cannot find sibling agent-container"
+  [ "$(/usr/bin/stat -L -f '%d:%i' "$command_path")" = \
+    "$launcher_identity" ] \
+    || fail "$command_name does not resolve through current to the shared launcher"
 done
 release_count=$(find "$asset_root/releases" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d '[:space:]')
 [ "$release_count" = 1 ] || fail "fresh install created multiple releases"
@@ -416,10 +659,9 @@ done
 rollback_once="$test_root/rollback-once"
 if HOME="$rollback_home" \
   PATH="$fixture_path" \
-  AGENT_CONTAINER_INSTALL_BASE_URL="file://$source_v2" \
   FAKE_MV_FAIL_DESTINATION="$rollback_bin/grok-container" \
   FAKE_MV_ONCE_MARKER="$rollback_once" \
-  bash "$repo_root/install.sh" \
+  bash "$repo_root/install.sh" --base-url "file://$source_v2" \
   > "$test_root/rollback.out" 2> "$test_root/rollback.err"; then
   fail "late command publication failure was hidden"
 fi
@@ -459,10 +701,9 @@ cp "$selection_rollback_bin/grok-container" \
 selection_rollback_once="$test_root/selection-rollback-once"
 if HOME="$selection_rollback_home" \
   PATH="$fixture_path" \
-  AGENT_CONTAINER_INSTALL_BASE_URL="file://$source_v2" \
   FAKE_MV_FAIL_DESTINATION="$selection_rollback_bin/grok-container" \
   FAKE_MV_ONCE_MARKER="$selection_rollback_once" \
-  bash "$repo_root/install.sh" --profile grok \
+  bash "$repo_root/install.sh" --base-url "file://$source_v2" --profile grok \
   > "$test_root/selection-rollback.out" \
   2> "$test_root/selection-rollback.err"; then
   fail "late profile-set replacement failure was hidden"
@@ -526,7 +767,23 @@ fi
 assert_contains "$test_root/release-symlink.err" 'Existing release is incomplete or modified'
 [ -L "$release_symlink_dir/profiles/codex.json" ] \
   || fail "failed validation mutated the substituted release asset"
-pass "installer rejects modified or symlink-substituted immutable releases"
+
+rm -f "$release_symlink_dir/profiles/codex.json"
+cp "$source_v1/profiles/codex.json" \
+  "$release_symlink_dir/profiles/codex.json"
+rm -f "$release_symlink_dir/codex-container"
+ln -s agent-container-runtime "$release_symlink_dir/codex-container"
+if run_install "$source_v1" "$release_symlink_home" \
+  > "$test_root/release-command-link.out" \
+  2> "$test_root/release-command-link.err"; then
+  fail "installer accepted a retargeted command alias in an existing release"
+fi
+assert_contains "$test_root/release-command-link.err" \
+  'Existing release has an invalid command alias'
+[ "$(readlink "$release_symlink_dir/codex-container")" = \
+  agent-container-runtime ] \
+  || fail "failed validation mutated the retargeted command alias"
+pass "installer rejects modified assets and retargeted immutable command aliases"
 
 # Two first installs serialize before adopting the asset root.
 concurrent_home="$test_root/concurrent-home"
@@ -538,11 +795,10 @@ concurrent_gate="$test_root/concurrent-gate"
 : > "$concurrent_gate"
 HOME="$concurrent_home" \
   PATH="$fixture_path" \
-  AGENT_CONTAINER_INSTALL_BASE_URL="file://$source_v1" \
   FAKE_MV_SLEEP_DESTINATION="$concurrent_root/current" \
   FAKE_MV_SLEEP_MARKER="$concurrent_pause" \
   FAKE_MV_WAIT_FILE="$concurrent_gate" \
-  bash "$repo_root/install.sh" \
+  bash "$repo_root/install.sh" --base-url "file://$source_v1" \
   > "$test_root/concurrent-first.out" 2> "$test_root/concurrent-first.err" &
 first_installer_pid=$!
 wait_step=0
@@ -623,9 +879,15 @@ code_only_home="$test_root/code-only-home"
 mkdir -p "$code_only_home"
 run_install "$source_v1" "$code_only_home" \
   > "$test_root/code-only-install.out" 2> "$test_root/code-only-install.err"
+code_only_root="$code_only_home/.local/share/agent-container"
+code_only_release="$code_only_root/$(readlink "$code_only_root/current")"
+rm -f "$code_only_home/.local/bin/grok-container"
+cp "$code_only_release/agent-container-darwin-arm64" \
+  "$code_only_home/.local/bin/grok-container"
+chmod 0755 "$code_only_home/.local/bin/grok-container"
 HOME="$code_only_home" PATH="/usr/bin:/bin" \
-  AGENT_CONTAINER_BIN=definitely-missing-container \
   bash "$repo_root/uninstall.sh" \
+    --container-bin definitely-missing-container \
   > "$test_root/code-only.out" 2> "$test_root/code-only.err"
 [ ! -e "$code_only_home/.local/share/agent-container" ] \
   || fail "code-only uninstall required an unavailable Apple runtime"
@@ -698,10 +960,10 @@ make_owned_state "$inspect_home"
 add_profile_state "$inspect_home" claude 'agent-container-claude:latest'
 inspect_log="$test_root/inspect-container.log"
 : > "$inspect_log"
-if HOME="$inspect_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+if HOME="$inspect_home" PATH="$fixture_path" \
   FAKE_CONTAINER_LOG="$inspect_log" \
   FAKE_IMAGE_INSPECT_FAIL_REF='agent-container-claude:latest' \
-  bash "$repo_root/uninstall.sh" --purge \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
   > "$test_root/inspect.out" 2> "$test_root/inspect.err"; then
   fail "uninstaller treated a transient inspect error as image absence"
 fi
@@ -711,10 +973,10 @@ assert_install_intact "$inspect_home"
   || fail "inspect failure removed provenance state"
 
 : > "$inspect_log"
-if HOME="$inspect_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+if HOME="$inspect_home" PATH="$fixture_path" \
   FAKE_CONTAINER_LOG="$inspect_log" \
   FAKE_IMAGE_EMPTY_REF='agent-container-claude:latest' \
-  bash "$repo_root/uninstall.sh" --purge \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
   > "$test_root/inspect-empty.out" 2> "$test_root/inspect-empty.err"; then
   fail "uninstaller accepted empty successful image-inspect output"
 fi
@@ -723,6 +985,63 @@ assert_install_intact "$inspect_home"
 [ -d "$inspect_home/.agent-container" ] \
   || fail "empty inspect output removed provenance state"
 pass "incomplete or transient image provenance fails closed and stays retryable"
+
+# Native container discovery is independent of image metadata. A crash can
+# leave a labeled container before the profile meta directory is created, and
+# label corruption must not make a reserved singleton name safe to ignore.
+missing_meta_home="$test_root/missing-meta-home"
+mkdir -p "$missing_meta_home"
+run_install "$source_v1" "$missing_meta_home" \
+  > "$test_root/missing-meta-install.out" \
+  2> "$test_root/missing-meta-install.err"
+make_owned_state "$missing_meta_home"
+mkdir -p "$missing_meta_home/.agent-container/profiles/claude/home"
+missing_meta_log="$test_root/missing-meta-container.log"
+: > "$missing_meta_log"
+if HOME="$missing_meta_home" PATH="$fixture_path" \
+  FAKE_CONTAINER_LOG="$missing_meta_log" \
+  FAKE_ACTIVE_LABELED_CONTAINER=true \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
+  > "$test_root/missing-meta.out" 2> "$test_root/missing-meta.err"; then
+  fail "missing metadata bypassed a labeled native Agent container"
+fi
+assert_contains "$test_root/missing-meta.err" \
+  'a stopped or running labeled Agent container still exists'
+assert_contains "$missing_meta_log" 'ARG=--all'
+assert_not_contains "$missing_meta_log" 'ARG=delete'
+assert_install_intact "$missing_meta_home"
+[ -d "$missing_meta_home/.agent-container" ] \
+  || fail "labeled container with missing metadata lost Agent state"
+
+empty_meta_home="$test_root/empty-meta-home"
+mkdir -p "$empty_meta_home"
+run_install "$source_v1" "$empty_meta_home" \
+  > "$test_root/empty-meta-install.out" \
+  2> "$test_root/empty-meta-install.err"
+make_owned_state "$empty_meta_home"
+mkdir -p "$empty_meta_home/.agent-container/profiles/grok/home" \
+  "$empty_meta_home/.agent-container/profiles/grok/meta"
+empty_meta_log="$test_root/empty-meta-container.log"
+reserved_singleton="agent-grok-$(id -u)-singleton"
+reserved_singleton_json=$(printf \
+  '[{"id":"%s","configuration":{"id":"%s","labels":{}},"status":{"state":"running"}}]' \
+  "$reserved_singleton" "$reserved_singleton")
+: > "$empty_meta_log"
+if HOME="$empty_meta_home" PATH="$fixture_path" \
+  FAKE_CONTAINER_LOG="$empty_meta_log" \
+  FAKE_CONTAINER_LIST_JSON="$reserved_singleton_json" \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
+  > "$test_root/empty-meta.out" 2> "$test_root/empty-meta.err"; then
+  fail "empty metadata bypassed a reserved singleton container name"
+fi
+assert_contains "$test_root/empty-meta.err" \
+  'occupies a reserved Agent singleton name'
+assert_contains "$empty_meta_log" 'ARG=--all'
+assert_not_contains "$empty_meta_log" 'ARG=delete'
+assert_install_intact "$empty_meta_home"
+[ -d "$empty_meta_home/.agent-container" ] \
+  || fail "reserved singleton with empty metadata lost Agent state"
+pass "missing or empty image metadata cannot bypass native singleton discovery"
 
 # An explicit Apple 'image not found' is the sole safe absence result.
 missing_home="$test_root/missing-home"
@@ -733,10 +1052,10 @@ make_owned_state "$missing_home"
 add_profile_state "$missing_home" claude 'agent-container-claude:latest'
 missing_log="$test_root/missing-container.log"
 : > "$missing_log"
-HOME="$missing_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+HOME="$missing_home" PATH="$fixture_path" \
   FAKE_CONTAINER_LOG="$missing_log" \
   FAKE_IMAGE_MISSING_REF='agent-container-claude:latest' \
-  bash "$repo_root/uninstall.sh" --purge \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
   > "$test_root/missing.out" 2> "$test_root/missing.err"
 assert_not_contains "$missing_log" 'ARG=delete'
 [ ! -e "$missing_home/.agent-container" ] \
@@ -754,11 +1073,11 @@ add_profile_state "$retag_home" claude 'agent-container-claude:latest'
 retag_log="$test_root/retag-container.log"
 retag_state="$test_root/retag-fixture-state"
 : > "$retag_log"
-if HOME="$retag_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+if HOME="$retag_home" PATH="$fixture_path" \
   FAKE_CONTAINER_LOG="$retag_log" \
   FAKE_CONTAINER_STATE_DIR="$retag_state" \
   FAKE_IMAGE_RETAG_REF='agent-container-claude:latest' \
-  bash "$repo_root/uninstall.sh" --purge \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
   > "$test_root/retag.out" 2> "$test_root/retag.err"; then
   fail "uninstaller deleted a tag retargeted after preflight"
 fi
@@ -775,10 +1094,10 @@ make_owned_state "$delete_fail_home"
 add_profile_state "$delete_fail_home" claude 'agent-container-claude:latest'
 delete_fail_log="$test_root/delete-fail-container.log"
 : > "$delete_fail_log"
-if HOME="$delete_fail_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+if HOME="$delete_fail_home" PATH="$fixture_path" \
   FAKE_CONTAINER_LOG="$delete_fail_log" \
   FAKE_IMAGE_DELETE_FAIL_REF='agent-container-claude:latest' \
-  bash "$repo_root/uninstall.sh" --purge \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
   > "$test_root/delete-fail.out" 2> "$test_root/delete-fail.err"; then
   fail "uninstaller hid an Apple image delete failure"
 fi
@@ -820,10 +1139,10 @@ for active_kind in global concurrent label pidless; do
       printf '%s\n' claude > "$active_home/.agent-container/session.lock/profile"
       ;;
   esac
-  if env HOME="$active_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+  if env HOME="$active_home" PATH="$fixture_path" \
     FAKE_CONTAINER_LOG="$active_log" \
     FAKE_ACTIVE_LABELED_CONTAINER="$active_label" \
-    bash "$repo_root/uninstall.sh" --purge \
+    bash "$repo_root/uninstall.sh" --purge --container-bin container \
     > "$test_root/active-$active_kind.out" \
     2> "$test_root/active-$active_kind.err"; then
     fail "$active_kind activity did not block uninstall"
@@ -848,9 +1167,9 @@ make_owned_state "$list_fail_home"
 add_profile_state "$list_fail_home" claude 'agent-container-claude:latest'
 list_fail_log="$test_root/list-fail-container.log"
 : > "$list_fail_log"
-if HOME="$list_fail_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+if HOME="$list_fail_home" PATH="$fixture_path" \
   FAKE_CONTAINER_LOG="$list_fail_log" FAKE_LIST_FAIL=true \
-  bash "$repo_root/uninstall.sh" \
+  bash "$repo_root/uninstall.sh" --container-bin container \
   > "$test_root/list-fail.out" 2> "$test_root/list-fail.err"; then
   fail "uninstaller treated container-list failure as an empty list"
 fi
@@ -859,9 +1178,9 @@ assert_install_intact "$list_fail_home"
   || fail "list failure removed state"
 
 : > "$list_fail_log"
-if HOME="$list_fail_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+if HOME="$list_fail_home" PATH="$fixture_path" \
   FAKE_CONTAINER_LOG="$list_fail_log" FAKE_LIST_INVALID_JSON=true \
-  bash "$repo_root/uninstall.sh" --purge \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
   > "$test_root/list-json.out" 2> "$test_root/list-json.err"; then
   fail "uninstaller accepted invalid container-list JSON"
 fi
@@ -893,16 +1212,17 @@ mkdir -p "$overlap_state"
 printf '%s\n' 'managed by agent-container' > "$overlap_state/.agent-container-owned"
 overlap_log="$test_root/overlap-container.log"
 : > "$overlap_log"
-if HOME="$overlap_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+if HOME="$overlap_home" PATH="$fixture_path" \
   AGENT_CONTAINER_STATE_DIR="$overlap_state" \
   FAKE_CONTAINER_LOG="$overlap_log" \
-  bash "$repo_root/uninstall.sh" --purge \
+  bash "$repo_root/uninstall.sh" --purge --container-bin container \
   > "$test_root/overlap.out" 2> "$test_root/overlap.err"; then
   fail "uninstaller accepted a custom Agent state root"
 fi
 assert_install_intact "$overlap_home"
 [ -d "$overlap_state" ] || fail "custom-root rejection removed state"
-assert_contains "$test_root/overlap.err" 'Custom AGENT_CONTAINER_STATE_DIR is unsupported'
+assert_contains "$test_root/overlap.err" \
+  'AGENT_CONTAINER_STATE_DIR is unsupported; unset it'
 
 symlink_home="$test_root/symlink-home"
 outside_state="$test_root/outside-state"
@@ -934,10 +1254,10 @@ race_pause="$test_root/race-pause"
 race_gate="$test_root/race-gate"
 : > "$race_log"
 : > "$race_gate"
-HOME="$race_home" PATH="$fixture_path" AGENT_CONTAINER_BIN=container \
+HOME="$race_home" PATH="$fixture_path" \
   FAKE_CONTAINER_LOG="$race_log" \
   FAKE_LIST_SLEEP_MARKER="$race_pause" FAKE_LIST_WAIT_FILE="$race_gate" \
-  bash "$repo_root/uninstall.sh" \
+  bash "$repo_root/uninstall.sh" --container-bin container \
   > "$test_root/race-uninstall.out" 2> "$test_root/race-uninstall.err" &
 uninstaller_pid=$!
 for wait_step in 1 2 3 4 5 6 7 8 9 10; do
@@ -969,8 +1289,8 @@ lifecycle_lock="$lifecycle_home/.local/share/.agent-container.install.lock"
 mkdir "$lifecycle_lock"
 printf '%s\n' "$$" > "$lifecycle_lock/pid"
 if HOME="$lifecycle_home" PATH="/usr/bin:/bin" \
-  AGENT_CONTAINER_BIN=definitely-missing-container \
   bash "$repo_root/uninstall.sh" \
+    --container-bin definitely-missing-container \
   > "$test_root/lifecycle.out" 2> "$test_root/lifecycle.err"; then
   fail "uninstaller ignored a lifecycle lock held by an Agent session"
 fi
@@ -978,7 +1298,32 @@ assert_contains "$test_root/lifecycle.err" 'Another agent-container transaction 
 assert_install_intact "$lifecycle_home"
 rm -f "$lifecycle_lock/pid"
 rmdir "$lifecycle_lock"
-pass "shared registration gate closes launcher/uninstaller start races"
+
+# The directory record is diagnostic provenance; the canonical HOME inode is
+# the non-replaceable mutex shared with launchers. Hold it without publishing a
+# directory record and prove uninstall still stops before runtime mutation.
+lifecycle_kernel_log="$test_root/lifecycle-kernel-container.log"
+: > "$lifecycle_kernel_log"
+exec 8< "$lifecycle_home"
+/usr/bin/lockf -t 0 8 \
+  || fail "test could not acquire the canonical HOME lifecycle lock"
+set +e
+(
+  exec 8<&-
+  run_uninstall "$lifecycle_home" "$lifecycle_kernel_log"
+) > "$test_root/lifecycle-kernel.out" \
+  2> "$test_root/lifecycle-kernel.err"
+lifecycle_kernel_status=$?
+set -e
+exec 8<&-
+[ "$lifecycle_kernel_status" -ne 0 ] \
+  || fail "uninstaller bypassed a launcher-style HOME inode lock"
+assert_contains "$test_root/lifecycle-kernel.err" \
+  'Another agent-container transaction is running'
+assert_install_intact "$lifecycle_home"
+[ ! -s "$lifecycle_kernel_log" ] \
+  || fail "HOME-lock rejection reached native runtime mutation"
+pass "directory provenance and the shared HOME inode both close uninstall races"
 
 # The native-only uninstaller never invokes Docker runtime management.
 if rg -n 'docker (image|volume|info)|docker[[:space:]]+(image|volume)' \

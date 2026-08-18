@@ -8,16 +8,89 @@ RUN apt-get update \
         ca-certificates \
         curl \
         file \
+        fuse3 \
         git \
         gh \
         jq \
         less \
+        netcat-openbsd \
         openssh-client \
         procps \
         ripgrep \
+        socat \
+        sshfs \
         tar \
         util-linux \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    fuse_config=/etc/fuse.conf; \
+    touch "$fuse_config"; \
+    if ! grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' "$fuse_config"; then \
+      printf '%s\n' user_allow_other >> "$fuse_config"; \
+    fi; \
+    chmod 0644 "$fuse_config"
+
+# Apple container builders use the guest's Debian trust store rather than the
+# macOS Keychain.  The launcher may provide one macOS-verified or explicitly
+# selected PEM CA bundle as a BuildKit secret.  Its public fingerprint is an
+# ordinary build argument solely so CA changes invalidate the cached layer;
+# the bundle itself never appears in the builder argv or build metadata.
+ARG AGENT_CA_FINGERPRINT=none
+RUN --mount=type=secret,id=agent_ca_bundle \
+    set -eu; \
+    ca_secret=/run/secrets/agent_ca_bundle; \
+    case "${AGENT_CA_FINGERPRINT}" in \
+      none) [ ! -s "$ca_secret" ] ;; \
+      *) \
+        printf '%s\n' "${AGENT_CA_FINGERPRINT}" \
+          | grep -Eq '^[0-9a-f]{64}$'; \
+        test -s "$ca_secret"; \
+        ca_size=$(wc -c < "$ca_secret" | tr -d '[:space:]'); \
+        case "$ca_size" in ''|*[!0-9]*) exit 65 ;; esac; \
+        [ "$ca_size" -le 1048576 ]; \
+        [ "$(sha256sum "$ca_secret" | awk '{print $1}')" = "${AGENT_CA_FINGERPRINT}" ]; \
+        ca_dir=/usr/local/share/ca-certificates/agent-container; \
+        install -d -m 0755 "$ca_dir"; \
+        awk -v output_dir="$ca_dir" ' \
+          BEGIN { inside = 0; count = 0; valid = 1 } \
+          /^-----BEGIN CERTIFICATE-----$/ { \
+            if (inside || count >= 64) valid = 0; \
+            count += 1; \
+            output = sprintf("%s/ca-%03d.crt", output_dir, count); \
+            inside = 1; \
+            print > output; \
+            next; \
+          } \
+          /^-----END CERTIFICATE-----$/ { \
+            if (!inside) valid = 0; \
+            if (inside) { print > output; close(output) } \
+            inside = 0; \
+            next; \
+          } \
+          inside && /^[A-Za-z0-9+\/=]+$/ { print > output; next } \
+          !inside && /^[[:space:]]*$/ { next } \
+          { valid = 0 } \
+          END { if (!valid || inside || count == 0 || count > 64) exit 1 } \
+        ' "$ca_secret"; \
+        ca_count=0; \
+        for ca_file in "$ca_dir"/*.crt; do \
+          test -f "$ca_file"; \
+          ca_count=$((ca_count + 1)); \
+          openssl x509 -in "$ca_file" -noout >/dev/null; \
+          openssl x509 -in "$ca_file" -checkend 0 -noout >/dev/null; \
+          ca_not_before=$(openssl x509 -in "$ca_file" -startdate -noout); \
+          case "$ca_not_before" in notBefore=*) ;; *) exit 65 ;; esac; \
+          ca_not_before=${ca_not_before#notBefore=}; \
+          ca_not_before_epoch=$(date -u --date="$ca_not_before" '+%s'); \
+          [ "$ca_not_before_epoch" -le "$(date -u '+%s')" ]; \
+          openssl x509 -in "$ca_file" -noout -ext basicConstraints \
+            | grep -Eq '^[[:space:]]*CA:TRUE([,[:space:]]|$)'; \
+        done; \
+        [ "$ca_count" -ge 1 ] && [ "$ca_count" -le 64 ]; \
+        update-ca-certificates; \
+        ;; \
+    esac
 
 # Keep profile-specific ARGs below the common tool layer so Claude, Codex, and
 # Grok share one cached Debian setup instead of reinstalling it per profile.
@@ -83,7 +156,7 @@ RUN set -eu; \
     install_bin="$install_home/.local/bin"; \
     installer_file=/tmp/agent-native-installer; \
     install -d -m 0755 "$install_home" "$install_bin" /usr/local/bin; \
-    curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    curl --disable --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
       --retry 5 --retry-all-errors \
       "${AGENT_INSTALLER_URL}" --output "$installer_file"; \
     chmod 0600 "$installer_file"; \
@@ -91,6 +164,9 @@ RUN set -eu; \
       "HOME=$install_home" \
       "PATH=$install_bin:$PATH" \
       "SHELL=/bin/false" \
+      "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" \
+      "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" \
+      "GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt" \
       "XDG_CACHE_HOME=$install_home/.cache" \
       "XDG_DATA_HOME=$install_home/.local/share" \
       "XDG_STATE_HOME=$install_home/.local/state"; \
@@ -146,9 +222,13 @@ RUN mkdir -p /workspace /Users \
 
 COPY entrypoint.sh /usr/local/bin/agent-container-entrypoint
 COPY host-exec-client /usr/local/bin/agent-host-exec
+COPY agent-workspace-connect /usr/local/bin/agent-workspace-connect
+COPY agent-workspace-session /usr/local/bin/agent-workspace-session
 RUN chmod 0755 \
       /usr/local/bin/agent-container-entrypoint \
       /usr/local/bin/agent-host-exec \
+      /usr/local/bin/agent-workspace-connect \
+      /usr/local/bin/agent-workspace-session \
     && ln -s /usr/local/bin/agent-host-exec /usr/local/bin/host-exec
 
 WORKDIR /workspace

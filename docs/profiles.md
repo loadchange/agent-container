@@ -2,10 +2,10 @@
 
 ## Purpose
 
-An Agent profile turns the common Apple-container runtime into a launcher for
-one native Linux arm64 Agent CLI. Profiles contain declarative metadata for an
-official installer, its version channel, and the installed command. They do not
-define mounts, shell fragments, or host capabilities.
+A profile describes how the shared runtime obtains and verifies one native
+Linux arm64 Agent CLI. It does not define container lifecycle, workspace
+mounts, host commands, CA policy, or persistent services. Those are core
+runtime responsibilities and behave the same for Claude, Codex, and Grok.
 
 List the installed profiles with:
 
@@ -13,33 +13,22 @@ List the installed profiles with:
 agent-container profiles
 ```
 
-The built-in profiles are:
+| ID | Agent | Status | Official installer | Version channel | Final image payload |
+|---|---|---|---|---|---|
+| `claude` | Claude Code | preview | `https://claude.ai/install.sh` | `https://downloads.claude.ai/claude-code-releases/latest` | one ELF |
+| `codex` | Codex CLI | preview | `https://chatgpt.com/codex/install.sh` | `https://releases.openai.com/codex/channels/latest` | standalone tree |
+| `grok` | Grok CLI | preview | `https://x.ai/cli/install.sh` | `https://x.ai/cli/stable` | one ELF |
 
-| ID | Agent | Status | Official installer | Shell | Version channel | Image payload |
-|---|---|---|---|---|---|---|
-| `claude` | Claude Code | preview | `https://claude.ai/install.sh` | `bash` | `https://downloads.claude.ai/claude-code-releases/latest` | single ELF |
-| `codex` | Codex CLI | preview | `https://chatgpt.com/codex/install.sh` | `sh` | `https://releases.openai.com/codex/channels/latest` | complete standalone tree |
-| `grok` | Grok CLI | experimental | `https://x.ai/cli/install.sh` | `bash` | `https://x.ai/cli/stable` | single ELF |
-
-All three built-in profiles set `version` to `latest`; “latest” means the
-publisher channel shown in the table, including Grok's stable channel. The
-floating name is never installed directly.
-
-Experimental profiles require an explicit opt-in:
-
-```bash
-AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true agent-container grok
-```
-
-`preview` profiles are available without an opt-in, but do not claim the full
-real-Agent qualification required for `stable`.
+All three are ordinary built-in profiles. Every normal invocation reuses one
+container per profile and host UID; no profile supplies its own resident Agent
+protocol. Each terminal starts a fresh profile command with independent
+arguments, TTY, cwd, and dynamic workspace.
 
 ## Schema version 2
 
-Profiles live in `profiles/<id>.json`. The launcher uses the system
-JavaScriptCore through `osascript` to parse each file once, validate an exact
-typed key set, and extract inert values. The Codex profile illustrates every
-schema-2 field:
+Profiles live at `profiles/<id>.json`. The launcher parses them as inert JSON
+with macOS JavaScriptCore and requires one exact typed key set. The Codex file
+shows every field:
 
 ```json
 {
@@ -64,225 +53,250 @@ schema-2 field:
 }
 ```
 
-| Field | Type | Meaning and constraints |
+| Field | Type | Contract |
 |---|---|---|
-| `schema` | integer | must currently be `2` |
-| `id` | string | must equal the filename; 1–32 lowercase letters, digits, and hyphens, not starting with a digit or hyphen |
-| `displayName` | string | non-empty ASCII name limited to letters, digits, spaces, and `._+()/-` |
-| `status` | string | `stable`, `preview`, or `experimental`; only experimental profiles require an opt-in |
-| `installerKind` | string | currently only `native-script` |
-| `installerUrl` | string | HTTPS URL of the publisher's native install script, limited to safe URL characters |
-| `installerShell` | string | exactly `bash` or `sh`, according to the publisher's documented invocation |
-| `installerVersionUrl` | string | HTTPS endpoint that identifies the publisher's current release |
-| `installerVersionFormat` | string | `plain-semver` for a one-line version or `rust-tag-json` for Codex metadata whose `tag_name` starts with `rust-v` |
-| `installerVersionEnv` | string | optional environment variable through which the installer receives the resolved exact version; empty means pass it as a positional argument |
-| `installerBinDirEnv` | string | optional installer variable used to direct its visible command into `/opt/agent-native/.local/bin` |
-| `installerHomeEnv` | string | optional installer-specific state root; Codex uses `CODEX_HOME` so the complete standalone tree remains under `/opt/agent-native/.codex` |
-| `installerNonInteractiveEnv` | string | optional variable set to `1` for unattended installation; Codex uses `CODEX_NON_INTERACTIVE` |
-| `version` | string | `latest` or one exact numeric `major.minor.patch` version with an optional safe prerelease/build suffix; no range or shell syntax |
-| `command` | string | one ASCII executable basename using letters, digits, `.`, `_`, or `-`; not a path or shell command |
+| `schema` | integer | Exactly `2` |
+| `id` | string | Matches the filename; 1–32 lowercase letters, digits, or hyphens; does not start with a digit or hyphen |
+| `displayName` | string | Non-empty safe ASCII display text |
+| `status` | string | `stable`, `preview`, or `experimental` |
+| `installerKind` | string | Currently exactly `native-script` |
+| `installerUrl` | string | Safe HTTPS URL for the publisher install script |
+| `installerShell` | string | Exactly `bash` or `sh` |
+| `installerVersionUrl` | string | Safe HTTPS endpoint identifying the current publisher release |
+| `installerVersionFormat` | string | `plain-semver` or the constrained Codex `rust-tag-json` form |
+| `installerVersionEnv` | string | Optional validated variable receiving the exact version; empty means a positional argument |
+| `installerBinDirEnv` | string | Optional validated installer output-directory variable |
+| `installerHomeEnv` | string | Optional validated installer state-root variable |
+| `installerNonInteractiveEnv` | string | Optional validated unattended-install variable |
+| `version` | string | `latest` or one exact safe semantic version |
+| `command` | string | One safe executable basename, never a path or shell fragment |
 | `probeArg` | string | `--version`, `-V`, or `version` |
-| `apiKeyEnv` | string | optional uppercase `[A-Z_][A-Z0-9_]*` environment-variable name |
-| `disableAutoUpdateEnv` | string | optional uppercase `[A-Z_][A-Z0-9_]*` variable set to `1` in every session |
+| `apiKeyEnv` | string | Optional uppercase credential variable name |
+| `disableAutoUpdateEnv` | string | Optional uppercase variable set to `1` in Agent processes |
 
-Every field shown above is required, including optional-value fields, which use
-an empty string when not applicable. String values may not contain C0 control
-characters or DEL. Profiles are parsed as data and are never passed to `eval`
-or `source`. Environment-variable names and URLs are validated again before
-they enter the build.
+Every key is required, including fields whose value is an empty string. C0
+control characters and DEL are rejected. Environment names, URL characters,
+profile IDs, command names, and versions receive field-specific validation.
+The file is never sourced or evaluated as shell.
 
-The shared image recipe currently binds each built-in profile ID to its exact
-official installer URL, shell, command, and installer-variable contract. This
-prevents a valid-looking edit from silently redirecting a built-in profile.
-Schema validation limits command injection; it does not attest the publisher's
-script or downloaded executable. See [security.md](security.md).
+The shared image recipe additionally binds each built-in ID to its reviewed
+installer URL, shell, command, and installer variable contract. A syntactically
+valid edit cannot silently redirect a built-in ID to another publisher.
 
-## Version resolution and image fingerprint
+## What profiles cannot request
 
-For a `latest` profile, every launch performs these steps before image reuse is
-decided:
+Schema 2 deliberately has no fields for:
 
-1. Fetch the profile's official `installerVersionUrl` over HTTPS using the
-   ordinary host `curl` network and proxy environment. A proxy-restricted host
-   must enable its host proxy, such as `proxy_on`, before launch.
-2. Strictly parse one exact version. Plain responses must contain only a safe
-   semantic version; Codex JSON must contain a safe `rust-v...` `tag_name`.
-3. Include that exact version, the complete profile JSON, Debian base image,
-   shared `Containerfile`, context allowlist, and entrypoint in the recipe
-   fingerprint.
-4. Reuse the inspected image only when both its fingerprint and recorded OCI
-   identity match. A moved publisher channel makes the profile rebuild.
+- volume paths or workspace lists;
+- real HOME access;
+- persistent-container commands;
+- Linux capabilities or mount namespaces;
+- native host-command execution;
+- arbitrary environment inheritance;
+- SSH/GitHub/Git configuration mounts;
+- CA files, Keychain access, or TLS-verification changes;
+- Agent permission-bypass arguments.
 
-`AGENT_CONTAINER_VERSION` overrides the profile for one invocation. The value
-may be `latest` or an exact release:
+The core runtime supplies one persistent container plus per-exec SFTP/SSHFS
+workspace transport for every profile. Making that behavior profile data would
+allow an installer description to expand host authority.
 
-```bash
-AGENT_CONTAINER_VERSION=0.146.0 agent-container codex --version
-```
+## Version resolution
 
-An exact override skips the channel request. It can therefore run offline when
-the matching image is already warm, and is also the rollback mechanism. If the
-matching image is absent or stale, a cold build still needs the Debian and
-publisher download endpoints. The override does not edit the profile file.
+For a `latest` profile, every launch:
 
-The image reference remains `agent-container-<profile>:latest`; that OCI tag is
-only a local cache name and is unrelated to the publisher's release channel.
-Arbitrary cross-profile image tags would make concurrent builds and uninstall
-provenance ambiguous.
+1. requests the profile's official version endpoint with host `curl`;
+2. strictly reduces the response to one exact version;
+3. includes that value and the complete build recipe in the image fingerprint;
+4. reuses an image only when its recorded fingerprint and inspected OCI
+   identity agree.
 
-## Native build and runtime behavior
-
-The default base is the Debian Bookworm slim Linux arm64 manifest pinned by
-digest:
-
-```text
-mirror.gcr.io/library/debian:bookworm-slim@sha256:9b67294679b30e5d6ab257b40594feeb4a4b81f7fcf4131f4decf0d6a212a9b0
-```
-
-The image does not install Node.js or npm. On a cold build, the profile supplies
-these controlled arguments to the shared `Containerfile`:
-
-- `AGENT_PROFILE`;
-- `AGENT_INSTALLER_URL`;
-- `AGENT_INSTALLER_SHELL`;
-- `AGENT_INSTALLER_VERSION_ENV`;
-- `AGENT_INSTALLER_BIN_DIR_ENV`;
-- `AGENT_INSTALLER_HOME_ENV`;
-- `AGENT_INSTALLER_NONINTERACTIVE_ENV`;
-- `AGENT_VERSION`;
-- `AGENT_COMMAND`;
-- `AGENT_PROBE_ARG`.
-
-The script is downloaded over HTTPS and run with a build-only
-`HOME=/opt/agent-native`. Claude and Grok receive the exact version as a
-positional argument. Codex receives it through `CODEX_RELEASE`, together with
-`CODEX_NON_INTERACTIVE=1`, `CODEX_INSTALL_DIR`, and `CODEX_HOME`. The build then
-requires the command to resolve inside the controlled install root, verifies it
-is an ELF64 ARM aarch64 executable, and requires `--version` to report the exact
-requested release.
-
-Claude and Grok require no adjacent installer tree, so the image copies only
-their ELF to `/usr/local/bin` and removes the temporary tree. Claude uses the
-base image's glibc, while Grok is statically linked. Codex
-depends on adjacent standalone helpers and resources, so its complete versioned
-release tree remains under `/opt/agent-native/.codex/packages/standalone/` and
-`/usr/local/bin/codex` links into it.
-
-Useful build controls are:
+The floating channel string is never handed to the publisher installer. A
+channel move changes the desired recipe. Because the normal container is
+persistent, stop the profile before adopting a newly resolved image:
 
 ```bash
-AGENT_CONTAINER_VERSION="$wanted_version" agent-container codex --version
-AGENT_CONTAINER_BASE_IMAGE=mirror.example/debian:bookworm-slim agent-container codex
-AGENT_CONTAINER_REBUILD=true agent-container codex --version
-AGENT_CONTAINER_SKIP_BUILD=true agent-container codex --version
+agent-container singleton stop codex
+codex-container --version
 ```
 
-## Persistent profile HOME and updater policy
+Use a leading launcher option to select an exact version for one invocation:
 
-Every profile receives its own directory:
+```bash
+agent-container singleton stop codex
+codex-container --container-version 0.146.0 --version
+```
+
+An exact version skips the channel request and can reuse a matching warm image
+without network access. It does not edit the profile, and a cold build still
+needs the Debian and publisher endpoints.
+
+The image tag remains `agent-container-<profile>:latest`; that is a local cache
+name, not the publisher channel and not ownership proof.
+
+## Image construction and verification
+
+The default base is a digest-pinned Debian Bookworm slim arm64 image. The build
+uses a private `HOME=/opt/agent-native` and has no workspace, runtime profile
+HOME, API key, SSH agent, GitHub configuration, or host Git configuration
+mounted.
+
+Core passes only constrained profile values to the shared `Containerfile`. The
+publisher script receives the already-resolved exact version through its
+documented positional or environment interface. After installation, the recipe
+requires:
+
+- the command to resolve below the controlled install root;
+- `file` to identify an ELF64 ARM aarch64 executable;
+- the profile version probe to report the requested exact version.
+
+Claude and Grok need no adjacent install tree, so only the final ELF enters
+`/usr/local/bin`. Codex depends on adjacent helpers and resources; its complete
+versioned standalone tree remains under `/opt/agent-native/.codex` and the
+command links into it.
+
+The default `--container-extra-ca auto` bridge and an explicitly selected CA
+bundle are core policy, not profile authority. A profile identifies two known
+HTTPS endpoints; it cannot choose a host file or cause the whole macOS Keychain
+to enter the guest. A user-selected CA path must arrive through
+`--container-extra-ca`. CA contents are delivered as a BuildKit secret, while
+the public digest becomes a recipe input.
+
+Useful build controls are leading launcher options:
+
+```bash
+codex-container --container-version 0.146.0 --version
+codex-container --container-rebuild --version
+codex-container --container-skip-build --version
+codex-container --container-base-image mirror.example/debian:bookworm-slim --version
+```
+
+Changing an image input while the singleton is active fails closed. Stop it
+before rebuilding or changing version/base/CA policy.
+
+## Persistent HOME and process policy
+
+Each profile has one isolated directory:
 
 ```text
 ~/.agent-container/profiles/<id>/home/
 ```
 
-That directory is mounted as the entire guest `$HOME` at the same absolute path
-as the macOS home. For example, the Codex profile for `/Users/alice` sees
-`HOME=/Users/alice`, but `/Users/alice` contains Codex's isolated persistent
-state rather than Alice's real macOS home. This runtime shadow HOME is separate
-from the `/opt/agent-native` HOME used while building the image.
+It is mounted at the same absolute guest path as the host HOME, but it does not
+contain the real host HOME. Login state, settings, history, plugins, and caches
+persist across Agent processes, singleton stops, image replacement, and a
+normal uninstall. Different profiles never share this directory.
 
-The Agent's normal login, settings, history, plugins, and cache persist, but
-profiles never share a HOME. Credential forwarding is ordinarily explicit and
-uses the profile's recognized credential names. Most profiles recognize only
-their `apiKeyEnv`; the built-in Claude integration also recognizes
-`ANTHROPIC_AUTH_TOKEN`, a common credential for Anthropic-compatible providers.
-This compatibility alias is core policy rather than profile-defined host
-capability. In the default `auto` mode, a non-empty `ANTHROPIC_BASE_URL` makes
-that exact token part of one custom-provider bundle; `true` forwards all
-recognized credential names without requiring the endpoint, and `false` (or an
-explicitly empty switch) disables the profile credential path. When declared,
-the launcher sets the updater-disable variable on every session:
-`DISABLE_AUTOUPDATER=1` for Claude and
-`GROK_DISABLE_AUTOUPDATER=1` for Grok. Image replacement, not an in-session
-updater, owns those release changes.
+All clients of one profile do share it. A repository can therefore influence a
+later client by changing Agent-managed state or plugins. Private workspace mount
+namespaces prevent ordinary path visibility across clients but do not make
+same-profile processes mutually hostile sandboxes.
 
-The built-in Claude runtime also has a core-owned exact allowlist of
-non-credential environment settings documented in the README. Profile JSON
-cannot add automatic host environment access: future settings use the explicit
-`AGENT_CONTAINER_FORWARD_ENV=NAME1,NAME2` interface until the reviewed core
-policy is updated. Keeping this authority outside profile data also avoids
-turning a valid-looking custom profile into a request for arbitrary host
-secrets.
+If `disableAutoUpdateEnv` is non-empty, core sets it for each Agent process.
+Claude uses `DISABLE_AUTOUPDATER`; Grok uses
+`GROK_DISABLE_AUTOUPDATER`. Publisher updates then enter through host channel
+resolution and a verified image rebuild instead of mutating the running image.
+
+## Environment and credential contract
+
+`apiKeyEnv` names the profile's one primary API-key variable. Profile JSON does
+not import it automatically. `--container-forward-api-key` is off by default
+and, when enabled, expands only that active profile field. It does not grant a
+profile an alternative-token list or
+provider-specific forwarding behavior. Login state in the shadow HOME remains
+the default authentication path.
+
+No profile receives provider, endpoint, model, token, or Agent settings from
+the host automatically. Each user-supplied name outside `apiKeyEnv` must be
+authorized with `--container-forward-env`. For example:
+
+```bash
+export ANTHROPIC_BASE_URL='https://open.bigmodel.cn/api/anthropic'
+export ANTHROPIC_AUTH_TOKEN='replace-with-provider-token'
+export ANTHROPIC_MODEL='glm-5.2'
+
+claude-container \
+  --container-forward-env \
+  ANTHROPIC_BASE_URL,ANTHROPIC_AUTH_TOKEN,ANTHROPIC_MODEL
+```
+
+The option contains names only. Values are read from the exported environment
+and do not enter launcher or Apple CLI argument vectors. Secret-bearing syntax
+such as `--container-forward-env ANTHROPIC_AUTH_TOKEN=secret` is invalid.
+
+The declared primary API key can be authorized explicitly:
+
+```bash
+export OPENAI_API_KEY='...'
+codex-container --container-forward-api-key
+```
+
+These launcher options are core interfaces. A profile cannot add implicit
+environment inheritance or secret sources.
+
+## Compatibility commands
+
+The Rust host launcher dispatches from `argv[0]`:
+
+```text
+claude-container ARGS...  -> agent-container claude ARGS...
+codex-container ARGS...   -> agent-container codex ARGS...
+grok-container ARGS...    -> agent-container grok ARGS...
+```
+
+Leading `--container-*` options are consumed before profile insertion. `--`
+ends launcher parsing. The first ordinary argument also ends parsing and is
+preserved with every following `OsString`. Unknown leading namespaced options
+fail instead of leaking a typo to an Agent.
+
+The aliases also support the advanced legacy path:
+
+```text
+codex-container [launcher options] run [run options...] [-- Agent args...]
+agent-container [launcher options] run codex [run options...] [-- Agent args...]
+```
+
+The default form selects the persistent singleton; `run` selects a short-lived
+Apple-volume and host-command compatibility path. This distinction is core
+runtime behavior, not profile metadata.
 
 ## Adding a profile
 
-1. Confirm that the publisher provides a native Linux arm64 executable and an
-   HTTPS installer that supports unattended installation of one exact version.
-   A macOS Mach-O executable cannot run in the guest.
-2. Audit the installer's version-selection interface, install layout, helper
-   dependencies, checksum/signature behavior, and version probe. Do not discard
-   adjacent resources merely because the main executable is an ELF.
-3. Add `profiles/<id>.json` using every schema-2 field and start the integration
-   as `experimental`.
-4. Extend the shared `Containerfile` allowlist and native-layout validation for
-   the new official installer. Profiles cannot inject shell fragments to add
-   this behavior themselves.
-5. Validate that the file is JSON and that the launcher accepts it:
+1. Confirm the publisher supplies a native Linux arm64 executable and an HTTPS
+   installer capable of selecting one exact version.
+2. Audit version selection, checksums/signatures, unattended operation, install
+   layout, adjacent helper requirements, and the version probe.
+3. Add a complete schema-2 JSON file with a new ID and start its status as
+   `experimental`.
+4. Extend the shared `Containerfile` allowlist and layout verification for the
+   fixed official installer contract. Do not add profile-provided shell.
+5. Validate JSON and core parsing:
 
    ```bash
    plutil -convert json -o /dev/null profiles/<id>.json
    agent-container profiles
    ```
 
-6. Build and probe it from a small disposable repository:
+6. Build with source assets through the documented launcher development
+   options, then test exact version, cold and warm startup, TTY, pipes, signals,
+   login persistence, UID/GID writes, and dynamic workspace cleanup:
 
    ```bash
-   AGENT_CONTAINER_ASSET_DIR="$PWD" \
-   AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true \
-     ./agent-container <id> --version
+   ./agent-container \
+     --container-assets "$PWD" \
+     --container-enable-experimental \
+     <id> --version
    ```
+7. Test two concurrent projects against the same profile singleton and verify
+   that each receives an independent cwd/TTY/mount namespace while sharing only
+   the intended profile state.
+8. Add channel parsing, malformed-response, CA, image identity, installer
+   layout, broker authentication, and stop/status tests.
+9. Add the profile and optional compatibility alias to the installer's signed
+   release asset set.
+10. Promote to `preview` only after the real Apple-container matrix passes; use
+    `stable` only for a fully supported integration.
 
-7. Verify native ELF architecture, the exact release, interactive TTY input,
-   piped stdin, exit status, signal cleanup, login persistence, workspace writes
-   with the host UID/GID, and a second warm invocation that skips the build.
-8. Add tests for channel resolution, an exact offline override, malformed
-   channel responses, layout/resource preservation, API-key policy, isolated
-   HOME, image identity, and the experimental gate.
-9. Add the JSON file to the installer's immutable release asset list. If a
-   convenience command is wanted, add a thin wrapper that performs only:
-
-   ```bash
-   exec /path/to/agent-container <id> "$@"
-   ```
-
-10. Document Agent-specific login and any known Linux incompatibilities. Move a
-    contract-tested integration to `preview`; promote it to `stable` only after
-    the complete real Apple-container end-to-end matrix passes.
-
-Adding a profile must not add Agent-specific directories, authentication
-migration, mounts, or dangerous flags to the core launcher. If a new Agent
-needs a broader host capability, design it as a generic, default-deny runtime
-capability and update the threat model first.
-
-## Compatibility wrappers
-
-The project may install `claude-container`, `codex-container`, and
-`grok-container` as generic aliases. Their legacy form preserves Agent arguments
-exactly and does not implement profile-specific runtime behavior:
-
-```bash
-agent-container <profile> [agent arguments...]
-```
-
-Each alias also reserves a leading `run` token for the core runtime's explicit
-host-integration mode. It only inserts the alias's fixed profile ID; all runtime
-options and Agent arguments retain the same meaning as the canonical form:
-
-```bash
-<profile>-container run [runtime options...] [-- agent arguments...]
-agent-container run <profile> [runtime options...] [-- agent arguments...]
-```
-
-Additional shares, host-command discovery, broker policy, and lifecycle remain
-core runtime responsibilities. They must not be declared by or specialized for
-a profile JSON. Omitting the reserved `run` token retains the legacy boundary.
+A new profile must not add Agent-specific lifecycle, mount, service, CA, or
+permission-bypass behavior to core merely by naming similar Agent flags. Any
+new host capability requires an explicit interface and threat-model update.

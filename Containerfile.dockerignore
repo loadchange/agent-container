@@ -1,3 +1,6 @@
 **
 !entrypoint.sh
 !host-exec-client
+!agent-workspace-connect
+!agent-workspace-session
+!tests/fixtures/workspace-session-test-agent

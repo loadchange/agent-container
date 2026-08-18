@@ -11,31 +11,98 @@ COMMANDS=(
   grok-container
 )
 
-purge=false
-case "${1:-}" in
-  "") ;;
-  --purge) purge=true ;;
-  -h|--help)
-    echo "Usage: uninstall.sh [--purge]"
-    echo ""
-    echo "Removes the shared launcher and whichever profile commands were installed."
-    echo "Without --purge, all per-profile credentials and state are preserved."
-    exit 0
-    ;;
-  *)
-    echo "Usage: uninstall.sh [--purge]" >&2
-    exit 64
-    ;;
-esac
-[ "$#" -le 1 ] || {
-  echo "Usage: uninstall.sh [--purge]" >&2
-  exit 64
-}
-
 die() {
   echo "Error: $*" >&2
   exit 1
 }
+
+usage() {
+  cat <<'EOF'
+Usage: uninstall.sh [--purge] [--container-bin PATH]
+
+Remove the shared launcher and whichever profile commands were installed.
+
+Options:
+  --purge               Also remove all per-profile credentials and state.
+  --container-bin PATH  Use this Apple container CLI instead of "container".
+  -h, --help            Show this help.
+
+Examples:
+  ./uninstall.sh
+  ./uninstall.sh --purge
+  ./uninstall.sh --container-bin /usr/local/bin/container --purge
+
+Without --purge, all per-profile credentials and state are preserved.
+EOF
+}
+
+usage_die() {
+  echo "Error: $*" >&2
+  echo "Try 'uninstall.sh --help' for usage." >&2
+  exit 64
+}
+
+[ -z "${AGENT_CONTAINER_BIN+x}" ] \
+  || usage_die "AGENT_CONTAINER_BIN is no longer supported; use --container-bin PATH."
+[ -z "${AGENT_CONTAINER_STATE_DIR+x}" ] \
+  || usage_die "AGENT_CONTAINER_STATE_DIR is unsupported; unset it. Agent state always uses HOME/.agent-container."
+
+purge=false
+purge_seen=false
+container_bin=container
+container_bin_seen=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --purge)
+      [ "$purge_seen" = false ] \
+        || usage_die "--purge may only be specified once."
+      purge=true
+      purge_seen=true
+      shift
+      ;;
+    --container-bin)
+      [ "$container_bin_seen" = false ] \
+        || usage_die "--container-bin may only be specified once."
+      [ "$#" -ge 2 ] \
+        || usage_die "--container-bin requires a path."
+      case "$2" in
+        ''|-*) usage_die "--container-bin requires a path." ;;
+        *$'\n'*|*$'\r'*|*$'\t'*)
+          usage_die "--container-bin contains unsupported control characters."
+          ;;
+      esac
+      container_bin="$2"
+      container_bin_seen=true
+      shift 2
+      ;;
+    --container-bin=*)
+      [ "$container_bin_seen" = false ] \
+        || usage_die "--container-bin may only be specified once."
+      container_bin=${1#--container-bin=}
+      [ -n "$container_bin" ] \
+        || usage_die "--container-bin requires a path."
+      case "$container_bin" in
+        -*) usage_die "--container-bin requires a path." ;;
+        *$'\n'*|*$'\r'*|*$'\t'*)
+          usage_die "--container-bin contains unsupported control characters."
+          ;;
+      esac
+      container_bin_seen=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      usage_die "Positional arguments are not supported."
+      ;;
+    -*|*)
+      usage_die "Unknown argument '$1'."
+      ;;
+  esac
+done
+readonly container_bin
 
 preflight_die() {
   die "$*; uninstall made no changes."
@@ -123,6 +190,193 @@ read_single_line() {
   printf '%s\n' "$value"
 }
 
+valid_lock_owner() {
+  [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1
+  case "$1" in
+    *[!A-Za-z0-9._:-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+lock_directory_has_only() {
+  local lock_root="$1"
+  local allowed_names="$2"
+  local lock_entry lock_name
+
+  for lock_entry in \
+    "$lock_root"/* \
+    "$lock_root"/.[!.]* \
+    "$lock_root"/..?*; do
+    [ -e "$lock_entry" ] || [ -L "$lock_entry" ] || continue
+    lock_name=${lock_entry##*/}
+    case " $allowed_names " in
+      *" $lock_name "*) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+release_install_directory_lock() {
+  local current_pid current_owner
+  if [ "$lock_acquired" = true ] \
+    && [ -n "${install_lock:-}" ] \
+    && [ -d "$install_lock" ] \
+    && [ ! -L "$install_lock" ]; then
+    current_pid=$(read_single_line "$install_lock/pid" || true)
+    current_owner=$(read_single_line "$install_lock/owner" || true)
+    if [ "$current_pid" = "$$" ] \
+      && [ -n "${install_lock_owner:-}" ] \
+      && [ "$current_owner" = "$install_lock_owner" ] \
+      && lock_directory_has_only "$install_lock" "pid owner"; then
+      rm -f -- "$install_lock/pid" "$install_lock/owner"
+      rmdir -- "$install_lock" 2>/dev/null || true
+    fi
+  fi
+  lock_acquired=false
+}
+
+release_install_kernel_lock() {
+  if [ "${install_kernel_lock_acquired:-false}" = true ]; then
+    exec 9<&-
+    install_kernel_lock_acquired=false
+  fi
+}
+
+release_install_lock() {
+  release_install_directory_lock
+  release_install_kernel_lock
+}
+
+acquire_install_kernel_lock() {
+  [ "${install_kernel_lock_acquired:-false}" = false ] || return 0
+  [ -x /usr/bin/lockf ] \
+    || die "macOS /usr/bin/lockf is required for installer serialization."
+  exec 9< "$home_dir" \
+    || die "Unable to open HOME for installer locking."
+  if ! /usr/bin/lockf -t 0 9 2>/dev/null; then
+    exec 9<&-
+    die "Another agent-container transaction is running."
+  fi
+  install_kernel_lock_acquired=true
+}
+
+acquire_install_lock() {
+  local existing_pid existing_owner existing_owner_present
+  local reap_dir reap_pid reap_owner quarantine retry
+
+  install_lock_owner="$$.$RANDOM.$RANDOM"
+  valid_lock_owner "$install_lock_owner" \
+    || die "Unable to generate a safe installer lock owner token."
+  acquire_install_kernel_lock
+  retry=0
+  while ! mkdir -- "$install_lock" 2>/dev/null; do
+    retry=$((retry + 1))
+    [ "$retry" -le 20 ] \
+      || die "Could not acquire the installer lock after repeated concurrent changes: $install_lock"
+    if ! path_exists "$install_lock"; then
+      continue
+    fi
+    [ -d "$install_lock" ] && [ ! -L "$install_lock" ] \
+      || die "Unsafe installer lock path: $install_lock"
+    existing_pid=$(read_single_line "$install_lock/pid" || true)
+    case "$existing_pid" in
+      ''|0|*[!0-9]*)
+        die "Installer lock has no valid owner PID; inspect and remove it manually if stale: $install_lock"
+        ;;
+    esac
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      die "Another agent-container transaction is running (PID $existing_pid)."
+    fi
+
+    existing_owner=""
+    existing_owner_present=false
+    if path_exists "$install_lock/owner"; then
+      [ -f "$install_lock/owner" ] && [ ! -L "$install_lock/owner" ] \
+        || die "The stale installer lock has an unsafe owner record: $install_lock"
+      existing_owner=$(read_single_line "$install_lock/owner" || true)
+      valid_lock_owner "$existing_owner" \
+        || die "The stale installer lock has an invalid owner record: $install_lock"
+      existing_owner_present=true
+    fi
+    [ "$existing_owner_present" = true ] \
+      || die "A stale legacy installer lock cannot be reclaimed safely while older launchers may still be running. Verify PID $existing_pid is dead, then remove only: $install_lock"
+
+    reap_dir="$install_lock/.reap"
+    if ! mkdir -- "$reap_dir" 2>/dev/null; then
+      path_exists "$install_lock" || continue
+      [ -d "$reap_dir" ] && [ ! -L "$reap_dir" ] \
+        || die "The stale installer lock has an unsafe recovery claim: $install_lock"
+      lock_directory_has_only "$reap_dir" "pid owner" \
+        || die "The stale installer lock recovery claim contains unexpected entries."
+      reap_pid=$(read_single_line "$reap_dir/pid" || true)
+      reap_owner=$(read_single_line "$reap_dir/owner" || true)
+      if case "$reap_pid" in
+          ''|0|*[!0-9]*) false ;;
+          *) true ;;
+        esac \
+        && valid_lock_owner "$reap_owner" \
+        && kill -0 "$reap_pid" 2>/dev/null; then
+        die "Another agent-container transaction is reclaiming a stale installer lock (PID $reap_pid)."
+      fi
+      rm -f -- "$reap_dir/pid" "$reap_dir/owner"
+      rmdir -- "$reap_dir" 2>/dev/null \
+        || die "Could not clear an abandoned installer recovery claim."
+      mkdir -- "$reap_dir" \
+        || die "Could not replace an abandoned installer recovery claim."
+    fi
+    chmod 0700 "$reap_dir"
+    if ! printf '%s\n' "$$" > "$reap_dir/pid" \
+      || ! printf '%s\n' "$install_lock_owner" > "$reap_dir/owner"; then
+      rm -f -- "$reap_dir/pid" "$reap_dir/owner"
+      rmdir -- "$reap_dir" 2>/dev/null || true
+      die "Unable to publish the installer lock recovery claim."
+    fi
+
+    [ "$(read_single_line "$install_lock/pid" || true)" = "$existing_pid" ] \
+      || die "The stale installer lock changed while it was being reclaimed."
+    if [ "$existing_owner_present" = true ]; then
+      [ "$(read_single_line "$install_lock/owner" || true)" = "$existing_owner" ] \
+        || die "The stale installer lock owner changed while it was being reclaimed."
+    else
+      ! path_exists "$install_lock/owner" \
+        || die "The stale installer lock gained an owner while it was being reclaimed."
+    fi
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      rm -f -- "$reap_dir/pid" "$reap_dir/owner"
+      rmdir -- "$reap_dir" 2>/dev/null || true
+      die "The installer lock owner PID $existing_pid became active during recovery."
+    fi
+    lock_directory_has_only "$install_lock" "pid owner .reap" \
+      && lock_directory_has_only "$reap_dir" "pid owner" \
+      || die "The stale installer lock contains unexpected entries; refusing to reclaim it."
+
+    quarantine="$install_lock.reaped.$install_lock_owner"
+    ! path_exists "$quarantine" \
+      || die "The installer lock recovery quarantine already exists: $quarantine"
+    mv -- "$install_lock" "$quarantine" \
+      || die "Could not atomically quarantine the stale installer lock: $install_lock"
+    [ "$(read_single_line "$quarantine/.reap/pid" || true)" = "$$" ] \
+      && [ "$(read_single_line "$quarantine/.reap/owner" || true)" = "$install_lock_owner" ] \
+      || die "Installer lock recovery ownership changed after quarantine."
+    rm -f -- \
+      "$quarantine/pid" \
+      "$quarantine/owner" \
+      "$quarantine/.reap/pid" \
+      "$quarantine/.reap/owner"
+    rmdir -- "$quarantine/.reap" \
+      && rmdir -- "$quarantine" \
+      || die "Could not clear the quarantined stale installer lock: $quarantine"
+  done
+  chmod 0700 "$install_lock"
+  if ! printf '%s\n' "$$" > "$install_lock/pid" \
+    || ! printf '%s\n' "$install_lock_owner" > "$install_lock/owner"; then
+    rm -f -- "$install_lock/pid" "$install_lock/owner"
+    rmdir -- "$install_lock" 2>/dev/null || true
+    die "Unable to publish installer lock ownership."
+  fi
+  lock_acquired=true
+}
+
 valid_profile_id() {
   [ "${#1}" -le 32 ] || return 1
   case "$1" in
@@ -139,15 +393,37 @@ valid_sha256() {
   esac
 }
 
+resolve_current_release() {
+  local current_link release_id release_dir
+
+  [ -n "$owned_asset_root" ] || return 1
+  [ -L "$owned_asset_root/current" ] || return 1
+  current_link=$(readlink "$owned_asset_root/current") || return 1
+  case "$current_link" in
+    releases/*) release_id=${current_link#releases/} ;;
+    *) return 1 ;;
+  esac
+  valid_sha256 "$release_id" || return 1
+  release_dir="$owned_asset_root/releases/$release_id"
+  [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || return 1
+  [ "$(physical_dir "$release_dir" || true)" = "$release_dir" ] || return 1
+  [ "$(read_single_line "$release_dir/.agent-container-release" || true)" = \
+    "$release_id" ] \
+    || return 1
+  printf '%s\n' "$release_dir"
+}
+
 is_project_command() {
   local command_path="$1"
   local command_name="$2"
-  local expected_target
+  local expected_target expected_release_dir expected_launcher
 
-  [ -n "$owned_asset_root" ] || return 1
-  expected_target="$owned_asset_root/current/$command_name"
+  [ -n "${owned_current_release:-}" ] || return 1
+  expected_release_dir="$owned_current_release"
+  expected_target="$expected_release_dir/$command_name"
   if [ -L "$command_path" ] \
-    && [ "$(readlink "$command_path")" = "$expected_target" ]; then
+    && [ "$(readlink "$command_path")" = \
+      "$owned_asset_root/current/$command_name" ]; then
     return 0
   fi
   if [ -f "$command_path" ] \
@@ -157,7 +433,31 @@ is_project_command() {
     && cmp -s "$command_path" "$expected_target"; then
     return 0
   fi
+
+  # New releases expose every command as the same exact relative alias. This
+  # branch recognizes a copied regular launcher during migration without
+  # trusting an arbitrary symlink target inside the managed release.
+  expected_launcher="$expected_release_dir/agent-container-darwin-arm64"
+  if [ -f "$command_path" ] \
+    && [ ! -L "$command_path" ] \
+    && [ -L "$expected_target" ] \
+    && [ "$(readlink "$expected_target")" = agent-container-darwin-arm64 ] \
+    && [ -f "$expected_launcher" ] \
+    && [ ! -L "$expected_launcher" ] \
+    && cmp -s "$command_path" "$expected_launcher"; then
+    return 0
+  fi
   return 1
+}
+
+current_release_publishes_command() {
+  local command_name="$1"
+  local profile_id profile_path
+
+  [ "$command_name" = agent-container ] && return 0
+  profile_id=${command_name%-container}
+  profile_path="$owned_current_release/profiles/$profile_id.json"
+  path_exists "$profile_path"
 }
 
 check_session_directory() {
@@ -190,14 +490,12 @@ home_dir=$(physical_dir "$home_input")
 install_dir_input="$home_input/.local/bin"
 asset_root_input="$home_input/.local/share/agent-container"
 state_root_input="$home_dir/.agent-container"
-if [ -n "${AGENT_CONTAINER_STATE_DIR:-}" ] \
-  && [ "$AGENT_CONTAINER_STATE_DIR" != "$state_root_input" ]; then
-  die "Custom AGENT_CONTAINER_STATE_DIR is unsupported; expected $state_root_input"
-fi
 
 local_root_created=false
 share_dir_created=false
 lock_acquired=false
+install_lock_owner=""
+install_kernel_lock_acquired=false
 tmp_dir=""
 local_root=""
 share_dir=""
@@ -206,11 +504,8 @@ cleanup() {
   local cleanup_root
   trap - EXIT INT TERM HUP
   set +e
-  if [ "$lock_acquired" = true ] && [ -n "${install_lock:-}" ]; then
-    rm -f -- "$install_lock/pid"
-    rmdir -- "$install_lock" 2>/dev/null
-  fi
   [ -z "$tmp_dir" ] || rm -rf -- "$tmp_dir"
+  release_install_directory_lock
   if [ "$share_dir_created" = true ]; then
     cleanup_root="${share_dir:-${share_dir_input:-}}"
     [ -z "$cleanup_root" ] || rmdir -- "$cleanup_root" 2>/dev/null
@@ -219,18 +514,20 @@ cleanup() {
     cleanup_root="${local_root:-${local_root_input:-}}"
     [ -z "$cleanup_root" ] || rmdir -- "$cleanup_root" 2>/dev/null
   fi
+  release_install_kernel_lock
   exit "$status"
 }
 trap cleanup EXIT
 restore_signal_traps
 
 # Acquire the same transaction lock as install.sh and keep it through EXIT.
+ignore_signals
+acquire_install_kernel_lock
+
 local_root_input="$home_input/.local"
 if ! path_exists "$local_root_input"; then
-  ignore_signals
   mkdir -- "$local_root_input"
   local_root_created=true
-  restore_signal_traps
 fi
 [ -d "$local_root_input" ] \
   || die "Unsafe local install root: $local_root_input"
@@ -240,10 +537,8 @@ path_is_within "$home_dir" "$local_root" \
 
 share_dir_input="$home_input/.local/share"
 if ! path_exists "$share_dir_input"; then
-  ignore_signals
   mkdir -- "$share_dir_input"
   share_dir_created=true
-  restore_signal_traps
 fi
 [ -d "$share_dir_input" ] \
   || die "Unsafe local share path: $share_dir_input"
@@ -252,29 +547,7 @@ path_is_within "$home_dir" "$share_dir" \
   || die "Local share path resolves outside HOME: $share_dir_input"
 
 install_lock="$share_dir/.agent-container.install.lock"
-ignore_signals
-if ! mkdir -- "$install_lock" 2>/dev/null; then
-  [ -d "$install_lock" ] && [ ! -L "$install_lock" ] \
-    || die "Unsafe installer lock path: $install_lock"
-  existing_pid=""
-  if [ -f "$install_lock/pid" ] && [ ! -L "$install_lock/pid" ]; then
-    existing_pid=$(sed -n '1p' "$install_lock/pid" 2>/dev/null || true)
-  fi
-  case "$existing_pid" in
-    ''|0|*[!0-9]*)
-      die "Installer lock has no valid owner PID; inspect and remove it manually if stale: $install_lock"
-      ;;
-  esac
-  if kill -0 "$existing_pid" 2>/dev/null; then
-    die "Another agent-container transaction is running (PID $existing_pid)."
-  fi
-  rm -f -- "$install_lock/pid"
-  rmdir -- "$install_lock" 2>/dev/null \
-    || die "Could not clear stale installer lock: $install_lock"
-  mkdir -- "$install_lock"
-fi
-lock_acquired=true
-printf '%s\n' "$$" > "$install_lock/pid"
+acquire_install_lock
 restore_signal_traps
 
 ignore_signals
@@ -284,12 +557,16 @@ echo "Uninstalling agent-container..."
 
 # ----- Complete read-only provenance and activity preflight -----
 owned_asset_root=""
+owned_current_release=""
 if path_exists "$asset_root_input"; then
   owned_asset_root=$(canonical_safe_root "$asset_root_input" || true)
   [ -n "$owned_asset_root" ] \
     || preflight_die "unsafe managed-asset path: $asset_root_input"
   marker_matches "$owned_asset_root/.agent-container-install-owned" "$INSTALL_MARKER_TEXT" \
     || preflight_die "managed-asset root has no valid ownership marker: $owned_asset_root"
+  owned_current_release=$(resolve_current_release || true)
+  [ -n "$owned_current_release" ] \
+    || preflight_die "managed-asset root has no valid current release: $owned_asset_root"
 fi
 
 resolved_install_dir=""
@@ -314,7 +591,7 @@ for ((command_index = 0; command_index < ${#COMMANDS[@]}; command_index++)); do
     if is_project_command "$command_path" "$command_name"; then
       command_owned[$command_index]=true
     elif [ -z "$owned_asset_root" ] \
-      || path_exists "$owned_asset_root/current/$command_name"; then
+      || current_release_publishes_command "$command_name"; then
       preflight_die "unrecognized command was kept: $command_path"
     fi
   fi
@@ -363,9 +640,42 @@ if [ -n "$owned_state_root" ]; then
   fi
 fi
 
+# Enumerate native containers whenever managed state exists, independently of
+# image metadata.  A singleton can survive a crash before (or while) its image
+# provenance is published, so missing profile metadata must never turn native
+# container discovery into an optional step.
+#
+# Apple container list emits ManagedContainer JSON whose raw labels live at
+# configuration.labels. Include stopped records because SIGKILL can land after
+# verified create but before attached start. A reserved singleton name is also
+# treated as active/indeterminate even if its labels were lost or corrupted;
+# adopting or ignoring a name-only resource would both be unsafe.
+if [ -n "$owned_state_root" ]; then
+  command -v "$container_bin" >/dev/null 2>&1 \
+    || preflight_die "Apple container CLI is unavailable, so active sessions cannot be determined"
+  all_containers="$tmp_dir/all-containers.json"
+  if ! "$container_bin" list --all --format json > "$all_containers" 2> "$tmp_dir/container-list.err"; then
+    preflight_die "Apple container service/list is unavailable, so active sessions cannot be determined"
+  fi
+  plutil_bin=$(command -v plutil || true)
+  [ -n "$plutil_bin" ] \
+    || preflight_die "macOS plutil is unavailable, so container-list JSON cannot be validated"
+  "$plutil_bin" -convert json -o - "$all_containers" >/dev/null 2>&1 \
+    || preflight_die "Apple container list returned invalid JSON"
+  if grep -Eq '"com\.loadchange\.agent-container"[[:space:]]*:[[:space:]]*"true"' \
+    "$all_containers"; then
+    preflight_die "a stopped or running labeled Agent container still exists"
+  fi
+  if grep -Eq '"id"[[:space:]]*:[[:space:]]*"agent-(claude|codex|grok)-[0-9]+-singleton"' \
+    "$all_containers"; then
+    preflight_die "a stopped or running container occupies a reserved Agent singleton name"
+  fi
+fi
+
 # Collect and validate every profile's image provenance before contacting the
-# runtime. An empty/incomplete meta directory can represent a build interrupted
-# before provenance publication, so it fails closed instead of guessing.
+# image store. An empty/incomplete meta directory can represent a build
+# interrupted before provenance publication, so it fails closed instead of
+# guessing.
 image_refs=()
 image_identities=()
 image_present=()
@@ -415,29 +725,6 @@ if [ -n "$owned_state_root" ]; then
         image_identities[${#image_identities[@]}]="$expected_identity"
       fi
     done
-  fi
-fi
-
-# Apple container list emits ManagedContainer JSON whose raw labels live at
-# configuration.labels. Include stopped records because SIGKILL can land after
-# verified create but before attached start; uninstall must not remove the image
-# or state needed to recover that project-owned container.
-container_bin="${AGENT_CONTAINER_BIN:-container}"
-if [ "${#image_refs[@]}" -gt 0 ]; then
-  command -v "$container_bin" >/dev/null 2>&1 \
-    || preflight_die "Apple container CLI is unavailable, so active sessions cannot be determined"
-  all_containers="$tmp_dir/all-containers.json"
-  if ! "$container_bin" list --all --format json > "$all_containers" 2> "$tmp_dir/container-list.err"; then
-    preflight_die "Apple container service/list is unavailable, so active sessions cannot be determined"
-  fi
-  plutil_bin=$(command -v plutil || true)
-  [ -n "$plutil_bin" ] \
-    || preflight_die "macOS plutil is unavailable, so container-list JSON cannot be validated"
-  "$plutil_bin" -convert json -o - "$all_containers" >/dev/null 2>&1 \
-    || preflight_die "Apple container list returned invalid JSON"
-  if grep -Eq '"com\.loadchange\.agent-container"[[:space:]]*:[[:space:]]*"true"' \
-    "$all_containers"; then
-    preflight_die "a stopped or running labeled Agent container still exists"
   fi
 fi
 

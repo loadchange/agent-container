@@ -1,0 +1,105 @@
+#!/bin/bash
+set -euo pipefail
+
+write_marker() {
+  printf '%s\n' "$2" > "$1"
+}
+
+write_identity() {
+  local base=$1
+  local start_time
+
+  start_time=$(/usr/bin/awk '{ print $22 }' "/proc/$$/stat")
+  case "$start_time" in ""|0|*[!0-9]*) exit 70 ;; esac
+  write_marker "$base.pid" "$$"
+  write_marker "$base.start" "$start_time"
+}
+
+run_child() {
+  local prefix=$1
+  local kind=$2
+
+  if [ "$kind" = stubborn ]; then
+    trap '' TERM
+  else
+    trap 'write_marker "$PWD/$prefix.$kind.term" TERM; exit 0' TERM
+  fi
+  write_identity "$PWD/$prefix.$kind"
+  while :; do
+    /bin/sleep 1
+  done
+}
+
+spawn_tree() {
+  local prefix=$1
+  local attempt
+
+  "$0" child "$prefix" ordinary &
+  /usr/bin/setsid "$0" child "$prefix" detached &
+  /usr/bin/setsid "$0" orphan-parent "$prefix" &
+  for attempt in $(/usr/bin/seq 1 200); do
+    if [ -s "$PWD/$prefix.ordinary.pid" ] \
+      && [ -s "$PWD/$prefix.ordinary.start" ] \
+      && [ -s "$PWD/$prefix.detached.pid" ] \
+      && [ -s "$PWD/$prefix.detached.start" ] \
+      && [ -s "$PWD/$prefix.stubborn.pid" ] \
+      && [ -s "$PWD/$prefix.stubborn.start" ]; then
+      return 0
+    fi
+    /bin/sleep 0.01
+  done
+  {
+    printf 'workspace-session-test-agent: descendants did not become ready.\n'
+    /usr/bin/id
+    /usr/bin/stat -c 'cwd=%n uid=%u gid=%g mode=%a type=%F' -- "$PWD"
+    /usr/bin/findmnt -rn -M "$PWD" -o TARGET,FSTYPE,OPTIONS || true
+    /bin/cat /proc/self/cgroup
+    /usr/bin/ps -o pid=,ppid=,sid=,pgid=,stat=,comm= -p "$$"
+  } >&2
+  return 70
+}
+
+case "${1:-}" in
+  child)
+    [ "$#" -eq 3 ] || exit 64
+    run_child "$2" "$3"
+    ;;
+  orphan-parent)
+    [ "$#" -eq 2 ] || exit 64
+    "$0" child "$2" stubborn &
+    orphan_pid=$!
+    disown "$orphan_pid" 2>/dev/null || true
+    exit 0
+    ;;
+  exit-tree)
+    [ "$#" -eq 3 ] || exit 64
+    spawn_tree "$2"
+    exit "$3"
+    ;;
+  wait-tree)
+    [ "$#" -eq 2 ] || exit 64
+    prefix=$2
+    trap 'write_marker "$PWD/$prefix.main.term" TERM; exit 0' TERM
+    spawn_tree "$prefix"
+    write_identity "$PWD/$prefix.main"
+    write_marker "$PWD/$prefix.ready" "$$"
+    while :; do
+      write_marker "$PWD/$prefix.heartbeat" "$(/bin/date +%s%N)"
+      /bin/sleep 0.05
+    done
+    ;;
+  idle-tree)
+    [ "$#" -eq 2 ] || exit 64
+    prefix=$2
+    trap 'write_marker "$PWD/$prefix.main.term" TERM; exit 0' TERM
+    spawn_tree "$prefix"
+    write_identity "$PWD/$prefix.main"
+    write_marker "$PWD/$prefix.ready" "$$"
+    while :; do
+      /bin/sleep 1
+    done
+    ;;
+  *)
+    exit 64
+    ;;
+esac

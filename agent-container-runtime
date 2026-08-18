@@ -1,0 +1,4499 @@
+#!/bin/bash
+set -euo pipefail
+
+# Internal hardened runtime. The public commands are the Rust launcher and its
+# profile aliases; this script owns cold image preparation and container state.
+
+readonly PROGRAM_NAME="agent-container"
+readonly MIN_CONTAINER_VERSION="1.2.0"
+readonly MAX_PROFILE_ID_LENGTH=32
+readonly VIRTIOFS_ISSUE_URL="https://github.com/apple/container/issues/1097"
+readonly OWNERSHIP_MARKER_TEXT="managed by agent-container"
+readonly DEFAULT_BASE_IMAGE="mirror.gcr.io/library/debian:bookworm-slim@sha256:9b67294679b30e5d6ab257b40594feeb4a4b81f7fcf4131f4decf0d6a212a9b0"
+# An installed Mach-O may remain in dyld/security validation for several
+# seconds before Rust reaches main. A separate watchdog bounds wall time even
+# when launching each 50 ms polling sleep is itself delayed.
+readonly WORKSPACE_BROKER_READY_TIMEOUT_SECONDS=30
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "Warning: $*" >&2
+}
+
+is_true() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+reject_control_characters() {
+  local setting_name="$1"
+  local setting_value="$2"
+
+  # Environment values are later used as native CLI arguments and persistent
+  # configuration fields. Reject every representable ASCII control character
+  # up front so neither interface can be split or made ambiguous. Shell
+  # environment variables cannot contain NUL.
+  case "$setting_value" in
+    *$'\n'*|*$'\r'*|*$'\t'*)
+      die "$setting_name contains unsupported control characters."
+      ;;
+  esac
+  if printf '%s' "$setting_value" \
+    | LC_ALL=C grep '[[:cntrl:]]' >/dev/null; then
+    die "$setting_name contains unsupported control characters."
+  fi
+}
+
+# Apple's optional host.container.internal bridge is reachable from builder and
+# guest VMs, but its documentation-only address is not a host-side route to a
+# loopback listener. Keep the proxy URL unchanged (including HTTPS proxy SNI)
+# and give only host curl a DNS-cache override for that exact authority.
+host_proxy_resolve_override() {
+  local authority host_port lower_host_port port proxy_rest proxy_url
+
+  proxy_url="$1"
+  [ -n "$proxy_url" ] || return 1
+  case "$proxy_url" in
+    *://*) proxy_rest=${proxy_url#*://} ;;
+    *) proxy_rest=$proxy_url ;;
+  esac
+  authority=${proxy_rest%%/*}
+  case "$authority" in
+    *'?'*|*'#'*) return 1 ;;
+  esac
+  # Proxy credentials may contain colons; the final @ separates userinfo from
+  # the host authority. Percent-encoded @ remains unambiguous.
+  host_port=${authority##*@}
+  lower_host_port=$(printf '%s' "$host_port" | tr '[:upper:]' '[:lower:]')
+  case "$lower_host_port" in
+    host.container.internal)
+      # curl's proxy default is port 1080 when no explicit port is present.
+      port=1080
+      ;;
+    host.container.internal:*)
+      port=${host_port#*:}
+      case "$port" in
+        ''|*[!0-9]*) return 1 ;;
+      esac
+      [ "${#port}" -le 5 ] \
+        && [ "$port" -ge 1 ] 2>/dev/null \
+        && [ "$port" -le 65535 ] 2>/dev/null \
+        || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf 'host.container.internal:%s:127.0.0.1\n' "$port"
+}
+
+version_at_least() {
+  local actual="$1"
+  local required="$2"
+  local actual_major actual_minor actual_patch
+  local required_major required_minor required_patch
+
+  IFS=. read -r actual_major actual_minor actual_patch <<EOF
+$actual
+EOF
+  IFS=. read -r required_major required_minor required_patch <<EOF
+$required
+EOF
+
+  [ "${actual_major:-0}" -gt "${required_major:-0}" ] && return 0
+  [ "${actual_major:-0}" -lt "${required_major:-0}" ] && return 1
+  [ "${actual_minor:-0}" -gt "${required_minor:-0}" ] && return 0
+  [ "${actual_minor:-0}" -lt "${required_minor:-0}" ] && return 1
+  [ "${actual_patch:-0}" -ge "${required_patch:-0}" ]
+}
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    die "shasum or sha256sum is required."
+  fi
+}
+
+sha256_stream() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    sha256sum | awk '{print $1}'
+  fi
+}
+
+sha256_tree() {
+  local root="$1"
+  [ -d "$root" ] && [ ! -L "$root" ] \
+    || die "Cannot fingerprint an unsafe directory tree: $root"
+  (
+    cd "$root"
+    LC_ALL=C /usr/bin/tar -cf - .
+  ) | sha256_stream
+}
+
+bounded_file_count() {
+  local root="$1"
+  local limit="$2"
+  local count error_file first_error
+
+  error_file=$(mktemp "${TMPDIR:-/tmp}/agent-container-find.XXXXXX") \
+    || die "Unable to create a temporary file for the workspace safety scan."
+
+  # Stop after limit+1 NUL-delimited paths. Temporarily disable pipefail because
+  # find is expected to receive SIGPIPE once the bounded reader exits. Any real
+  # traversal error is captured separately and fails closed.
+  set +o pipefail
+  count=$(
+    find "$root" -mindepth 1 -print0 2>"$error_file" \
+      | (
+          bounded_count=0
+          while IFS= read -r -d '' ignored_path; do
+            bounded_count=$((bounded_count + 1))
+            [ "$bounded_count" -gt "$limit" ] && break
+          done
+          printf '%s\n' "$bounded_count"
+        )
+  )
+  set -o pipefail
+
+  if [ -s "$error_file" ]; then
+    first_error=$(sed -n '1p' "$error_file")
+    rm -f "$error_file"
+    die "Unable to safely scan workspace '$root': $first_error"
+  fi
+  rm -f "$error_file"
+  case "$count" in
+    ''|*[!0-9]*) die "Workspace safety scan returned an invalid file count." ;;
+  esac
+  printf '%s\n' "$count"
+}
+
+resolve_absolute_dir() {
+  (CDPATH= cd -- "$1" 2>/dev/null && pwd -P)
+}
+
+canonical_data_dir() {
+  local target="$1"
+  local parent base canonical_parent
+  if [ -L "$target" ] && [ ! -e "$target" ]; then
+    die "Refusing a broken symlink as a writable data path: $target"
+  fi
+  if [ -e "$target" ]; then
+    [ -d "$target" ] || die "Expected a directory path, found a file: $target"
+    resolve_absolute_dir "$target"
+    return
+  fi
+  parent=$(dirname -- "$target")
+  base=$(basename -- "$target")
+  [ -d "$parent" ] \
+    || die "Parent directory must already exist for custom data path: $parent"
+  canonical_parent=$(resolve_absolute_dir "$parent")
+  printf '%s/%s\n' "$canonical_parent" "$base"
+}
+
+path_contains() {
+  local parent="$1"
+  local child="$2"
+  if [ "$parent" = / ]; then
+    case "$child" in
+      /*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  case "$child/" in
+    "$parent/"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+paths_overlap() {
+  path_contains "$1" "$2" || path_contains "$2" "$1"
+}
+
+array_contains_value() {
+  local wanted="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    [ "$candidate" = "$wanted" ] && return 0
+  done
+  return 1
+}
+
+is_empty_dir() {
+  local first_entry
+  [ -d "$1" ] || return 0
+  if ! first_entry=$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>&1); then
+    return 1
+  fi
+  [ -z "$first_entry" ]
+}
+
+ownership_marker_valid() {
+  local marker="$1"
+  [ -f "$marker" ] \
+    && [ ! -L "$marker" ] \
+    && cmp -s "$marker" <(printf '%s\n' "$OWNERSHIP_MARKER_TEXT")
+}
+
+validate_marker_path() {
+  local marker="$1"
+  if [ -L "$marker" ] || { [ -e "$marker" ] && [ ! -f "$marker" ]; }; then
+    die "Refusing an unsafe agent-container ownership marker: $marker"
+  fi
+  if [ -f "$marker" ] && ! ownership_marker_valid "$marker"; then
+    die "Refusing an invalid agent-container ownership marker: $marker"
+  fi
+}
+
+validate_managed_directory() {
+  local directory="$1"
+  if [ -L "$directory" ]; then
+    die "Refusing a symlink as a managed directory: $directory"
+  fi
+  if [ -e "$directory" ] && [ ! -d "$directory" ]; then
+    die "Expected a managed directory, found another file type: $directory"
+  fi
+}
+
+validate_volume_source_path() {
+  local source="$1"
+  case "$source" in
+    *:*)
+      die "Apple container 1.2 cannot bind-mount a macOS path containing ':': $source"
+      ;;
+  esac
+}
+
+atomic_write_line() {
+  local destination="$1"
+  local value="$2"
+  local parent temporary
+  if [ -L "$destination" ] \
+    || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
+    die "Refusing to replace an unsafe state file: $destination"
+  fi
+  parent=$(dirname -- "$destination")
+  temporary=$(mktemp "$parent/.agent-container-write.XXXXXX") \
+    || die "Unable to create a temporary file in $parent."
+  if ! printf '%s\n' "$value" > "$temporary"; then
+    rm -f "$temporary"
+    die "Unable to write temporary state in $parent."
+  fi
+  chmod 0600 "$temporary"
+  # Recheck immediately before rename. A same-directory mv atomically replaces
+  # an existing regular file, so readers never observe an absent destination.
+  if [ -L "$destination" ] \
+    || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
+    rm -f "$temporary"
+    die "Refusing to replace an unsafe state file: $destination"
+  fi
+  if ! mv -f "$temporary" "$destination"; then
+    rm -f "$temporary"
+    die "Unable to atomically publish state at $destination."
+  fi
+}
+
+read_single_line() {
+  local file="$1"
+  local value
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  IFS= read -r value < "$file" || return 1
+  [ -n "$value" ] || return 1
+  cmp -s "$file" <(printf '%s\n' "$value") || return 1
+  printf '%s\n' "$value"
+}
+
+lifecycle_lock_acquired=false
+lifecycle_lock=""
+lifecycle_lock_owner=""
+lifecycle_kernel_lock_acquired=false
+
+valid_lock_owner() {
+  [ -n "$1" ] && [ "${#1}" -le 128 ] || return 1
+  case "$1" in
+    *[!A-Za-z0-9._:-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+lock_directory_has_only() {
+  local lock_root="$1"
+  local allowed_names="$2"
+  local lock_entry lock_name
+
+  for lock_entry in \
+    "$lock_root"/* \
+    "$lock_root"/.[!.]* \
+    "$lock_root"/..?*; do
+    [ -e "$lock_entry" ] || [ -L "$lock_entry" ] || continue
+    lock_name=${lock_entry##*/}
+    case " $allowed_names " in
+      *" $lock_name "*) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+release_lifecycle_lock() {
+  local current_pid current_owner
+  if [ "$lifecycle_lock_acquired" = true ] \
+    && [ -n "$lifecycle_lock" ] \
+    && [ -d "$lifecycle_lock" ] \
+    && [ ! -L "$lifecycle_lock" ]; then
+    current_pid=$(read_single_line "$lifecycle_lock/pid" || true)
+    current_owner=$(read_single_line "$lifecycle_lock/owner" || true)
+    if [ "$current_pid" = "$$" ] \
+      && [ -n "$lifecycle_lock_owner" ] \
+      && [ "$current_owner" = "$lifecycle_lock_owner" ] \
+      && lock_directory_has_only "$lifecycle_lock" "pid owner"; then
+      rm -f "$lifecycle_lock/pid" "$lifecycle_lock/owner"
+      rmdir "$lifecycle_lock" 2>/dev/null || true
+    fi
+  fi
+  lifecycle_lock_acquired=false
+  if [ "$lifecycle_kernel_lock_acquired" = true ]; then
+    exec 9<&-
+    lifecycle_kernel_lock_acquired=false
+  fi
+}
+
+acquire_lifecycle_lock() {
+  local wait_for_lock="${1:-false}"
+  local local_root_input local_root share_dir_input share_dir lifecycle_pid
+  local lifecycle_owner lifecycle_owner_present lifecycle_reap
+  local lifecycle_reap_pid lifecycle_reap_owner lifecycle_quarantine
+  local lifecycle_retry
+
+  [ "$lifecycle_lock_acquired" = false ] || return 0
+
+  # Install/uninstall hold this mutex for their complete transaction. A normal
+  # launcher releases it after durable PID registration. Singleton creation
+  # deliberately keeps it until the stable service has reached READY.
+  [ -x /usr/bin/lockf ] \
+    || die "macOS /usr/bin/lockf is required for lifecycle serialization."
+  # Lock the canonical HOME inode rather than a removable state directory.
+  # Child processes intentionally inherit this descriptor: if the launcher is
+  # killed during a synchronous native mutation, recovery waits until that
+  # mutation also exits. The project never removes or renames HOME, so every
+  # launcher/install/uninstall observes the same kernel lock generation.
+  exec 9< "$host_home_dir" \
+    || die "Unable to open the host home directory for lifecycle locking."
+  if ! /usr/bin/lockf -t 0 9 2>/dev/null; then
+    if [ "$wait_for_lock" != true ]; then
+      exec 9<&-
+      die "Another agent-container session, install, or uninstall is running."
+    fi
+    warn "Another agent-container lifecycle transaction is starting; waiting for it to finish."
+    if ! /usr/bin/lockf -s 9; then
+      exec 9<&-
+      die "Unable to acquire the agent-container lifecycle lock."
+    fi
+  fi
+  lifecycle_kernel_lock_acquired=true
+  trap '' INT TERM HUP
+  trap release_lifecycle_lock EXIT
+
+  local_root_input="$host_home_dir/.local"
+  if [ ! -e "$local_root_input" ] && [ ! -L "$local_root_input" ]; then
+    mkdir "$local_root_input" 2>/dev/null \
+      || { [ -d "$local_root_input" ] && [ ! -L "$local_root_input" ]; } \
+      || die "Unable to create the local data root: $local_root_input"
+  fi
+  [ -d "$local_root_input" ] \
+    || die "Local data root is not a directory: $local_root_input"
+  local_root=$(resolve_absolute_dir "$local_root_input")
+  path_contains "$host_home_dir" "$local_root" \
+    || die "Local data root resolves outside the host home: $local_root_input"
+
+  share_dir_input="$host_home_dir/.local/share"
+  if [ ! -e "$share_dir_input" ] && [ ! -L "$share_dir_input" ]; then
+    mkdir "$share_dir_input" 2>/dev/null \
+      || { [ -d "$share_dir_input" ] && [ ! -L "$share_dir_input" ]; } \
+      || die "Unable to create the local share path: $share_dir_input"
+  fi
+  [ -d "$share_dir_input" ] \
+    || die "Local share path is not a directory: $share_dir_input"
+  share_dir=$(resolve_absolute_dir "$share_dir_input")
+  path_contains "$host_home_dir" "$share_dir" \
+    || die "Local share path resolves outside the host home: $share_dir_input"
+
+  lifecycle_lock="$share_dir/.agent-container.install.lock"
+  lifecycle_lock_owner="$$.$RANDOM.$RANDOM"
+  valid_lock_owner "$lifecycle_lock_owner" \
+    || die "Unable to generate a safe lifecycle lock owner token."
+  lifecycle_retry=0
+  while ! mkdir "$lifecycle_lock" 2>/dev/null; do
+    lifecycle_retry=$((lifecycle_retry + 1))
+    [ "$lifecycle_retry" -le 20 ] \
+      || die "Unable to acquire the agent-container lifecycle lock after repeated concurrent changes."
+    if [ ! -e "$lifecycle_lock" ] && [ ! -L "$lifecycle_lock" ]; then
+      continue
+    fi
+    [ -d "$lifecycle_lock" ] && [ ! -L "$lifecycle_lock" ] \
+      || die "Unsafe agent-container lifecycle lock: $lifecycle_lock"
+    [ -f "$lifecycle_lock/pid" ] && [ ! -L "$lifecycle_lock/pid" ] \
+      || die "The agent-container lifecycle lock has no trustworthy PID; refusing to steal it."
+    lifecycle_pid=$(read_single_line "$lifecycle_lock/pid" || true)
+    case "$lifecycle_pid" in
+      ''|0|*[!0-9]*) die "The agent-container lifecycle lock has an invalid PID; refusing to steal it." ;;
+    esac
+    if kill -0 "$lifecycle_pid" 2>/dev/null; then
+      die "Another agent-container session, install, or uninstall is running (PID $lifecycle_pid)."
+    fi
+
+    lifecycle_owner=""
+    lifecycle_owner_present=false
+    if [ -e "$lifecycle_lock/owner" ] || [ -L "$lifecycle_lock/owner" ]; then
+      [ -f "$lifecycle_lock/owner" ] && [ ! -L "$lifecycle_lock/owner" ] \
+        || die "The stale agent-container lifecycle lock has an unsafe owner record."
+      lifecycle_owner=$(read_single_line "$lifecycle_lock/owner" || true)
+      valid_lock_owner "$lifecycle_owner" \
+        || die "The stale agent-container lifecycle lock has an invalid owner record."
+      lifecycle_owner_present=true
+    fi
+    [ "$lifecycle_owner_present" = true ] \
+      || die "A stale legacy lifecycle lock cannot be reclaimed safely while older launchers may still be running. Verify PID $lifecycle_pid is dead, then remove only: $lifecycle_lock"
+
+    lifecycle_reap="$lifecycle_lock/.reap"
+    if ! mkdir "$lifecycle_reap" 2>/dev/null; then
+      if [ ! -e "$lifecycle_lock" ] && [ ! -L "$lifecycle_lock" ]; then
+        continue
+      fi
+      [ -d "$lifecycle_reap" ] && [ ! -L "$lifecycle_reap" ] \
+        || die "The stale lifecycle lock has an unsafe recovery claim; refusing to steal it."
+      lock_directory_has_only "$lifecycle_reap" "pid owner" \
+        || die "The stale lifecycle lock recovery claim contains unexpected entries."
+      lifecycle_reap_pid=$(read_single_line "$lifecycle_reap/pid" || true)
+      lifecycle_reap_owner=$(read_single_line "$lifecycle_reap/owner" || true)
+      if case "$lifecycle_reap_pid" in
+          ''|0|*[!0-9]*) false ;;
+          *) true ;;
+        esac \
+        && valid_lock_owner "$lifecycle_reap_owner" \
+        && kill -0 "$lifecycle_reap_pid" 2>/dev/null; then
+        die "Another agent-container transaction is reclaiming a stale lifecycle lock (PID $lifecycle_reap_pid)."
+      fi
+      # A process that owned this recovery claim cannot still hold the kernel
+      # lock: lockf released it automatically when that process exited or was
+      # killed. Remove only the exact claim records, then publish our claim.
+      rm -f "$lifecycle_reap/pid" "$lifecycle_reap/owner"
+      rmdir "$lifecycle_reap" 2>/dev/null \
+        || die "Could not clear an abandoned lifecycle recovery claim."
+      mkdir "$lifecycle_reap" \
+        || die "Could not replace an abandoned lifecycle recovery claim."
+    fi
+    chmod 0700 "$lifecycle_reap"
+    if ! printf '%s\n' "$$" > "$lifecycle_reap/pid" \
+      || ! printf '%s\n' "$lifecycle_lock_owner" > "$lifecycle_reap/owner"; then
+      rm -f "$lifecycle_reap/pid" "$lifecycle_reap/owner"
+      rmdir "$lifecycle_reap" 2>/dev/null || true
+      die "Unable to publish the lifecycle lock recovery claim."
+    fi
+
+    # Revalidate the stale directory after winning its in-directory recovery
+    # claim.  This prevents two launchers that observed the same dead PID from
+    # deleting a replacement lock created by the other launcher.
+    [ "$(read_single_line "$lifecycle_lock/pid" || true)" = "$lifecycle_pid" ] \
+      || die "The stale lifecycle lock changed while it was being reclaimed."
+    if [ "$lifecycle_owner_present" = true ]; then
+      [ "$(read_single_line "$lifecycle_lock/owner" || true)" = "$lifecycle_owner" ] \
+        || die "The stale lifecycle lock owner changed while it was being reclaimed."
+    else
+      [ ! -e "$lifecycle_lock/owner" ] && [ ! -L "$lifecycle_lock/owner" ] \
+        || die "The stale lifecycle lock gained an owner while it was being reclaimed."
+    fi
+    if kill -0 "$lifecycle_pid" 2>/dev/null; then
+      rm -f "$lifecycle_reap/pid" "$lifecycle_reap/owner"
+      rmdir "$lifecycle_reap" 2>/dev/null || true
+      die "The lifecycle lock owner PID $lifecycle_pid became active during recovery."
+    fi
+    lock_directory_has_only "$lifecycle_lock" "pid owner .reap" \
+      && lock_directory_has_only "$lifecycle_reap" "pid owner" \
+      || die "The stale lifecycle lock contains unexpected entries; refusing to reclaim it."
+
+    lifecycle_quarantine="$lifecycle_lock.reaped.$lifecycle_lock_owner"
+    [ ! -e "$lifecycle_quarantine" ] && [ ! -L "$lifecycle_quarantine" ] \
+      || die "The lifecycle lock recovery quarantine already exists: $lifecycle_quarantine"
+    mv "$lifecycle_lock" "$lifecycle_quarantine" \
+      || die "Could not atomically quarantine the stale lifecycle lock: $lifecycle_lock"
+    [ "$(read_single_line "$lifecycle_quarantine/.reap/pid" || true)" = "$$" ] \
+      && [ "$(read_single_line "$lifecycle_quarantine/.reap/owner" || true)" = "$lifecycle_lock_owner" ] \
+      || die "Lifecycle lock recovery ownership changed after quarantine."
+    rm -f \
+      "$lifecycle_quarantine/pid" \
+      "$lifecycle_quarantine/owner" \
+      "$lifecycle_quarantine/.reap/pid" \
+      "$lifecycle_quarantine/.reap/owner"
+    rmdir "$lifecycle_quarantine/.reap" \
+      && rmdir "$lifecycle_quarantine" \
+      || die "Could not clear the quarantined stale lifecycle lock: $lifecycle_quarantine"
+  done
+  chmod 0700 "$lifecycle_lock"
+  if ! printf '%s\n' "$$" > "$lifecycle_lock/pid" \
+    || ! printf '%s\n' "$lifecycle_lock_owner" > "$lifecycle_lock/owner"; then
+    rm -f "$lifecycle_lock/pid" "$lifecycle_lock/owner"
+    rmdir "$lifecycle_lock" 2>/dev/null || true
+    die "Unable to publish lifecycle lock ownership."
+  fi
+  lifecycle_lock_acquired=true
+}
+
+certificate_not_before_is_current() {
+  local openssl_bin="$1"
+  local certificate_file="$2"
+  local startdate_output not_before_value not_before_epoch current_epoch
+
+  startdate_output=$(
+    "$openssl_bin" x509 -in "$certificate_file" -startdate -noout 2>/dev/null
+  ) || return 1
+  case "$startdate_output" in
+    notBefore=*) not_before_value=${startdate_output#notBefore=} ;;
+    *) return 1 ;;
+  esac
+  case "$not_before_value" in
+    ''|*$'\n'*|*$'\r'*) return 1 ;;
+  esac
+
+  # The supported host is macOS, whose date(1) uses -j/-f.  Keep the GNU form
+  # as a portability fallback for the shell regression suite.
+  not_before_epoch=$(
+    LC_ALL=C /bin/date -j -f '%b %e %T %Y %Z' \
+      "$not_before_value" '+%s' 2>/dev/null
+  ) || not_before_epoch=$(
+    LC_ALL=C /bin/date -u -d "$not_before_value" '+%s' 2>/dev/null
+  ) || return 1
+  current_epoch=$(/bin/date -u '+%s') || return 1
+  [ "$not_before_epoch" -le "$current_epoch" ]
+}
+
+certificate_has_ca_basic_constraint() {
+  local openssl_bin="$1"
+  local certificate_file="$2"
+  local extension_text certificate_text
+
+  # OpenSSL supports selecting this extension directly.  The macOS system
+  # LibreSSL does not, so fall back to parsing only the immediate value of the
+  # named Basic Constraints extension rather than searching the full dump.
+  extension_text=$(
+    "$openssl_bin" x509 -in "$certificate_file" -noout \
+      -ext basicConstraints 2>/dev/null
+  ) || extension_text=""
+  if printf '%s\n' "$extension_text" \
+    | grep -Eq '^[[:space:]]*CA:TRUE([,[:space:]].*)?$'; then
+    return 0
+  fi
+
+  certificate_text=$(
+    "$openssl_bin" x509 -in "$certificate_file" -text -noout 2>/dev/null
+  ) || return 1
+  printf '%s\n' "$certificate_text" | LC_ALL=C awk '
+    /^[[:space:]]*X509v3 Basic Constraints:[^[:cntrl:]]*$/ {
+      headings += 1
+      if ((getline value) <= 0) exit 1
+      if (value ~ /^[[:space:]]*CA:TRUE([,[:space:]].*)?$/) valid = 1
+      next
+    }
+    END { exit !(headings == 1 && valid) }
+  '
+}
+
+validate_extra_ca_bundle() {
+  local bundle="$1"
+  local bundle_size openssl_bin certificate_count validation_dir
+  local certificate_file validation_failed
+
+  [ -f "$bundle" ] && [ ! -L "$bundle" ] || return 1
+  bundle_size=$(wc -c < "$bundle" | tr -d '[:space:]')
+  case "$bundle_size" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$bundle_size" -gt 0 ] && [ "$bundle_size" -le 1048576 ] || return 1
+
+  # Accept only one or more complete PEM CERTIFICATE blocks.  In particular,
+  # reject private keys, prose, and partially parsed bundles before they become
+  # trusted by every TLS client in the image.
+  LC_ALL=C awk '
+    BEGIN { inside = 0; count = 0; valid = 1 }
+    /^-----BEGIN CERTIFICATE-----$/ {
+      if (inside) valid = 0
+      inside = 1
+      count += 1
+      next
+    }
+    /^-----END CERTIFICATE-----$/ {
+      if (!inside) valid = 0
+      inside = 0
+      next
+    }
+    inside && /^[A-Za-z0-9+\/=]+$/ { next }
+    !inside && /^[[:space:]]*$/ { next }
+    { valid = 0 }
+    END { exit !(valid && !inside && count > 0) }
+  ' "$bundle" || return 1
+
+  openssl_bin="${AGENT_CONTAINER_OPENSSL_BIN:-/usr/bin/openssl}"
+  [ -x "$openssl_bin" ] || return 1
+  certificate_count=$(grep -c '^-----BEGIN CERTIFICATE-----$' "$bundle")
+  [ "$certificate_count" -gt 0 ] && [ "$certificate_count" -le 64 ] \
+    || return 1
+
+  # Validate each block independently.  Counting `CA:TRUE` strings in an
+  # aggregate OpenSSL dump can let one certificate satisfy another and does
+  # not prove that every admitted CA is still within its validity period.
+  validation_dir=$(mktemp -d \
+    "${TMPDIR:-/tmp}/agent-container-ca.XXXXXX") || return 1
+  if ! LC_ALL=C awk -v output_dir="$validation_dir" '
+    /^-----BEGIN CERTIFICATE-----$/ {
+      count += 1
+      output = sprintf("%s/certificate-%03d.pem", output_dir, count)
+      inside = 1
+    }
+    inside { print > output }
+    /^-----END CERTIFICATE-----$/ { close(output); inside = 0 }
+    END { if (inside || count == 0) exit 1 }
+  ' "$bundle"; then
+    rm -f -- "$validation_dir"/certificate-*.pem
+    rmdir "$validation_dir" 2>/dev/null || true
+    return 1
+  fi
+
+  validation_failed=false
+  for certificate_file in "$validation_dir"/certificate-*.pem; do
+    if ! "$openssl_bin" x509 -in "$certificate_file" -noout \
+      >/dev/null 2>&1 \
+      || ! "$openssl_bin" x509 -in "$certificate_file" -checkend 0 \
+        -noout >/dev/null 2>&1 \
+      || ! certificate_not_before_is_current \
+        "$openssl_bin" "$certificate_file" \
+      || ! certificate_has_ca_basic_constraint \
+        "$openssl_bin" "$certificate_file"; then
+      validation_failed=true
+      break
+    fi
+  done
+  rm -f -- "$validation_dir"/certificate-*.pem
+  rmdir "$validation_dir" 2>/dev/null || validation_failed=true
+  [ "$validation_failed" = false ]
+}
+
+extract_macos_verified_anchor() {
+  local url="$1"
+  local destination="$2"
+  local security_bin openssl_bin chain_file chain_size candidate_dir
+  local curl_bin proxy_value resolve_value url_authority tls_host fetch_dir
+  local fetched_chain fetched_count fetched_file
+  local -a candidate_files
+  local -a fetch_args verify_args
+  local candidate_index candidate_file selected
+
+  security_bin="${AGENT_CONTAINER_SECURITY_BIN:-/usr/bin/security}"
+  openssl_bin="${AGENT_CONTAINER_OPENSSL_BIN:-/usr/bin/openssl}"
+  [ -x "$security_bin" ] && [ -x "$openssl_bin" ] || return 1
+  chain_file="$destination.chain"
+  if ! "$security_bin" verify-cert -P "$url" \
+    > "$chain_file" 2>/dev/null; then
+    # Security.framework does not honor the launcher's explicit shell proxy.
+    # When direct URL evaluation cannot reach the endpoint, let curl perform
+    # only the proxied TLS handshake and export its peer chain. Security still
+    # performs the authoritative hostname and Keychain trust evaluation over
+    # those local certificates; TLS verification is never disabled.
+    curl_bin="${AGENT_CONTAINER_CURL_BIN:-curl}"
+    command -v "$curl_bin" >/dev/null 2>&1 || return 1
+    url_authority=${url#https://}
+    url_authority=${url_authority%%/*}
+    tls_host=${url_authority%%:*}
+    case "$tls_host" in
+      ''|*[!A-Za-z0-9.-]*) return 1 ;;
+    esac
+    fetch_dir=$(mktemp -d "${destination}.fetch.XXXXXX") || return 1
+    fetched_chain="$fetch_dir/curl-certs"
+    fetch_args=(
+      --disable
+      --proto '=https'
+      --tlsv1.2
+      --fail
+      --silent
+      --show-error
+      --output /dev/null
+      --write-out '%{certs}'
+    )
+    proxy_value=${https_proxy_value:-$all_proxy_value}
+    if [ -n "$proxy_value" ]; then
+      fetch_args+=(--proxy "$proxy_value")
+      if resolve_value=$(host_proxy_resolve_override "$proxy_value"); then
+        fetch_args+=(--resolve "$resolve_value")
+      fi
+    else
+      fetch_args+=(--proxy '')
+    fi
+    fetch_args+=(--noproxy "$no_proxy_value" "$url")
+    if ! "$curl_bin" "${fetch_args[@]}" > "$fetched_chain"; then
+      rm -f -- "$fetched_chain"
+      rmdir "$fetch_dir" 2>/dev/null || true
+      return 1
+    fi
+    if ! LC_ALL=C awk -v output_dir="$fetch_dir" '
+      /^-----BEGIN CERTIFICATE-----$/ {
+        if (inside || count >= 64) invalid = 1
+        count += 1
+        output = sprintf("%s/certificate-%03d.pem", output_dir, count)
+        inside = 1
+      }
+      inside { print > output }
+      /^-----END CERTIFICATE-----$/ { close(output); inside = 0 }
+      END { if (invalid || inside || count == 0 || count > 64) exit 1 }
+    ' "$fetched_chain"; then
+      rm -f -- "$fetch_dir"/certificate-*.pem "$fetched_chain"
+      rmdir "$fetch_dir" 2>/dev/null || true
+      return 1
+    fi
+    verify_args=()
+    fetched_count=0
+    for fetched_file in "$fetch_dir"/certificate-*.pem; do
+      verify_args+=(-c "$fetched_file")
+      fetched_count=$((fetched_count + 1))
+    done
+    if [ "$fetched_count" -le 0 ] \
+      || ! "$security_bin" verify-cert "${verify_args[@]}" \
+        -p ssl -n "$tls_host" -P > "$chain_file" 2>/dev/null; then
+      rm -f -- "$fetch_dir"/certificate-*.pem "$fetched_chain" "$chain_file"
+      rmdir "$fetch_dir" 2>/dev/null || true
+      return 1
+    fi
+    rm -f -- "$fetch_dir"/certificate-*.pem "$fetched_chain"
+    rmdir "$fetch_dir" 2>/dev/null || {
+      rm -f "$chain_file"
+      return 1
+    }
+  fi
+
+  chain_size=$(wc -c < "$chain_file" | tr -d '[:space:]')
+  case "$chain_size" in
+    ''|*[!0-9]*) rm -f "$chain_file"; return 1 ;;
+  esac
+  if [ "$chain_size" -le 0 ] || [ "$chain_size" -gt 1048576 ]; then
+    rm -f "$chain_file"
+    return 1
+  fi
+
+  candidate_dir=$(mktemp -d "${destination}.candidates.XXXXXX") || {
+    rm -f "$chain_file"
+    return 1
+  }
+
+  # `security verify-cert -P` prints a macOS-validated leaf-to-anchor chain.
+  # Security.framework may terminate PEM records with CR/NUL and append the
+  # next chain label on that same physical line, so convert NUL to a record
+  # boundary before stripping CR.  Split every certificate and then select the
+  # first currently-valid issuer from leaf toward anchor that explicitly
+  # carries Basic Constraints CA:TRUE.  This avoids widening trust to a root
+  # when a narrower, endpoint-specific intermediate is available.
+  if ! tr '\000' '\n' < "$chain_file" \
+    | tr -d '\r' \
+    | LC_ALL=C awk -v output_dir="$candidate_dir" '
+    /^-----BEGIN CERTIFICATE-----$/ {
+      if (inside || count >= 64) invalid = 1
+      count += 1
+      output = sprintf("%s/certificate-%03d.pem", output_dir, count)
+      inside = 1
+      print > output
+      next
+    }
+    inside && /^[A-Za-z0-9+\/=]+$/ { print > output; next }
+    /^-----END CERTIFICATE-----$/ {
+      if (!inside) invalid = 1
+      if (inside) { print > output; close(output) }
+      inside = 0
+      next
+    }
+    END {
+      if (invalid || inside || count == 0 || count > 64) exit 1
+    }
+  '; then
+    rm -f -- "$candidate_dir"/certificate-*.pem
+    rmdir "$candidate_dir" 2>/dev/null || true
+    rm -f "$chain_file" "$destination"
+    return 1
+  fi
+  rm -f "$chain_file"
+
+  candidate_files=("$candidate_dir"/certificate-*.pem)
+  selected=false
+  candidate_index=0
+  while [ "$candidate_index" -lt "${#candidate_files[@]}" ]; do
+    candidate_file="${candidate_files[$candidate_index]}"
+    if "$openssl_bin" x509 -in "$candidate_file" -noout \
+      >/dev/null 2>&1 \
+      && "$openssl_bin" x509 -in "$candidate_file" -checkend 0 \
+        -noout >/dev/null 2>&1 \
+      && certificate_not_before_is_current \
+        "$openssl_bin" "$candidate_file" \
+      && certificate_has_ca_basic_constraint \
+        "$openssl_bin" "$candidate_file"; then
+      cp "$candidate_file" "$destination"
+      selected=true
+      break
+    fi
+    candidate_index=$((candidate_index + 1))
+  done
+  rm -f -- "$candidate_dir"/certificate-*.pem
+  rmdir "$candidate_dir" 2>/dev/null || selected=false
+  [ "$selected" = true ] || {
+    rm -f "$destination"
+    return 1
+  }
+  chmod 0600 "$destination"
+  validate_extra_ca_bundle "$destination" || {
+    rm -f "$destination"
+    return 1
+  }
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  agent-container [container options...] <profile> [agent arguments...]
+  agent-container [container options...] run <profile> [runtime options...] [-- agent arguments...]
+  agent-container [container options...] singleton status <profile>
+  agent-container [container options...] singleton stop <profile>
+  agent-container [container options...] profiles
+
+Built-in compatibility commands:
+  claude-container [container options...] [arguments...]
+  codex-container [container options...] [arguments...]
+  grok-container [container options...] [arguments...]
+
+The host must be Apple silicon running macOS 26 or newer. Each profile runs
+inside an arm64 Linux Micro-VM with an isolated, persistent shadow HOME.
+Ordinary launches reuse one persistent container per profile; `run` creates
+one legacy container for that invocation only.
+
+Runtime options for `run`:
+  --share-ro PATH          Share one additional directory read-only
+  --share-rw PATH          Share one additional directory read-write
+  --no-host-exec COMMAND   Do not expose one host command (may be repeated)
+  --host-first COMMAND     Prefer one host command over the guest copy
+
+Container launcher options (must precede the profile or Agent arguments):
+  --container-cpus N              VM CPU count
+  --container-memory SIZE         VM memory, for example 4g
+  --container-build-cpus N        image-build CPU count
+  --container-build-memory SIZE   image-build memory
+  --container-version VERSION     latest or an exact native CLI version
+  --container-base-image IMAGE    pinned base image reference
+  --container-http-proxy URL      HTTP proxy
+  --container-https-proxy URL     HTTPS proxy
+  --container-all-proxy URL       all-protocol proxy
+  --container-no-proxy LIST       proxy exclusion list
+  --container-extra-ca auto|PATH  host trust bridge or an explicit CA bundle
+  --container-dns1 ADDRESS        primary DNS server
+  --container-dns2 ADDRESS        secondary DNS server
+  --container-timezone ZONE       guest timezone
+  --container-forward-env NAMES   exact exported names, comma-separated
+  --container-max-files N         legacy VirtioFS file budget
+  --container-fd-stop-percent N   legacy file-descriptor stop threshold
+  --container-assets PATH         release asset directory
+  --container-bin PATH            Apple container CLI override
+  --container-host-broker PATH    host-exec broker override
+  --container-host-node PATH      host Node.js override
+  --container-host-gateway IP     default-network host gateway override
+  --container-host-alias HOSTS    comma-separated guest names mapped to the host gateway
+  --container-block-host HOSTS    comma-separated guest names mapped to IPv4/IPv6 blackholes
+  --container-openssl PATH        host OpenSSL override
+  --container-security PATH       macOS security tool override
+
+Boolean container options:
+  --container-enable-experimental
+  --container-rebuild
+  --container-skip-build
+  --container-full-git-config
+  --container-mount-gh
+  --container-forward-api-key
+  --container-forward-ssh-agent
+  --container-mount-ssh-config
+  --container-accept-virtiofs-risk
+  --container-allow-concurrent
+  --container-disable-fd-watchdog
+
+Each boolean also accepts --no-container-NAME. Configuration through
+AGENT_CONTAINER_* environment variables is no longer a public interface.
+EOF
+}
+
+valid_host_command_name() {
+  case "$1" in
+    ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 64 ]
+}
+
+validate_env_name() {
+  local name="$1"
+  [ -z "$name" ] && return 0
+  case "$name" in
+    [A-Z_]* ) ;;
+    *) return 1 ;;
+  esac
+  case "$name" in
+    *[!A-Z0-9_]*) return 1 ;;
+  esac
+}
+
+validate_profile_env_name() {
+  local name="$1"
+  [ -n "$name" ] && validate_env_name "$name" || return 1
+  case "$name" in
+    AGENT_CONTAINER|AGENT_CONTAINER_HOST_EXEC|AGENT_CONTAINER_*|AGENT_WORKSPACE|AGENT_WORKSPACE_*)
+      return 1
+      ;;
+    AGENT_PROFILE|AGENT_VERSION|AGENT_COMMAND|AGENT_PROBE_ARG|AGENT_CA_FINGERPRINT|AGENT_INSTALLER_URL|AGENT_INSTALLER_SHELL|AGENT_INSTALLER_VERSION_ENV|AGENT_INSTALLER_BIN_DIR_ENV|AGENT_INSTALLER_HOME_ENV|AGENT_INSTALLER_NONINTERACTIVE_ENV)
+      return 1
+      ;;
+    HOST_UID|HOST_GID|HOST_HOME|XDG_RUNTIME_DIR|IS_SANDBOX|BASE_IMAGE|DEFAULT_BASE_IMAGE)
+      return 1
+      ;;
+    HOME|USER|LOGNAME|SHELL|PATH|PWD|OLDPWD|SHLVL|_|GIT_CONFIG_GLOBAL|TERM|COLORTERM|TZ|SSH_AUTH_SOCK)
+      return 1
+      ;;
+    HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|FTP_PROXY)
+      return 1
+      ;;
+    BASH_*|BASHOPTS|SHELLOPTS|ENV|POSIXLY_CORRECT|CDPATH|GLOBIGNORE|IFS|PS4|PROMPT_COMMAND)
+      return 1
+      ;;
+    CURL_*|GIT_*|OPENSSL_*|SSL_*|SSLKEYLOGFILE|LD_*|DYLD_*|XDG_CONFIG_HOME|SSH_ASKPASS*)
+      return 1
+      ;;
+  esac
+}
+
+validate_forward_env_name() {
+  local name="$1"
+  validate_profile_env_name "$name" || return 1
+  if [ -n "${profile_disable_update_env:-}" ] \
+    && [ "$name" = "$profile_disable_update_env" ]; then
+    return 1
+  fi
+}
+
+valid_agent_version() {
+  printf '%s\n' "$1" \
+    | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9][A-Za-z0-9._-]*)?(\+[A-Za-z0-9][A-Za-z0-9._-]*)?$'
+}
+
+valid_profile_id() {
+  [ "${#1}" -le "$MAX_PROFILE_ID_LENGTH" ] || return 1
+  case "$1" in
+    ''|*[!a-z0-9-]*|[0-9-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+load_profile() {
+  local requested_id="$1"
+  local allow_experimental="${2:-false}"
+  local profile_record
+
+  valid_profile_id "$requested_id" \
+    || die "Invalid profile id '$requested_id'. Use '$PROGRAM_NAME profiles' to list profiles."
+  profile_id="$requested_id"
+  profile_file="$asset_dir/profiles/$profile_id.json"
+  [ -f "$profile_file" ] && [ ! -L "$profile_file" ] \
+    || die "Unknown or unsafe Agent profile '$profile_id'. Use '$PROGRAM_NAME profiles' to list profiles."
+
+  # Parse once with macOS JavaScriptCore instead of spawning plutil for every
+  # field. The constant parser enforces an exact typed key set and emits one
+  # unit-separator-delimited record; profile data is never evaluated as code.
+  # Unlike a whitespace IFS delimiter, unit separator preserves empty fields.
+  profile_record=$("$osascript_bin" -l JavaScript - "$profile_file" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const keys = [
+    'schema',
+    'id',
+    'displayName',
+    'status',
+    'installerKind',
+    'installerUrl',
+    'installerShell',
+    'installerVersionUrl',
+    'installerVersionFormat',
+    'installerVersionEnv',
+    'installerBinDirEnv',
+    'installerHomeEnv',
+    'installerNonInteractiveEnv',
+    'version',
+    'command',
+    'probeArg',
+    'apiKeyEnv',
+    'disableAutoUpdateEnv'
+  ];
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('profile is not readable UTF-8');
+  const value = JSON.parse(ObjC.unwrap(source));
+  if (value === null || Array.isArray(value) || typeof value !== 'object') {
+    throw new Error('profile root must be an object');
+  }
+  const actualKeys = Object.keys(value).sort();
+  const expectedKeys = keys.slice().sort();
+  if (actualKeys.length !== expectedKeys.length
+      || actualKeys.some((key, index) => key !== expectedKeys[index])) {
+    throw new Error('profile keys do not match schema 2');
+  }
+  if (!Number.isInteger(value.schema)) {
+    throw new Error('schema must be an integer');
+  }
+  for (const key of keys.slice(1)) {
+    if (typeof value[key] !== 'string' || /[\u0000-\u001f\u007f]/.test(value[key])) {
+      throw new Error(key + ' must not contain control characters');
+    }
+  }
+  return keys.map((key) => String(value[key])).join('\u001f');
+}
+JXA
+  ) || die "Agent profile '$profile_id' is not valid schema-2 JSON."
+
+  IFS=$'\037' read -r \
+    profile_schema \
+    profile_declared_id \
+    profile_display_name \
+    profile_status \
+    profile_installer_kind \
+    profile_installer_url \
+    profile_installer_shell \
+    profile_installer_version_url \
+    profile_installer_version_format \
+    profile_installer_version_env \
+    profile_installer_bin_dir_env \
+    profile_installer_home_env \
+    profile_installer_noninteractive_env \
+    profile_version \
+    profile_command \
+    profile_probe_arg \
+    profile_api_key_env \
+    profile_disable_update_env <<EOF
+$profile_record
+EOF
+
+  [ "$profile_schema" = 2 ] \
+    || die "Unsupported schema '$profile_schema' in profile '$profile_id'."
+  [ "$profile_declared_id" = "$profile_id" ] \
+    || die "Profile id '$profile_declared_id' does not match filename '$profile_id.json'."
+  [ -n "$profile_display_name" ] \
+    && printf '%s\n' "$profile_display_name" \
+      | grep -Eq '^[A-Za-z0-9 ._+()/-]+$' \
+    || die "Profile '$profile_id' has an unsafe displayName."
+  case "$profile_status" in
+    stable|preview) ;;
+    experimental)
+      if [ "$allow_experimental" != true ] \
+        && ! is_true "${AGENT_CONTAINER_ENABLE_EXPERIMENTAL:-false}"; then
+        die "Profile '$profile_id' is experimental. Pass --container-enable-experimental before the profile name to enable it explicitly."
+      fi
+      ;;
+    *) die "Profile '$profile_id' has unsupported status '$profile_status'." ;;
+  esac
+  [ "$profile_installer_kind" = native-script ] \
+    || die "Profile '$profile_id' uses unsupported installerKind '$profile_installer_kind'."
+  case "$profile_installer_url" in
+    https://*) ;;
+    *) die "Profile '$profile_id' must use an HTTPS native installer URL." ;;
+  esac
+  case "$profile_installer_url" in
+    *[!A-Za-z0-9._:/-]*) die "Profile '$profile_id' has an unsafe installerUrl." ;;
+  esac
+  case "$profile_installer_shell" in
+    bash|sh) ;;
+    *) die "Profile '$profile_id' has an unsupported installerShell." ;;
+  esac
+  case "$profile_installer_version_url" in
+    https://*) ;;
+    *) die "Profile '$profile_id' must use an HTTPS installerVersionUrl." ;;
+  esac
+  case "$profile_installer_version_url" in
+    *[!A-Za-z0-9._:/-]*) die "Profile '$profile_id' has an unsafe installerVersionUrl." ;;
+  esac
+  case "$profile_installer_version_format" in
+    plain-semver|rust-tag-json) ;;
+    *) die "Profile '$profile_id' has an unsupported installerVersionFormat." ;;
+  esac
+  [ -z "$profile_installer_version_env" ] \
+    || validate_profile_env_name "$profile_installer_version_env" \
+    || die "Profile '$profile_id' has an unsafe installerVersionEnv."
+  [ -z "$profile_installer_bin_dir_env" ] \
+    || validate_profile_env_name "$profile_installer_bin_dir_env" \
+    || die "Profile '$profile_id' has an unsafe installerBinDirEnv."
+  [ -z "$profile_installer_home_env" ] \
+    || validate_profile_env_name "$profile_installer_home_env" \
+    || die "Profile '$profile_id' has an unsafe installerHomeEnv."
+  [ -z "$profile_installer_noninteractive_env" ] \
+    || validate_profile_env_name "$profile_installer_noninteractive_env" \
+    || die "Profile '$profile_id' has an unsafe installerNonInteractiveEnv."
+  if [ "$profile_version" != latest ]; then
+    valid_agent_version "$profile_version" \
+      || die "Profile '$profile_id' must select 'latest' or an exact native CLI version."
+  fi
+  case "$profile_command" in
+    ''|*[!A-Za-z0-9._-]*) die "Profile '$profile_id' has an unsafe command." ;;
+  esac
+  case "$profile_probe_arg" in
+    --version|-V|version) ;;
+    *) die "Profile '$profile_id' has an unsupported probe argument." ;;
+  esac
+  [ -z "$profile_api_key_env" ] \
+    || validate_profile_env_name "$profile_api_key_env" \
+    || die "Profile '$profile_id' has an unsafe apiKeyEnv."
+  [ -z "$profile_disable_update_env" ] \
+    || validate_profile_env_name "$profile_disable_update_env" \
+    || die "Profile '$profile_id' has an unsafe disableAutoUpdateEnv."
+  if [ -n "$profile_api_key_env" ] \
+    && [ "$profile_api_key_env" = "$profile_disable_update_env" ]; then
+    die "Profile '$profile_id' reuses one environment name for credentials and update control."
+  fi
+}
+
+host_home_dir="${HOME:?HOME is not set}"
+script_dir=$(resolve_absolute_dir "$(dirname -- "$0")")
+asset_dir="${AGENT_CONTAINER_ASSET_DIR:-$script_dir}"
+if [ ! -f "$asset_dir/Containerfile" ] \
+  || [ ! -f "$asset_dir/Containerfile.dockerignore" ] \
+  || [ ! -f "$asset_dir/entrypoint.sh" ] \
+  || [ ! -f "$asset_dir/host-exec-client" ] \
+  || [ ! -f "$asset_dir/host-exec-broker.mjs" ] \
+  || [ ! -f "$asset_dir/agent-workspace-connect" ] \
+  || [ ! -f "$asset_dir/agent-workspace-session" ] \
+  || [ ! -d "$asset_dir/profiles" ]; then
+  asset_dir="${AGENT_CONTAINER_ASSET_DIR:-$host_home_dir/.local/share/agent-container/current}"
+fi
+asset_dir=$(resolve_absolute_dir "$asset_dir") \
+  || die "Unable to resolve Agent container assets: $asset_dir"
+[ -f "$asset_dir/Containerfile" ] && [ ! -L "$asset_dir/Containerfile" ] \
+  || die "Containerfile not found. Re-run install.sh or pass --container-assets PATH."
+[ -f "$asset_dir/Containerfile.dockerignore" ] \
+  && [ ! -L "$asset_dir/Containerfile.dockerignore" ] \
+  || die "Containerfile.dockerignore not found. Re-run install.sh or pass --container-assets PATH."
+[ -f "$asset_dir/entrypoint.sh" ] && [ ! -L "$asset_dir/entrypoint.sh" ] \
+  || die "entrypoint.sh not found. Re-run install.sh or pass --container-assets PATH."
+[ -f "$asset_dir/host-exec-client" ] && [ ! -L "$asset_dir/host-exec-client" ] \
+  || die "host-exec-client not found. Re-run install.sh or pass --container-assets PATH."
+[ -f "$asset_dir/host-exec-broker.mjs" ] && [ ! -L "$asset_dir/host-exec-broker.mjs" ] \
+  || die "host-exec-broker.mjs not found. Re-run install.sh or pass --container-assets PATH."
+[ -f "$asset_dir/agent-workspace-connect" ] && [ ! -L "$asset_dir/agent-workspace-connect" ] \
+  && [ -x "$asset_dir/agent-workspace-connect" ] \
+  || die "agent-workspace-connect not found. Re-run install.sh or pass --container-assets PATH."
+[ -f "$asset_dir/agent-workspace-session" ] && [ ! -L "$asset_dir/agent-workspace-session" ] \
+  && [ -x "$asset_dir/agent-workspace-session" ] \
+  || die "agent-workspace-session not found. Re-run install.sh or pass --container-assets PATH."
+[ -d "$asset_dir/profiles" ] \
+  || die "Profiles directory not found. Re-run install.sh or pass --container-assets PATH."
+
+osascript_bin=$(command -v osascript || true)
+[ -n "$osascript_bin" ] \
+  || die "macOS osascript/JavaScriptCore is required to validate Agent profiles."
+
+run_mode=false
+singleton_control_action=""
+extra_share_inputs=()
+extra_share_input_modes=()
+host_exec_denied=()
+host_exec_first=(git)
+
+requested_profile="${1:-}"
+case "$requested_profile" in
+  -h|--help|'')
+    usage
+    [ -n "$requested_profile" ] && exit 0
+    exit 64
+    ;;
+  profiles)
+    found_profile=false
+    for profile_path in "$asset_dir"/profiles/*.json; do
+      [ -f "$profile_path" ] || continue
+      found_profile=true
+      listed_id=$(basename -- "$profile_path" .json)
+      load_profile "$listed_id" true
+      printf '%-12s %-14s %s\n' "$profile_id" "$profile_status" "$profile_display_name"
+    done
+    [ "$found_profile" = true ] || die "No Agent profiles are installed."
+    exit 0
+    ;;
+  singleton)
+    shift
+    singleton_control_action="${1:-}"
+    case "$singleton_control_action" in
+      status|stop) ;;
+      -h|--help|'') usage; [ -n "$singleton_control_action" ] && exit 0; exit 64 ;;
+      *) die "Unknown singleton action '$singleton_control_action'; expected status or stop." ;;
+    esac
+    shift
+    requested_profile="${1:-}"
+    case "$requested_profile" in
+      claude|codex|grok) ;;
+      *) die "The singleton control command requires the claude, codex, or grok profile." ;;
+    esac
+    shift
+    [ "$#" -eq 0 ] \
+      || die "The singleton control command does not accept additional arguments."
+    ;;
+  run)
+    run_mode=true
+    shift
+    requested_profile="${1:-}"
+    case "$requested_profile" in
+      -h|--help) usage; exit 0 ;;
+      '') die "The run command requires an Agent profile." ;;
+    esac
+    shift
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --share-ro|--share-rw)
+          share_option="$1"
+          [ "$#" -ge 2 ] \
+            || die "$share_option requires a directory path."
+          extra_share_inputs+=("$2")
+          if [ "$share_option" = --share-ro ]; then
+            extra_share_input_modes+=(ro)
+          else
+            extra_share_input_modes+=(rw)
+          fi
+          shift 2
+          ;;
+        --no-host-exec)
+          [ "$#" -ge 2 ] \
+            || die "$1 requires a command name."
+          valid_host_command_name "$2" \
+            || die "Unsafe host command name '$2'."
+          host_exec_denied+=("$2")
+          shift 2
+          ;;
+        --host-first)
+          [ "$#" -ge 2 ] \
+            || die "--host-first requires a command name."
+          valid_host_command_name "$2" \
+            || die "Unsafe host command name '$2'."
+          host_exec_first+=("$2")
+          shift 2
+          ;;
+        --)
+          shift
+          break
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          die "Unknown agent-container run option '$1'. Place Agent arguments after --."
+          ;;
+      esac
+    done
+    ;;
+esac
+if [ "$run_mode" = false ] && [ -z "$singleton_control_action" ]; then
+  shift
+fi
+if [ -n "$singleton_control_action" ]; then
+  # Singleton recovery is a fixed management-plane operation, not a profile
+  # launch. Keep it available after an installer selection removes a wrapper
+  # and declarative profile: the reserved container name plus the complete
+  # ownership/provenance labels below are the authority for status and stop.
+  # No executable command or image setting is taken from a missing record.
+  profile_id="$requested_profile"
+  profile_api_key_env=""
+  profile_disable_update_env=""
+else
+  load_profile "$requested_profile"
+fi
+
+# Ordinary profile launches always share one persistent container per profile.
+# The explicit run mode retains its wider, per-launch host broker and therefore
+# continues to use the legacy attached-container lifecycle for now.
+singleton_requested=false
+if [ -z "$singleton_control_action" ] && [ "$run_mode" = false ]; then
+  singleton_requested=true
+fi
+
+profile_credential_forward_mode=false
+if [ -n "${AGENT_CONTAINER_FORWARD_API_KEY+x}" ]; then
+  case "$AGENT_CONTAINER_FORWARD_API_KEY" in
+    true) profile_credential_forward_mode=true ;;
+    false) profile_credential_forward_mode=false ;;
+    *)
+      die "--container-forward-api-key must be true or false."
+      ;;
+  esac
+fi
+
+# Every Agent endpoint, model, token, and setting uses this one explicit path.
+# Each exact name is an authorization; values are inherited by Apple container
+# and never copied into this launcher's argv. Runtime/identity and loader
+# variables stay launcher-managed because overriding them could affect the
+# root entrypoint itself.
+explicit_forward_env_names=()
+explicit_forward_env_value="${AGENT_CONTAINER_FORWARD_ENV:-}"
+if [ -n "$explicit_forward_env_value" ]; then
+  case "$explicit_forward_env_value" in
+    ,*|*,|*,,*|*$'\n'*|*$'\r'*|*$'\t'*)
+      die "--container-forward-env must be a comma-separated list of environment-variable names without empty entries."
+      ;;
+  esac
+  IFS=, read -r -a requested_forward_env_names <<EOF
+$explicit_forward_env_value
+EOF
+  for forward_env_name in "${requested_forward_env_names[@]}"; do
+    [ -n "$forward_env_name" ] && validate_env_name "$forward_env_name" \
+      || die "--container-forward-env contains an invalid environment-variable name."
+    validate_forward_env_name "$forward_env_name" \
+      || die "--container-forward-env contains a launcher-managed name: $forward_env_name"
+    printenv "$forward_env_name" >/dev/null 2>&1 \
+      || die "--container-forward-env requested '$forward_env_name', but it is unset or not exported."
+    if [ "${#explicit_forward_env_names[@]}" -eq 0 ] \
+      || ! array_contains_value "$forward_env_name" "${explicit_forward_env_names[@]}"; then
+      explicit_forward_env_names+=("$forward_env_name")
+    fi
+  done
+fi
+
+if [ -n "${AGENT_CONTAINER_IMAGE:-}" ]; then
+  die "AGENT_CONTAINER_IMAGE is not supported. Image references are profile-scoped to preserve ownership and uninstall provenance."
+fi
+image_repository="agent-container-$profile_id"
+image_name="$image_repository:latest"
+
+[ "$(uname -s)" = "Darwin" ] \
+  || die "agent-container is supported only on macOS."
+[ "$(uname -m)" = "arm64" ] \
+  || die "agent-container requires Apple silicon."
+
+macos_major=$(sw_vers -productVersion | cut -d. -f1)
+case "$macos_major" in
+  ''|*[!0-9]*) die "Could not determine the macOS version." ;;
+esac
+if [ "${macos_major:-0}" -lt 26 ]; then
+  die "macOS 26 or newer is required by the supported Apple container release."
+fi
+
+host_uid=$(id -u)
+host_gid=$(id -g)
+[ "$host_uid" -gt 0 ] && [ "$host_gid" -gt 0 ] \
+  || die "Refusing to launch an Agent container from a numeric root account."
+singleton_container_name="agent-$profile_id-$host_uid-singleton"
+
+container_bin="${AGENT_CONTAINER_BIN:-container}"
+command -v "$container_bin" >/dev/null 2>&1 \
+  || die "Apple container is not installed. Install it from https://github.com/apple/container/releases"
+
+container_version_output=$("$container_bin" --version 2>&1) \
+  || die "Unable to execute '$container_bin --version'."
+container_version=$(printf '%s\n' "$container_version_output" \
+  | sed -nE 's/.*version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
+  | head -n 1)
+[ -n "$container_version" ] \
+  || die "Could not parse Apple container version from: $container_version_output"
+version_at_least "$container_version" "$MIN_CONTAINER_VERSION" \
+  || die "Apple container $MIN_CONTAINER_VERSION or newer is required (found $container_version)."
+
+if ! "$container_bin" system status >/dev/null 2>&1; then
+  printf '%s\n' \
+    "Apple container services are not running; starting them now..." >&2
+  "$container_bin" system start \
+    || die "Unable to start Apple container services with: $container_bin system start"
+  "$container_bin" system status >/dev/null 2>&1 \
+    || die "Apple container services did not become ready after: $container_bin system start"
+fi
+
+# Return every project-labeled container plus any container occupying this
+# launcher's reserved name pattern. The latter is reported even without our
+# labels so recovery never deletes an unproven resource merely because its
+# name looks familiar.
+list_native_agent_containers() {
+  local list_tmp parsed_records
+  list_tmp=$(mktemp "${TMPDIR:-/tmp}/agent-container-list.XXXXXX") \
+    || die "Unable to create temporary storage for Apple container state."
+  if ! "$container_bin" list --all --format json > "$list_tmp" 2>/dev/null; then
+    rm -f "$list_tmp"
+    die "Unable to enumerate Apple containers for stale-session safety."
+  fi
+  if ! parsed_records=$("$osascript_bin" -l JavaScript - \
+    "$list_tmp" "$host_uid" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('container list is not readable UTF-8');
+  const containers = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(containers)) throw new Error('container list must be an array');
+
+  const hostUID = argv[1];
+  const reserved = new RegExp(
+    '^agent-[a-z0-9-]+-' + hostUID + '(?:-[0-9]+|-singleton)$'
+  );
+  const records = [];
+  for (const container of containers) {
+    if (container === null || typeof container !== 'object' || Array.isArray(container)) {
+      throw new Error('container list contains a non-object record');
+    }
+    const id = container.id;
+    if (typeof id !== 'string' || /[\t\r\n]/.test(id)) {
+      throw new Error('container id is not a single-line string');
+    }
+    const configuration = container.configuration;
+    if (configuration === null || typeof configuration !== 'object'
+        || Array.isArray(configuration) || configuration.id !== id) {
+      throw new Error('container configuration identity does not match its record');
+    }
+    const labels = configuration && typeof configuration === 'object'
+      && configuration.labels && typeof configuration.labels === 'object'
+      ? configuration.labels
+      : {};
+    const owned = labels['com.loadchange.agent-container'] === 'true';
+    if (!owned && !reserved.test(id)) continue;
+
+    const state = container.status && typeof container.status === 'object'
+      ? container.status.state
+      : null;
+    if (!['unknown', 'stopped', 'running', 'stopping'].includes(state)) {
+      throw new Error('managed container has an invalid runtime state');
+    }
+    const values = [
+      id,
+      owned ? 'true' : 'false',
+      labels['com.loadchange.agent-container.profile'] ?? '-',
+      labels['com.loadchange.agent-container.host-uid'] ?? '-',
+      labels['com.loadchange.agent-container.launcher-pid'] ?? '-',
+      labels['com.loadchange.agent-container.mode'] ?? '-',
+      labels['com.loadchange.agent-container.workspace-roots-sha256'] ?? '-',
+      labels['com.loadchange.agent-container.config-sha256'] ?? '-',
+      state
+    ];
+    if (values.some((value) => typeof value !== 'string' || /[\t\r\n]/.test(value))) {
+      throw new Error('managed container metadata is not a single-line string');
+    }
+    records.push(values.join('\t'));
+  }
+  return records.join('\n');
+}
+JXA
+  ); then
+    rm -f "$list_tmp"
+    die "Apple container state did not match the expected JSON contract."
+  fi
+  rm -f "$list_tmp"
+  [ -z "$parsed_records" ] || printf '%s\n' "$parsed_records"
+}
+
+# Confirm only the narrow fact needed after an attached --rm start: the exact
+# container ID is absent from a successful, structurally valid `list --all`.
+# Inspect stderr is intentionally not parsed because Apple may wrap a
+# not-found phrase inside a broader service/RPC error. Any list failure,
+# malformed record, or matching ID is indeterminate and therefore returns
+# failure without deleting anything.
+native_container_name_is_absent() {
+  local expected_name="$1"
+  local list_tmp
+  list_tmp=$(mktemp "${TMPDIR:-/tmp}/agent-container-absence.XXXXXX") \
+    || return 1
+  if ! "$container_bin" list --all --format json > "$list_tmp" 2>/dev/null; then
+    rm -f "$list_tmp"
+    return 1
+  fi
+  if ! "$osascript_bin" -l JavaScript - \
+    "$list_tmp" "$expected_name" >/dev/null 2>&1 <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('container list is not readable UTF-8');
+  const containers = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(containers)) throw new Error('container list must be an array');
+
+  const expectedID = argv[1];
+  for (const container of containers) {
+    if (container === null || typeof container !== 'object' || Array.isArray(container)) {
+      throw new Error('container list contains a non-object record');
+    }
+    const id = container.id;
+    if (typeof id !== 'string' || /[\t\r\n]/.test(id)) {
+      throw new Error('container id is not a single-line string');
+    }
+    if (id === expectedID) throw new Error('container still exists');
+  }
+  return 'absent';
+}
+JXA
+  then
+    rm -f "$list_tmp"
+    return 1
+  fi
+  rm -f "$list_tmp"
+}
+
+valid_sha256_value() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+}
+
+validate_singleton_native_record() {
+  local native_id="$1"
+  local native_owned="$2"
+  local native_profile="$3"
+  local native_uid="$4"
+  local native_pid="$5"
+  local native_mode="$6"
+  local native_roots_hash="$7"
+  local native_config_hash="$8"
+
+  valid_profile_id "$native_profile" \
+    || die "Container '$native_id' has an invalid singleton profile label."
+  [ "$native_id" = "agent-$native_profile-$host_uid-singleton" ] \
+    || die "Singleton container identity mismatch: $native_id"
+  [ "$native_owned" = true ] \
+    || die "Container '$native_id' occupies a singleton name without project ownership labels."
+  [ "$native_uid" = "$host_uid" ] \
+    || die "Container '$native_id' has mismatched singleton host UID provenance."
+  case "$native_pid" in
+    ''|0|1|*[!0-9]*)
+      die "Container '$native_id' has an invalid creator PID label."
+      ;;
+  esac
+  [ "$native_mode" = singleton ] \
+    || die "Container '$native_id' lacks the singleton mode label."
+  # Accept the legacy roots column from structured list parsing, but a generic
+  # singleton neither requires nor publishes a static workspace-root hash.
+  [ -n "$native_roots_hash" ] \
+    || die "Container '$native_id' has invalid singleton metadata."
+  valid_sha256_value "$native_config_hash" \
+    || die "Container '$native_id' has an invalid singleton configuration fingerprint."
+}
+
+clear_singleton_state_files() {
+  local singleton_state_root="$1"
+  local singleton_stage_root="$singleton_state_root/guest-stage"
+  local singleton_ssh_stage="$singleton_stage_root/ssh"
+
+  [ -e "$singleton_state_root" ] || [ -L "$singleton_state_root" ] || return 0
+  validate_managed_directory "$singleton_state_root"
+  validate_managed_directory "$singleton_stage_root"
+  validate_managed_directory "$singleton_ssh_stage"
+  if [ -d "$singleton_stage_root" ]; then
+    rm -f "$singleton_stage_root/gitconfig"
+    if [ -d "$singleton_ssh_stage" ]; then
+      rm -f \
+        "$singleton_ssh_stage/config" \
+        "$singleton_ssh_stage/known_hosts" \
+        "$singleton_ssh_stage/known_hosts.old" \
+        "$singleton_ssh_stage/allowed_signers"
+      rmdir "$singleton_ssh_stage" 2>/dev/null || true
+    fi
+    rmdir "$singleton_stage_root" 2>/dev/null || true
+  fi
+  rm -f \
+    "$singleton_state_root/phase" \
+    "$singleton_state_root/creator-pid" \
+    "$singleton_state_root/agent-version" \
+    "$singleton_state_root/image-digest" \
+    "$singleton_state_root/config.sha256"
+  rmdir "$singleton_state_root" 2>/dev/null || true
+}
+
+if [ -n "$singleton_control_action" ]; then
+  host_home_dir=$(resolve_absolute_dir "$host_home_dir") \
+    || die "Unable to resolve the host home for singleton control."
+  control_state_root="$host_home_dir/.agent-container"
+  control_profiles_root="$control_state_root/profiles"
+  control_profile_root="$control_profiles_root/$profile_id"
+  control_singleton_root="$control_profile_root/singleton"
+  if [ -e "$control_state_root" ] || [ -L "$control_state_root" ]; then
+    validate_managed_directory "$control_state_root"
+    ownership_marker_valid "$control_state_root/.agent-container-owned" \
+      || die "Agent state has no valid ownership marker; singleton control stopped fail-closed."
+    validate_managed_directory "$control_profiles_root"
+    validate_managed_directory "$control_profile_root"
+    validate_managed_directory "$control_singleton_root"
+  fi
+
+  if [ "$singleton_control_action" = stop ]; then
+    acquire_lifecycle_lock
+  fi
+
+  singleton_record=""
+  while IFS=$'\t' read -r \
+    native_id native_owned native_profile native_uid native_pid \
+    native_mode native_roots_hash native_config_hash native_state; do
+    [ -n "$native_id" ] || continue
+    if [ "$native_id" = "$singleton_container_name" ]; then
+      [ -z "$singleton_record" ] \
+        || die "Apple container returned duplicate records for '$singleton_container_name'."
+      validate_singleton_native_record \
+        "$native_id" "$native_owned" "$native_profile" "$native_uid" \
+        "$native_pid" "$native_mode" "$native_roots_hash" \
+        "$native_config_hash"
+      singleton_record=$(printf '%s\t%s\t%s\t%s\n' \
+        "$native_state" "$native_roots_hash" "$native_config_hash" "$native_pid")
+    fi
+  done <<EOF
+$(list_native_agent_containers)
+EOF
+
+  if [ -z "$singleton_record" ]; then
+    if [ "$singleton_control_action" = stop ]; then
+      clear_singleton_state_files "$control_singleton_root"
+    fi
+    printf '%s singleton: stopped (container %s is absent)\n' \
+      "$profile_id" "$singleton_container_name"
+    exit 0
+  fi
+
+  IFS=$'\t' read -r \
+    singleton_native_state singleton_native_roots_hash \
+    singleton_native_config_hash singleton_creator_pid <<EOF
+$singleton_record
+EOF
+
+  if [ "$singleton_control_action" = status ]; then
+    singleton_phase=$(read_single_line "$control_singleton_root/phase" || true)
+    [ -n "$singleton_phase" ] || singleton_phase=unregistered
+    printf '%s singleton: %s (container=%s phase=%s config-sha256=%s)\n' \
+      "$profile_id" \
+      "$singleton_native_state" \
+      "$singleton_container_name" \
+      "$singleton_phase" \
+      "$singleton_native_config_hash"
+    exit 0
+  fi
+
+  if [ "$singleton_native_state" != stopped ]; then
+    "$container_bin" stop --time 5 "$singleton_container_name" >/dev/null 2>&1 \
+      || true
+  fi
+
+  post_stop_record=""
+  while IFS=$'\t' read -r \
+    native_id native_owned native_profile native_uid native_pid \
+    native_mode native_roots_hash native_config_hash native_state; do
+    [ "$native_id" = "$singleton_container_name" ] || continue
+    validate_singleton_native_record \
+      "$native_id" "$native_owned" "$native_profile" "$native_uid" \
+      "$native_pid" "$native_mode" "$native_roots_hash" \
+      "$native_config_hash"
+    post_stop_record="$native_state"
+  done <<EOF
+$(list_native_agent_containers)
+EOF
+
+  case "$post_stop_record" in
+    '') ;;
+    stopped)
+      "$container_bin" delete --force "$singleton_container_name" >/dev/null 2>&1 \
+        || native_container_name_is_absent "$singleton_container_name" \
+        || die "The stopped '$profile_id' singleton could not be deleted safely."
+      ;;
+    *)
+      die "The '$profile_id' singleton remained in state '$post_stop_record' after stop; it was not force-deleted."
+      ;;
+  esac
+  native_container_name_is_absent "$singleton_container_name" \
+    || die "Could not prove the '$profile_id' singleton container is absent after stop."
+  clear_singleton_state_files "$control_singleton_root"
+  printf '%s singleton stopped: %s\n' "$profile_id" "$singleton_container_name"
+  exit 0
+fi
+
+http_proxy_value="${AGENT_CONTAINER_HTTP_PROXY:-}"
+https_proxy_value="${AGENT_CONTAINER_HTTPS_PROXY:-}"
+all_proxy_value="${AGENT_CONTAINER_ALL_PROXY:-}"
+no_proxy_value="${AGENT_CONTAINER_NO_PROXY:-localhost,127.0.0.1}"
+dns1_value="${AGENT_CONTAINER_DNS1:-}"
+dns2_value="${AGENT_CONTAINER_DNS2:-}"
+timezone_value="${AGENT_CONTAINER_TZ:-}"
+host_alias_value="${AGENT_CONTAINER_HOST_ALIAS:-}"
+block_host_value="${AGENT_CONTAINER_BLOCK_HOST:-}"
+extra_ca_setting="${AGENT_CONTAINER_EXTRA_CA_CERTS:-auto}"
+
+reject_control_characters --container-http-proxy "$http_proxy_value"
+reject_control_characters --container-https-proxy "$https_proxy_value"
+reject_control_characters --container-all-proxy "$all_proxy_value"
+reject_control_characters --container-no-proxy "$no_proxy_value"
+reject_control_characters --container-dns1 "$dns1_value"
+reject_control_characters --container-dns2 "$dns2_value"
+reject_control_characters --container-timezone "$timezone_value"
+reject_control_characters --container-host-alias "$host_alias_value"
+reject_control_characters --container-block-host "$block_host_value"
+reject_control_characters --container-cpus "${AGENT_CONTAINER_CPUS:-4}"
+reject_control_characters --container-memory "${AGENT_CONTAINER_MEMORY:-4g}"
+
+host_aliases=()
+if [ -n "$host_alias_value" ]; then
+  case "$host_alias_value" in
+    ,*|*,|*,,*) die "--container-host-alias must contain comma-separated DNS names." ;;
+  esac
+  IFS=, read -r -a requested_host_aliases <<EOF
+$host_alias_value
+EOF
+  for host_alias in "${requested_host_aliases[@]}"; do
+    case "$host_alias" in
+      ''|*[!A-Za-z0-9.-]*|.*|*.|*..*)
+        die "--container-host-alias contains an unsafe DNS name: $host_alias"
+        ;;
+    esac
+    if [ "${#host_aliases[@]}" -eq 0 ] \
+      || ! array_contains_value "$host_alias" "${host_aliases[@]}"; then
+      host_aliases+=("$host_alias")
+    fi
+  done
+fi
+
+blocked_hosts=()
+if [ -n "$block_host_value" ]; then
+  case "$block_host_value" in
+    ,*|*,|*,,*) die "--container-block-host must contain comma-separated DNS names." ;;
+  esac
+  IFS=, read -r -a requested_blocked_hosts <<EOF
+$block_host_value
+EOF
+  for blocked_host in "${requested_blocked_hosts[@]}"; do
+    case "$blocked_host" in
+      ''|*[!A-Za-z0-9.-]*|.*|*.|*..*)
+        die "--container-block-host contains an unsafe DNS name: $blocked_host"
+        ;;
+    esac
+    if array_contains_value "$blocked_host" "${host_aliases[@]}"; then
+      die "A hostname cannot be both --container-host-alias and --container-block-host: $blocked_host"
+    fi
+    if [ "${#blocked_hosts[@]}" -eq 0 ] \
+      || ! array_contains_value "$blocked_host" "${blocked_hosts[@]}"; then
+      blocked_hosts+=("$blocked_host")
+    fi
+  done
+fi
+
+case "$extra_ca_setting" in
+  ''|auto) ;;
+  /*)
+    case "$extra_ca_setting" in
+      *','*|*$'\n'*|*$'\r'*|*$'\t'*)
+        die "--container-extra-ca contains characters unsupported by the Apple build-secret interface."
+        ;;
+    esac
+    ;;
+  *)
+    die "--container-extra-ca must be 'auto' or an absolute PEM bundle path."
+    ;;
+esac
+
+proxy_values_lower=$(
+  printf '%s\n' "$http_proxy_value" "$https_proxy_value" "$all_proxy_value" \
+    | tr '[:upper:]' '[:lower:]'
+)
+case "$proxy_values_lower" in
+  *host.docker.internal*)
+    die "host.docker.internal is Docker-specific and is unreachable from Apple containers. Configure a VM-reachable proxy address, or explicitly create and use Apple's host.container.internal bridge as documented in README.md."
+    ;;
+esac
+
+host_workspace=$(pwd -P)
+mount_root="$host_workspace"
+common_git_dir=""
+
+if command -v git >/dev/null 2>&1 \
+  && git -C "$host_workspace" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git_top=$(git -C "$host_workspace" rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -n "$git_top" ] && [ -d "$git_top" ]; then
+    mount_root=$(resolve_absolute_dir "$git_top")
+  fi
+
+  common_git_dir=$(git -C "$host_workspace" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  if [ -z "$common_git_dir" ]; then
+    common_git_raw=$(git -C "$host_workspace" rev-parse --git-common-dir 2>/dev/null || true)
+    if [ -n "$common_git_raw" ]; then
+      case "$common_git_raw" in
+        /*) common_git_dir="$common_git_raw" ;;
+        *) common_git_dir=$(resolve_absolute_dir "$mount_root/$common_git_raw" || true) ;;
+      esac
+    fi
+  fi
+fi
+
+if [ -n "$common_git_dir" ]; then
+  [ -d "$common_git_dir" ] \
+    || die "Git reported a common directory that does not exist: $common_git_dir"
+  common_git_dir=$(resolve_absolute_dir "$common_git_dir")
+fi
+reject_control_characters "workspace path" "$host_workspace"
+reject_control_characters "workspace root" "$mount_root"
+reject_control_characters "Git common directory" "$common_git_dir"
+if [ "$singleton_requested" = true ] \
+  && [ -n "$common_git_dir" ] \
+  && ! path_contains "$mount_root" "$common_git_dir"; then
+  die "The current Git worktree uses an external common directory '$common_git_dir'. Dynamic singleton sharing currently supports one workspace root; use 'agent-container run $profile_id --' for this worktree."
+fi
+
+home_canonical=$(resolve_absolute_dir "$host_home_dir")
+host_home_dir="$home_canonical"
+
+extra_share_paths=()
+extra_share_modes=()
+if [ "$run_mode" = true ]; then
+  share_index=0
+  while [ "$share_index" -lt "${#extra_share_inputs[@]}" ]; do
+    share_input="${extra_share_inputs[$share_index]}"
+    share_mode="${extra_share_input_modes[$share_index]}"
+    [ -d "$share_input" ] \
+      || die "Additional share is not an existing directory: $share_input"
+    share_path=$(resolve_absolute_dir "$share_input") \
+      || die "Unable to resolve additional share: $share_input"
+    case "$share_path" in
+      /|*$'\n'*|*$'\r'*|*$'\t'*)
+        die "Additional share has an unsafe canonical path: $share_path"
+        ;;
+    esac
+    validate_volume_source_path "$share_path"
+    if path_contains "$share_path" "$home_canonical"; then
+      die "Refusing an additional share that contains the real host HOME: $share_path"
+    fi
+    if paths_overlap "$share_path" "$asset_dir"; then
+      die "Refusing overlap between an additional share and installed runtime assets: $share_path"
+    fi
+    if paths_overlap "$share_path" "$mount_root"; then
+      die "Additional share overlaps the existing workspace mount: $share_path"
+    fi
+    if [ -n "$common_git_dir" ] \
+      && paths_overlap "$share_path" "$common_git_dir"; then
+      die "Additional share overlaps the external Git common directory: $share_path"
+    fi
+    if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+      for existing_share in "${extra_share_paths[@]}"; do
+        paths_overlap "$share_path" "$existing_share" \
+          && die "Additional shares may not overlap: $share_path and $existing_share"
+      done
+    fi
+    extra_share_paths+=("$share_path")
+    extra_share_modes+=("$share_mode")
+    share_index=$((share_index + 1))
+  done
+fi
+
+max_workspace_files="${AGENT_CONTAINER_MAX_FILES:-40000}"
+case "$max_workspace_files" in
+  ''|*[!0-9]*) die "--container-max-files must be a positive integer." ;;
+esac
+[ "$max_workspace_files" -gt 0 ] \
+  || die "--container-max-files must be greater than zero."
+
+workspace_file_count=0
+
+state_root_input="$host_home_dir/.agent-container"
+if [ -n "${AGENT_CONTAINER_STATE_DIR:-}" ] \
+  && [ "$AGENT_CONTAINER_STATE_DIR" != "$state_root_input" ]; then
+  die "Custom AGENT_CONTAINER_STATE_DIR is not supported because session registration must remain globally discoverable for safe uninstall."
+fi
+[ ! -L "$state_root_input" ] \
+  || die "Refusing a symlink as the Agent container state root: $state_root_input"
+state_root=$(canonical_data_dir "$state_root_input")
+path_contains "$home_canonical" "$state_root" \
+  || die "Agent container state must remain under the user's home directory: $state_root"
+[ "$state_root" != "$home_canonical" ] \
+  || die "Refusing to use the entire host home as Agent container state."
+
+state_ownership_marker="$state_root/.agent-container-owned"
+validate_marker_path "$state_ownership_marker"
+if [ -d "$state_root" ] \
+  && ! ownership_marker_valid "$state_ownership_marker" \
+  && ! is_empty_dir "$state_root"; then
+  die "State directory is non-empty and has no valid agent-container ownership marker: $state_root"
+fi
+
+singleton_config_hash=""
+singleton_runtime_config_hash=""
+if [ "$singleton_requested" = true ]; then
+  singleton_runtime_config_hash=$(
+    {
+      printf 'cpus=%s\n' "${AGENT_CONTAINER_CPUS:-4}"
+      printf 'memory=%s\n' "${AGENT_CONTAINER_MEMORY:-4g}"
+      printf 'http-proxy=%s\n' "$http_proxy_value"
+      printf 'https-proxy=%s\n' "$https_proxy_value"
+      printf 'all-proxy=%s\n' "$all_proxy_value"
+      printf 'no-proxy=%s\n' "$no_proxy_value"
+      printf 'dns1=%s\n' "$dns1_value"
+      printf 'dns2=%s\n' "$dns2_value"
+      printf 'timezone=%s\n' "$timezone_value"
+      printf 'host-alias=%s\n' "$host_alias_value"
+      printf 'block-host=%s\n' "$block_host_value"
+    } | sha256_stream
+  )
+fi
+
+if [ "$singleton_requested" != true ]; then
+  workspace_file_count=$(bounded_file_count "$mount_root" "$max_workspace_files")
+  if [ "$workspace_file_count" -le "$max_workspace_files" ] \
+    && [ -n "$common_git_dir" ] \
+    && ! path_contains "$mount_root" "$common_git_dir"; then
+    remaining_file_budget=$((max_workspace_files - workspace_file_count))
+    common_git_file_count=$(bounded_file_count "$common_git_dir" "$remaining_file_budget")
+    workspace_file_count=$((workspace_file_count + common_git_file_count))
+  fi
+  if [ "$workspace_file_count" -gt "$max_workspace_files" ] \
+    && ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
+    die "Workspace mounts have more than $max_workspace_files files. Apple VirtioFS issue #1097 can exhaust host file descriptors and has caused kernel panics. Reduce the mounted tree, or pass --container-accept-virtiofs-risk after reviewing $VIRTIOFS_ISSUE_URL"
+  fi
+fi
+
+for shared_tree in "$mount_root" "$common_git_dir"; do
+  [ -n "$shared_tree" ] || continue
+  if path_contains "$shared_tree" "$state_root" \
+    || path_contains "$state_root" "$shared_tree"; then
+    die "Refusing overlap between shared workspace/Git data '$shared_tree' and private Agent state '$state_root'. Run from a narrower project directory."
+  fi
+done
+if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+  for shared_tree in "${extra_share_paths[@]}"; do
+    if path_contains "$shared_tree" "$state_root" \
+      || path_contains "$state_root" "$shared_tree"; then
+      die "Refusing overlap between an additional share '$shared_tree' and private Agent state '$state_root'."
+    fi
+  done
+fi
+
+profiles_root="$state_root/profiles"
+profile_root="$profiles_root/$profile_id"
+profile_home="$profile_root/home"
+profile_host_exec_home="$profile_root/host-home"
+profile_meta="$profile_root/meta"
+singleton_root="$profile_root/singleton"
+singleton_guest_stage="$singleton_root/guest-stage"
+singleton_phase_file="$singleton_root/phase"
+singleton_config_hash_file="$singleton_root/config.sha256"
+singleton_image_digest_file="$singleton_root/image-digest"
+singleton_agent_version_file="$singleton_root/agent-version"
+sessions_root="$state_root/sessions"
+host_stage_dir="$sessions_root/session-$$"
+lock_dir="$state_root/session.lock"
+profile_lock_dir="$profile_root/session.lock"
+image_marker="$profile_meta/image-build-id"
+image_identity_file="$profile_meta/image-identity"
+image_ref_file="$profile_meta/image-ref"
+full_git_config=false
+gitconfig_tmp=""
+if is_true "${AGENT_CONTAINER_FULL_GIT_CONFIG:-false}"; then
+  full_git_config=true
+fi
+forward_ssh_agent=false
+if is_true "${AGENT_CONTAINER_FORWARD_SSH_AGENT:-false}"; then
+  forward_ssh_agent=true
+fi
+mount_ssh_config=false
+if is_true "${AGENT_CONTAINER_MOUNT_SSH_CONFIG:-false}"; then
+  mount_ssh_config=true
+fi
+
+concurrent_sessions=false
+if is_true "${AGENT_CONTAINER_ALLOW_CONCURRENT:-false}"; then
+  concurrent_sessions=true
+fi
+if [ "$concurrent_sessions" = true ] \
+  && [ "$singleton_requested" != true ] \
+  && ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
+  die "--container-allow-concurrent also requires --container-accept-virtiofs-risk because every legacy run session adds another affected VirtioFS VM."
+fi
+
+validate_managed_directory "$profiles_root"
+validate_managed_directory "$profile_root"
+validate_managed_directory "$profile_home"
+validate_managed_directory "$profile_host_exec_home"
+validate_managed_directory "$profile_meta"
+validate_managed_directory "$singleton_root"
+validate_managed_directory "$singleton_guest_stage"
+validate_managed_directory "$sessions_root"
+validate_managed_directory "$host_stage_dir"
+validate_managed_directory "$lock_dir"
+validate_managed_directory "$profile_lock_dir"
+
+gh_config_dir=""
+if is_true "${AGENT_CONTAINER_MOUNT_GH:-false}" \
+  && [ -d "$host_home_dir/.config/gh" ]; then
+  gh_config_dir=$(resolve_absolute_dir "$host_home_dir/.config/gh")
+fi
+git_xdg_config_dir=""
+if [ "$full_git_config" = true ] \
+  && [ -d "$host_home_dir/.config/git" ]; then
+  git_xdg_config_dir=$(resolve_absolute_dir "$host_home_dir/.config/git")
+fi
+reject_control_characters "GitHub configuration path" "$gh_config_dir"
+reject_control_characters "Git XDG configuration path" "$git_xdg_config_dir"
+
+for volume_source in \
+  "$mount_root" \
+  "$common_git_dir" \
+  "$profile_home" \
+  "$host_stage_dir" \
+  "$gh_config_dir" \
+  "$git_xdg_config_dir"; do
+  [ -n "$volume_source" ] && validate_volume_source_path "$volume_source"
+done
+if [ "$singleton_requested" = true ]; then
+  validate_volume_source_path "$singleton_guest_stage"
+fi
+if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+  for volume_source in "${extra_share_paths[@]}"; do
+    validate_volume_source_path "$volume_source"
+  done
+fi
+
+# Account for every user-controlled directory that becomes a VirtioFS share.
+# The profile HOME is isolated from the real host HOME, but it can still grow
+# large enough to trigger the upstream VirtioFS descriptor-retention issue.
+mounted_entry_count=$((workspace_file_count + 8))
+add_tree_to_mount_budget() {
+  local source="$1"
+  local remaining tree_count
+  [ -d "$source" ] || return 0
+  [ "$mounted_entry_count" -le "$max_workspace_files" ] || return 0
+  mounted_entry_count=$((mounted_entry_count + 1))
+  [ "$mounted_entry_count" -le "$max_workspace_files" ] || return 0
+  remaining=$((max_workspace_files - mounted_entry_count))
+  tree_count=$(bounded_file_count "$source" "$remaining")
+  mounted_entry_count=$((mounted_entry_count + tree_count))
+}
+
+add_tree_to_mount_budget "$profile_home"
+if [ -n "$gh_config_dir" ]; then
+  add_tree_to_mount_budget "$gh_config_dir"
+fi
+if [ -n "$git_xdg_config_dir" ]; then
+  add_tree_to_mount_budget "$git_xdg_config_dir"
+fi
+if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+  for extra_share_path in "${extra_share_paths[@]}"; do
+    add_tree_to_mount_budget "$extra_share_path"
+  done
+fi
+if [ "$mounted_entry_count" -gt "$max_workspace_files" ] \
+  && ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
+  die "Projected VirtioFS shares have more than $max_workspace_files filesystem entries. Reduce mounted trees, or explicitly accept the upstream risk after reviewing $VIRTIOFS_ISSUE_URL"
+fi
+
+fd_stop_percent="${AGENT_CONTAINER_FD_STOP_PERCENT:-80}"
+if ! is_true "${AGENT_CONTAINER_DISABLE_FD_WATCHDOG:-false}"; then
+  case "$fd_stop_percent" in
+    ''|*[!0-9]*) die "--container-fd-stop-percent must be an integer from 50 through 95." ;;
+  esac
+  [ "$fd_stop_percent" -ge 50 ] && [ "$fd_stop_percent" -le 95 ] \
+    || die "--container-fd-stop-percent must be an integer from 50 through 95."
+fi
+
+host_num_files=$(sysctl -n kern.num_files 2>/dev/null || true)
+host_max_files=$(sysctl -n kern.maxfiles 2>/dev/null || true)
+host_max_files_per_proc=$(sysctl -n kern.maxfilesperproc 2>/dev/null || true)
+host_max_vnodes=$(sysctl -n kern.maxvnodes 2>/dev/null || true)
+host_free_vnodes=$(sysctl -n kern.free_vnodes 2>/dev/null || true)
+case "$host_num_files:$host_max_files:$host_max_files_per_proc:$host_max_vnodes:$host_free_vnodes" in
+  *[!0-9:]*)
+    host_num_files=""
+    host_max_files=""
+    host_max_files_per_proc=""
+    host_max_vnodes=""
+    host_free_vnodes=""
+    ;;
+esac
+if [ -z "$host_num_files" ] \
+  || [ -z "$host_max_files" ] \
+  || [ -z "$host_max_files_per_proc" ] \
+  || [ -z "$host_max_vnodes" ] \
+  || [ -z "$host_free_vnodes" ] \
+  || [ "$host_max_files" -le 0 ] \
+  || [ "$host_max_files_per_proc" -le 0 ] \
+  || [ "$host_max_vnodes" -le 0 ] \
+  || [ "$host_free_vnodes" -gt "$host_max_vnodes" ]; then
+  if is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
+    warn "Unable to read all macOS file/vnode limits; continuing only because --container-accept-virtiofs-risk is enabled."
+    # If counters recover after launch, a zero baseline makes the live
+    # watchdog conservative instead of performing arithmetic on an empty value.
+    host_num_files=0
+  else
+    die "Unable to read macOS file/vnode limits for the VirtioFS safety preflight. Explicitly accept the upstream risk only after reviewing $VIRTIOFS_ISSUE_URL"
+  fi
+else
+  projected_files=$((host_num_files + mounted_entry_count))
+  safe_file_limit=$((host_max_files * 70 / 100))
+  safe_process_file_limit=$((host_max_files_per_proc * 70 / 100))
+  used_vnodes=$((host_max_vnodes - host_free_vnodes))
+  projected_vnodes=$((used_vnodes + mounted_entry_count))
+  safe_vnode_limit=$((host_max_vnodes * 70 / 100))
+  if [ "$projected_files" -ge "$safe_file_limit" ] \
+    || [ "$mounted_entry_count" -ge "$safe_process_file_limit" ] \
+    || [ "$projected_vnodes" -ge "$safe_vnode_limit" ]; then
+    if ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
+      die "Projected VirtioFS use crosses a 70% host file, per-process file, or vnode safety limit. Reduce the shared trees or explicitly accept the upstream risk. See $VIRTIOFS_ISSUE_URL"
+    fi
+  fi
+fi
+
+acquire_lifecycle_lock "$singleton_requested"
+
+umask 077
+mkdir -p "$state_root"
+atomic_write_line "$state_ownership_marker" "$OWNERSHIP_MARKER_TEXT"
+mkdir -p \
+  "$profiles_root" \
+  "$profile_root" \
+  "$profile_home" \
+  "$profile_host_exec_home" \
+  "$profile_meta" \
+  "$sessions_root"
+
+global_lock_acquired=false
+profile_lock_acquired=false
+host_broker_pid=""
+workspace_broker_pid=""
+workspace_broker_watchdog_pid=""
+workspace_broker_liveness_fifo=""
+workspace_broker_liveness_reader_open=false
+workspace_broker_liveness_writer_open=false
+session_job_is_active() {
+  local wanted_pid="$1"
+  local job_pid job_state
+
+  [ -n "$wanted_pid" ] || return 1
+  # These PIDs always belong to asynchronous children of this shell.  Consult
+  # Bash's job table instead of probing the numeric PID: after a child exits,
+  # kill -0 can accidentally match an unrelated process that reused its PID.
+  for job_state in -pr -ps; do
+    while IFS= read -r job_pid; do
+      [ "$job_pid" = "$wanted_pid" ] && return 0
+    done < <(jobs "$job_state" 2>/dev/null)
+  done
+  return 1
+}
+stop_host_broker() {
+  local stop_attempt
+  [ -n "$host_broker_pid" ] || return 0
+  if session_job_is_active "$host_broker_pid"; then
+    kill -TERM "$host_broker_pid" 2>/dev/null || true
+    stop_attempt=0
+    while session_job_is_active "$host_broker_pid" \
+      && [ "$stop_attempt" -lt 50 ]; do
+      sleep 0.1
+      stop_attempt=$((stop_attempt + 1))
+    done
+    if session_job_is_active "$host_broker_pid"; then
+      kill -KILL "$host_broker_pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$host_broker_pid" 2>/dev/null || true
+  host_broker_pid=""
+}
+stop_workspace_broker_watchdog() {
+  [ -n "$workspace_broker_watchdog_pid" ] || return 0
+  if session_job_is_active "$workspace_broker_watchdog_pid"; then
+    kill -TERM "$workspace_broker_watchdog_pid" 2>/dev/null || true
+  fi
+  wait "$workspace_broker_watchdog_pid" 2>/dev/null || true
+  workspace_broker_watchdog_pid=""
+}
+close_workspace_broker_liveness() {
+  if [ "$workspace_broker_liveness_reader_open" = true ]; then
+    exec 8<&-
+    workspace_broker_liveness_reader_open=false
+  fi
+  if [ "$workspace_broker_liveness_writer_open" = true ]; then
+    exec 7>&-
+    workspace_broker_liveness_writer_open=false
+  fi
+  if [ -n "$workspace_broker_liveness_fifo" ]; then
+    case "$workspace_broker_liveness_fifo" in
+      "$host_stage_dir"/workspace-broker.liveness)
+        rm -f -- "$workspace_broker_liveness_fifo" 2>/dev/null || true
+        ;;
+    esac
+    workspace_broker_liveness_fifo=""
+  fi
+}
+cleanup_session() {
+  local cleanup_status=$?
+
+  trap '' INT TERM HUP
+  trap - EXIT
+  set +e
+  close_workspace_broker_liveness
+  stop_workspace_broker_watchdog
+  if [ -n "$workspace_broker_pid" ] \
+    && session_job_is_active "$workspace_broker_pid"; then
+    kill -TERM "$workspace_broker_pid" 2>/dev/null || true
+  fi
+  if [ -n "$workspace_broker_pid" ]; then
+    wait "$workspace_broker_pid" 2>/dev/null || true
+  fi
+  workspace_broker_pid=""
+  stop_host_broker
+  if [ -n "$gitconfig_tmp" ]; then
+    rm -f "$gitconfig_tmp" || true
+  fi
+  # The per-session directory can contain opted-in Git credentials and SSH
+  # metadata. Remove all staging regardless of how the child exits.
+  if [ -d "$host_stage_dir" ] || [ -L "$host_stage_dir" ]; then
+    rm -rf "$host_stage_dir" || true
+  fi
+  if [ "$profile_lock_acquired" = true ] && [ -d "$profile_lock_dir" ]; then
+    rm -f "$profile_lock_dir/pid" "$profile_lock_dir/profile"
+    rmdir "$profile_lock_dir" 2>/dev/null || true
+  fi
+  if [ "$global_lock_acquired" = true ] && [ -d "$lock_dir" ]; then
+    rm -f "$lock_dir/pid" "$lock_dir/profile"
+    rmdir "$lock_dir" 2>/dev/null || true
+  fi
+  release_lifecycle_lock
+  return "$cleanup_status"
+}
+trap cleanup_session EXIT
+
+valid_image_digest() {
+  case "$1" in
+    sha256:????????????????????????????????????????????????????????????????)
+      case "${1#sha256:}" in
+        *[!0-9a-f]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+singleton_state_image_digest=""
+singleton_state_agent_version=""
+singleton_state_creator_pid=""
+validate_singleton_state() {
+  local expected_config_hash="$1"
+  local recorded_phase recorded_config_hash
+
+  validate_managed_directory "$singleton_root"
+  [ -d "$singleton_root" ] \
+    || die "The '$profile_id' singleton exists without its managed state directory. Stop it with: agent-container singleton stop $profile_id"
+  recorded_phase=$(read_single_line "$singleton_phase_file" || true)
+  [ "$recorded_phase" = ready ] \
+    || die "The '$profile_id' singleton state is '$recorded_phase', not ready. Stop it with: agent-container singleton stop $profile_id"
+  recorded_config_hash=$(read_single_line "$singleton_config_hash_file" || true)
+  [ "$recorded_config_hash" = "$expected_config_hash" ] \
+    || die "The running '$profile_id' singleton configuration differs from this launch. Stop it before changing VM, network, or image settings."
+  singleton_state_image_digest=$(read_single_line \
+    "$singleton_image_digest_file" || true)
+  valid_image_digest "$singleton_state_image_digest" \
+    || die "The '$profile_id' singleton image-digest state is invalid."
+  singleton_state_agent_version=$(read_single_line \
+    "$singleton_agent_version_file" || true)
+  valid_agent_version "$singleton_state_agent_version" \
+    || die "The '$profile_id' singleton agent-version state is invalid."
+  singleton_state_creator_pid=$(read_single_line \
+    "$singleton_root/creator-pid" || true)
+  case "$singleton_state_creator_pid" in
+    ''|0|1|*[!0-9]*) die "The '$profile_id' singleton creator-PID state is invalid." ;;
+  esac
+}
+
+verify_singleton_container_inspect() {
+  local inspect_tmp="$1"
+  local expected_state="$2"
+  local expected_digest="$3"
+  local expected_creator_pid="$4"
+
+  "$osascript_bin" -l JavaScript - \
+    "$inspect_tmp" \
+    "$singleton_container_name" \
+    "$profile_id" \
+    "$host_uid" \
+    "$singleton_config_hash" \
+    "$expected_state" \
+    "$expected_digest" \
+    "$expected_creator_pid" >/dev/null 2>&1 <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('container inspect is not readable UTF-8');
+  const containers = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(containers) || containers.length !== 1) {
+    throw new Error('container inspect must contain exactly one container');
+  }
+  const container = containers[0];
+  if (container === null || typeof container !== 'object' || Array.isArray(container)
+      || container.id !== argv[1]) {
+    throw new Error('singleton container id mismatch');
+  }
+  const configuration = container.configuration;
+  if (configuration === null || typeof configuration !== 'object'
+      || Array.isArray(configuration) || configuration.id !== argv[1]) {
+    throw new Error('singleton configuration id mismatch');
+  }
+  const labels = configuration.labels;
+  if (labels === null || typeof labels !== 'object' || Array.isArray(labels)
+      || labels['com.loadchange.agent-container'] !== 'true'
+      || labels['com.loadchange.agent-container.profile'] !== argv[2]
+      || labels['com.loadchange.agent-container.host-uid'] !== argv[3]
+      || labels['com.loadchange.agent-container.launcher-pid'] !== argv[7]
+      || labels['com.loadchange.agent-container.mode'] !== 'singleton'
+      || labels['com.loadchange.agent-container.config-sha256'] !== argv[4]) {
+    throw new Error('singleton provenance labels mismatch');
+  }
+  const status = container.status;
+  if (status === null || typeof status !== 'object' || Array.isArray(status)
+      || status.state !== argv[5]) {
+    throw new Error('singleton runtime state mismatch');
+  }
+  const image = configuration.image;
+  const descriptor = image && typeof image === 'object' && !Array.isArray(image)
+    ? image.descriptor
+    : null;
+  const digest = descriptor && typeof descriptor === 'object' && !Array.isArray(descriptor)
+    ? descriptor.digest
+    : null;
+  if (typeof digest !== 'string' || digest !== argv[6]) {
+    throw new Error('singleton image digest mismatch');
+  }
+  const initProcess = configuration.initProcess;
+  if (initProcess === null || typeof initProcess !== 'object'
+      || Array.isArray(initProcess) || initProcess.terminal !== false) {
+    throw new Error('singleton primary process must not own a terminal');
+  }
+  return 'verified';
+}
+JXA
+}
+
+resolve_singleton_host_gateway() {
+  local network_inspect_tmp
+
+  host_gateway="${AGENT_CONTAINER_HOST_GATEWAY:-}"
+  if [ -z "$host_gateway" ]; then
+    network_inspect_tmp="$host_stage_dir/.singleton-network-inspect.$$"
+    "$container_bin" network inspect default > "$network_inspect_tmp" 2>/dev/null \
+      || die "Unable to inspect Apple's default container network for workspace sharing."
+    host_gateway=$(
+      "$osascript_bin" -l JavaScript - "$network_inspect_tmp" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('network inspect is not readable UTF-8');
+  const networks = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(networks) || networks.length !== 1) {
+    throw new Error('network inspect must contain exactly one network');
+  }
+  const gateway = networks[0]
+    && networks[0].status
+    && networks[0].status.ipv4Gateway;
+  if (typeof gateway !== 'string'
+      || !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(gateway)) {
+    throw new Error('default network has no IPv4 gateway');
+  }
+  return gateway;
+}
+JXA
+    ) || {
+      rm -f "$network_inspect_tmp"
+      die "Apple's default container network returned an invalid host gateway."
+    }
+    rm -f "$network_inspect_tmp"
+  fi
+  if ! printf '%s\n' "$host_gateway" \
+    | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1; ok = 1 } END { exit !ok }'; then
+    die "Unsafe workspace-broker gateway address: $host_gateway"
+  fi
+}
+
+resolve_workspace_launcher() {
+  local candidate candidate_path runtime_path
+  workspace_launcher_bin=""
+  runtime_path=$(/bin/realpath "$0" 2>/dev/null || true)
+  for candidate in \
+    "$script_dir/target/release/agent-container-launcher" \
+    "$asset_dir/target/release/agent-container-launcher" \
+    "$script_dir/agent-container-darwin-arm64" \
+    "$asset_dir/agent-container-darwin-arm64" \
+    "$script_dir/agent-container" \
+    "$script_dir/agent-container-launcher" \
+    "$asset_dir/agent-container-launcher" \
+    "$script_dir/target/debug/agent-container-launcher" \
+    "$asset_dir/target/debug/agent-container-launcher"; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] && [ -x "$candidate" ] \
+      || continue
+    candidate_path=$(/bin/realpath "$candidate" 2>/dev/null || true)
+    [ -n "$candidate_path" ] && [ "$candidate_path" != "$runtime_path" ] \
+      || continue
+    workspace_launcher_bin="$candidate_path"
+    return 0
+  done
+  die "The Rust agent-container launcher is unavailable; reinstall it or build target/release/agent-container-launcher."
+}
+
+run_singleton_client() {
+  local broker_record broker_log broker_line broker_ready broker_signal_ready
+  local watchdog_signal_ready
+  local workspace_endpoint workspace_token workspace_port run_status
+  local singleton_exec_pid=""
+  local singleton_exec_launching=false
+  local singleton_pending_signal_name=""
+  local singleton_pending_signal_status=""
+  local forward_env_name
+  local -a singleton_exec_args singleton_forwarded_env_names
+
+  singleton_exec_is_active_job() {
+    local job_pid job_state
+
+    [ -n "$singleton_exec_pid" ] || return 1
+    for job_state in -pr -ps; do
+      while IFS= read -r job_pid; do
+        [ "$job_pid" = "$singleton_exec_pid" ] && return 0
+      done < <(jobs "$job_state" 2>/dev/null)
+    done
+    return 1
+  }
+
+  handle_singleton_client_signal() {
+    local signal_name="$1"
+    local signal_status="$2"
+    local stop_attempt=0
+
+    if [ "$singleton_exec_launching" = true ]; then
+      if [ -z "$singleton_pending_signal_status" ]; then
+        singleton_pending_signal_name=$signal_name
+        singleton_pending_signal_status=$signal_status
+      fi
+      return 0
+    fi
+    if [ -n "$singleton_pending_signal_status" ]; then
+      signal_name=$singleton_pending_signal_name
+      signal_status=$singleton_pending_signal_status
+      singleton_pending_signal_name=""
+      singleton_pending_signal_status=""
+    fi
+
+    # A non-job-control Bash starts asynchronous children with INT and QUIT
+    # ignored. TERM is the reliable host-side request for Apple container CLI
+    # teardown; the launcher itself still reports the user's original signal.
+    trap '' INT TERM HUP
+    set +e
+    if singleton_exec_is_active_job; then
+      kill -TERM "$singleton_exec_pid" 2>/dev/null || true
+      while singleton_exec_is_active_job \
+        && [ "$stop_attempt" -lt 50 ]; do
+        sleep 0.1
+        stop_attempt=$((stop_attempt + 1))
+      done
+      if singleton_exec_is_active_job; then
+        kill -KILL "$singleton_exec_pid" 2>/dev/null || true
+      fi
+    fi
+    [ -z "$singleton_exec_pid" ] \
+      || wait "$singleton_exec_pid" 2>/dev/null || true
+    singleton_exec_pid=""
+    exit "$signal_status"
+  }
+
+  complete_singleton_exec_launch() {
+    singleton_exec_launching=false
+    if [ -n "$singleton_pending_signal_status" ]; then
+      handle_singleton_client_signal \
+        "$singleton_pending_signal_name" \
+        "$singleton_pending_signal_status"
+    fi
+  }
+
+  resolve_singleton_host_gateway
+  resolve_workspace_launcher
+
+  broker_record="$host_stage_dir/workspace-broker.record"
+  broker_log="$host_stage_dir/workspace-broker.log"
+  broker_signal_ready="$host_stage_dir/workspace-broker.signal-ready"
+  watchdog_signal_ready="$host_stage_dir/workspace-broker-watchdog.signal-ready"
+  : > "$broker_record"
+  : > "$broker_log"
+
+  # The lifecycle critical section ignores interactive signals. Both children
+  # explicitly restore defaults and acknowledge that reset before the parent
+  # may try to terminate and wait for them.
+  (
+    trap - INT TERM HUP
+    # The BSD lock is tied to the shared open-file description.  A forked
+    # watchdog must not keep the lifecycle mutex alive after the launcher
+    # closes its own descriptor to admit another singleton client.
+    exec 9<&-
+    : > "$watchdog_signal_ready"
+    exec sleep "$WORKSPACE_BROKER_READY_TIMEOUT_SECONDS"
+  ) &
+  workspace_broker_watchdog_pid=$!
+  while [ ! -f "$watchdog_signal_ready" ] \
+    && session_job_is_active "$workspace_broker_watchdog_pid"; do
+    sleep 0.01
+  done
+  [ -f "$watchdog_signal_ready" ] \
+    || die "Unable to start the workspace-broker readiness watchdog."
+  rm -f "$watchdog_signal_ready"
+
+  workspace_broker_liveness_fifo="$host_stage_dir/workspace-broker.liveness"
+  [ ! -e "$workspace_broker_liveness_fifo" ] \
+    || die "Workspace-broker liveness endpoint already exists."
+  mkfifo -m 0600 -- "$workspace_broker_liveness_fifo" \
+    || die "Unable to create the workspace-broker liveness endpoint."
+  exec 7<> "$workspace_broker_liveness_fifo" \
+    || die "Unable to open the workspace-broker liveness writer."
+  workspace_broker_liveness_writer_open=true
+  exec 8< "$workspace_broker_liveness_fifo" \
+    || die "Unable to open the workspace-broker liveness reader."
+  workspace_broker_liveness_reader_open=true
+  rm -f -- "$workspace_broker_liveness_fifo" \
+    || die "Unable to unlink the workspace-broker liveness endpoint."
+  workspace_broker_liveness_fifo=""
+
+  (
+    trap - INT TERM HUP
+    # The broker intentionally lives for the whole workspace connection, so
+    # retaining fd 9 here would serialize clients for the whole Agent session.
+    exec 9<&-
+    # Only the launcher parent may retain the write end. The broker receives
+    # the read end and tears down its socket as soon as that parent disappears.
+    exec 7>&-
+    : > "$broker_signal_ready"
+    exec "$workspace_launcher_bin" \
+      __workspace-broker "$mount_root" "$host_gateway" \
+      --liveness-fd 8
+  ) > "$broker_record" 2> "$broker_log" &
+  workspace_broker_pid=$!
+  exec 8<&-
+  workspace_broker_liveness_reader_open=false
+  while [ ! -f "$broker_signal_ready" ] \
+    && session_job_is_active "$workspace_broker_pid" \
+    && session_job_is_active "$workspace_broker_watchdog_pid"; do
+    sleep 0.01
+  done
+  [ -f "$broker_signal_ready" ] \
+    || die "Unable to start the workspace broker safely."
+  rm -f "$broker_signal_ready"
+
+  broker_ready=false
+  while session_job_is_active "$workspace_broker_pid" \
+    && session_job_is_active "$workspace_broker_watchdog_pid"; do
+    if IFS= read -r broker_line < "$broker_record"; then
+      if session_job_is_active "$workspace_broker_pid" \
+        && session_job_is_active "$workspace_broker_watchdog_pid"; then
+        broker_ready=true
+      fi
+      break
+    fi
+    sleep 0.05
+  done
+  stop_workspace_broker_watchdog
+  if [ "$broker_ready" != true ]; then
+    broker_line=$(sed -n '1p' "$broker_log" 2>/dev/null || true)
+    [ -n "$broker_line" ] \
+      || broker_line="the broker did not publish an endpoint"
+    die "Unable to start the workspace broker: $broker_line"
+  fi
+  IFS=$'\t' read -r workspace_endpoint workspace_token < "$broker_record" \
+    || die "The workspace broker returned an incomplete endpoint record."
+  cmp -s "$broker_record" \
+    <(printf '%s\t%s\n' "$workspace_endpoint" "$workspace_token") \
+    || die "The workspace broker returned an invalid multi-line endpoint record."
+  [ "${#workspace_token}" -eq 64 ] \
+    || die "The workspace broker returned an invalid token length."
+  case "$workspace_token" in
+    *[!0-9a-f]*) die "The workspace broker returned an invalid token." ;;
+  esac
+  workspace_port=""
+  case "$workspace_endpoint" in
+    "$host_gateway":*) workspace_port=${workspace_endpoint#"$host_gateway:"} ;;
+  esac
+  case "$workspace_port" in
+    ''|0|0*|*[!0-9]*) workspace_port="" ;;
+  esac
+  [ -n "$workspace_port" ] \
+    && [ "${#workspace_port}" -le 5 ] \
+    && [ "$workspace_port" -le 65535 ] 2>/dev/null \
+    || die "The workspace broker returned an invalid endpoint."
+  session_job_is_active "$workspace_broker_pid" \
+    || die "The workspace broker exited after publishing its endpoint."
+
+  export AGENT_WORKSPACE_ENDPOINT="$workspace_endpoint"
+  export AGENT_WORKSPACE_TOKEN="$workspace_token"
+  singleton_exec_args=(
+    exec
+    --interactive
+    --uid 0
+    --gid 0
+    --workdir /
+    --env AGENT_WORKSPACE_ENDPOINT
+    --env AGENT_WORKSPACE_TOKEN
+    --env "HOME=$host_home_dir"
+    --env "USER=agent-host"
+    --env "LOGNAME=agent-host"
+    --env "SHELL=/bin/bash"
+    --env "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    --env "GIT_CONFIG_GLOBAL=/run/agent-host/gitconfig"
+  )
+  if [ -t 0 ] && [ -t 1 ]; then
+    singleton_exec_args+=(--tty)
+  fi
+  [ -n "${TERM:-}" ] \
+    && singleton_exec_args+=(--env "TERM=$TERM")
+  [ -n "${COLORTERM:-}" ] \
+    && singleton_exec_args+=(--env "COLORTERM=$COLORTERM")
+  [ -z "$profile_disable_update_env" ] \
+    || singleton_exec_args+=(--env "$profile_disable_update_env=1")
+
+  singleton_forwarded_env_names=()
+  if [ "$profile_credential_forward_mode" = true ]; then
+    [ -n "$profile_api_key_env" ] \
+      || die "Profile '$profile_id' does not recognize an API-key environment variable."
+    printenv "$profile_api_key_env" >/dev/null 2>&1 \
+      || die "--container-forward-api-key is enabled, but no credential recognized for profile '$profile_id' is set and exported."
+    singleton_exec_args+=(--env "$profile_api_key_env")
+    singleton_forwarded_env_names+=("$profile_api_key_env")
+  fi
+  if [ "${#explicit_forward_env_names[@]}" -gt 0 ]; then
+    for forward_env_name in "${explicit_forward_env_names[@]}"; do
+      printenv "$forward_env_name" >/dev/null 2>&1 \
+        || die "Explicitly requested environment variable '$forward_env_name' became unavailable before client attach."
+      if [ "${#singleton_forwarded_env_names[@]}" -eq 0 ] \
+        || ! array_contains_value \
+          "$forward_env_name" "${singleton_forwarded_env_names[@]}"; then
+        singleton_exec_args+=(--env "$forward_env_name")
+        singleton_forwarded_env_names+=("$forward_env_name")
+      fi
+    done
+  fi
+
+  # The persistent VM references only profile-scoped staging. Remove this
+  # launcher's live registration before releasing the lifecycle mutex so other
+  # clients can attach concurrently while this container exec remains active.
+  [ -d "$host_stage_dir" ] && [ ! -L "$host_stage_dir" ] \
+    || die "Singleton client staging became unsafe before attach."
+  rm -rf -- "$host_stage_dir" \
+    || die "Unable to remove singleton client staging before attach."
+
+  # Install client traps before releasing the lifecycle mutex. Signals were
+  # intentionally ignored throughout the preceding native critical section;
+  # from this point through child-PID publication they are retained and replayed.
+  singleton_exec_launching=true
+  trap 'handle_singleton_client_signal INT 130' INT
+  trap 'handle_singleton_client_signal TERM 143' TERM
+  trap 'handle_singleton_client_signal HUP 129' HUP
+  release_lifecycle_lock
+  complete_singleton_exec_launch
+  set +e
+  singleton_exec_launching=true
+  (
+    # The Apple CLI must not keep its own launcher alive by retaining the
+    # broker-owner write end after the parent is killed.
+    exec 7>&-
+    exec "$container_bin" "${singleton_exec_args[@]}" \
+      "$singleton_container_name" \
+      /usr/local/bin/agent-workspace-session \
+      "$mount_root" "$host_workspace" "$host_uid" "$host_gid" \
+      "$profile_command" "$@"
+  ) <&0 &
+  singleton_exec_pid=$!
+  complete_singleton_exec_launch
+  wait "$singleton_exec_pid"
+  run_status=$?
+  singleton_exec_pid=""
+  set -e
+  close_workspace_broker_liveness
+  if session_job_is_active "$workspace_broker_pid"; then
+    kill -TERM "$workspace_broker_pid" 2>/dev/null || true
+  fi
+  wait "$workspace_broker_pid" 2>/dev/null || true
+  workspace_broker_pid=""
+  trap - INT TERM HUP
+  exit "$run_status"
+}
+
+# A launcher killed with SIGKILL cannot run its EXIT cleanup, and Apple can keep
+# an attached auto-remove container alive when its client disappears. Reconcile the
+# native resource first, while the lifecycle mutex prevents a new launcher or
+# uninstall transaction from publishing another session concurrently.
+native_records=$(list_native_agent_containers)
+singleton_existing=false
+singleton_existing_state=""
+singleton_existing_creator_pid=""
+singleton_existing_config_hash=""
+while IFS=$'\t' read -r \
+  native_id native_owned native_profile native_uid native_pid \
+  native_mode native_roots_hash native_config_hash native_state; do
+  [ -n "$native_id" ] || continue
+
+  if [ "$native_mode" = singleton ] \
+    || [ "$native_id" = "$singleton_container_name" ]; then
+    validate_singleton_native_record \
+      "$native_id" "$native_owned" "$native_profile" "$native_uid" \
+      "$native_pid" "$native_mode" "$native_roots_hash" \
+      "$native_config_hash"
+    if [ "$native_id" != "$singleton_container_name" ]; then
+      continue
+    fi
+    [ "$singleton_requested" = true ] \
+      || die "A persistent '$profile_id' singleton is active or stopped. Stop it before using legacy run mode: agent-container singleton stop $profile_id"
+    [ "$singleton_existing" = false ] \
+      || die "Apple container returned duplicate records for '$singleton_container_name'."
+    singleton_existing=true
+    singleton_existing_state="$native_state"
+    singleton_existing_creator_pid="$native_pid"
+    singleton_existing_config_hash="$native_config_hash"
+    continue
+  fi
+
+  [ "$native_owned" = true ] \
+    || die "Container '$native_id' occupies an agent-container session name but lacks project ownership labels."
+  valid_profile_id "$native_profile" \
+    || die "Managed native container '$native_id' has an invalid profile label."
+  [ "$native_uid" = "$host_uid" ] \
+    || die "Managed native container '$native_id' has an unexpected host UID label."
+  case "$native_pid" in
+    ''|0|1|*[!0-9]*)
+      die "Managed native container '$native_id' has an invalid launcher PID label."
+      ;;
+  esac
+  [ "$native_id" = "agent-$native_profile-$native_uid-$native_pid" ] \
+    || die "Managed native container '$native_id' does not match its provenance labels."
+
+  if kill -0 "$native_pid" 2>/dev/null; then
+    if [ "$singleton_requested" = true ]; then
+      die "A legacy Agent VM is active; stop it before starting the persistent '$profile_id' singleton."
+    elif [ "$concurrent_sessions" != true ]; then
+      die "Another managed Agent VM is active (container $native_id, launcher PID $native_pid)."
+    fi
+    continue
+  fi
+
+  warn "Removing orphaned Agent VM '$native_id' left by launcher PID $native_pid."
+  "$container_bin" delete --force "$native_id" >/dev/null 2>&1 \
+    || die "Unable to remove orphaned managed Agent VM '$native_id'."
+done <<EOF
+$native_records
+EOF
+
+# Remove only complete, dead registrations. Malformed records fail closed
+# because their directories may hold opted-in Git or SSH material.
+for session_dir in "$sessions_root"/session-*; do
+  [ -e "$session_dir" ] || [ -L "$session_dir" ] || continue
+  [ -d "$session_dir" ] && [ ! -L "$session_dir" ] \
+    || die "Unsafe Agent session registration: $session_dir"
+  session_number=${session_dir##*/session-}
+  case "$session_number" in
+    ''|0|1|*[!0-9]*) die "Invalid Agent session registration name: $session_dir" ;;
+  esac
+  registered_pid=$(read_single_line "$session_dir/pid" || true)
+  [ "$registered_pid" = "$session_number" ] \
+    || die "Agent session registration has an invalid PID: $session_dir"
+  registered_profile=$(read_single_line "$session_dir/profile" || true)
+  valid_profile_id "$registered_profile" \
+    || die "Agent session registration has an invalid profile: $session_dir"
+  if kill -0 "$registered_pid" 2>/dev/null; then
+    if [ "$singleton_requested" = true ]; then
+      die "A legacy Agent session is registering or running; stop it before starting the persistent '$profile_id' singleton."
+    elif [ "$concurrent_sessions" != true ]; then
+      die "Another Agent session is registering or running (PID $registered_pid, profile $registered_profile)."
+    fi
+    continue
+  fi
+  warn "Removing stale Agent session staging for PID $registered_pid."
+  rm -rf -- "$session_dir"
+done
+
+if [ "$singleton_requested" != true ] \
+  && [ "$concurrent_sessions" != true ]; then
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] \
+      || die "Unable to safely inspect the Agent session lock at $lock_dir."
+    [ -f "$lock_dir/pid" ] && [ ! -L "$lock_dir/pid" ] \
+      || die "The Agent session lock has no trustworthy PID; refusing to steal it."
+    existing_pid=$(read_single_line "$lock_dir/pid" || true)
+    case "$existing_pid" in
+      ''|*[!0-9]*) die "The Agent session lock contains an invalid PID; refusing to steal it." ;;
+    esac
+    [ "$existing_pid" -gt 1 ] \
+      || die "The Agent session lock contains an unsafe PID; refusing to steal it."
+    existing_profile=$(read_single_line "$lock_dir/profile" || true)
+    valid_profile_id "$existing_profile" \
+      || die "The Agent session lock contains an invalid profile; refusing to steal it."
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      die "Another Agent container session is running (PID $existing_pid). Concurrent sessions are disabled because of Apple container issue #1097."
+    fi
+    rm -f "$lock_dir/pid" "$lock_dir/profile"
+    rmdir "$lock_dir" 2>/dev/null || true
+    mkdir "$lock_dir" || die "Unable to acquire native session lock at $lock_dir."
+  fi
+  global_lock_acquired=true
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  printf '%s\n' "$profile_id" > "$lock_dir/profile"
+fi
+
+# Even after cross-profile concurrency is explicitly accepted, one legacy
+# session per profile prevents two builds from racing on its fixed tag. A cold
+# singleton launch instead keeps the stronger lifecycle mutex through READY.
+if [ "$singleton_requested" != true ] \
+  && ! mkdir "$profile_lock_dir" 2>/dev/null; then
+  [ -d "$profile_lock_dir" ] && [ ! -L "$profile_lock_dir" ] \
+    || die "Unable to safely inspect the profile session lock at $profile_lock_dir."
+  [ -f "$profile_lock_dir/pid" ] && [ ! -L "$profile_lock_dir/pid" ] \
+    || die "The profile session lock has no trustworthy PID; refusing to steal it."
+  profile_lock_pid=$(read_single_line "$profile_lock_dir/pid" || true)
+  case "$profile_lock_pid" in
+    ''|0|1|*[!0-9]*) die "The profile session lock contains an invalid PID; refusing to steal it." ;;
+  esac
+  profile_lock_profile=$(read_single_line "$profile_lock_dir/profile" || true)
+  [ "$profile_lock_profile" = "$profile_id" ] \
+    || die "The profile session lock has mismatched profile provenance; refusing to steal it."
+  if kill -0 "$profile_lock_pid" 2>/dev/null; then
+    die "Another '$profile_id' Agent session is running (PID $profile_lock_pid). Same-profile sessions are serialized to protect image provenance."
+  fi
+  rm -f "$profile_lock_dir/pid" "$profile_lock_dir/profile"
+  rmdir "$profile_lock_dir" 2>/dev/null || true
+  mkdir "$profile_lock_dir" \
+    || die "Unable to acquire the '$profile_id' profile session lock."
+fi
+if [ "$singleton_requested" != true ]; then
+  profile_lock_acquired=true
+  printf '%s\n' "$$" > "$profile_lock_dir/pid"
+  printf '%s\n' "$profile_id" > "$profile_lock_dir/profile"
+fi
+
+mkdir "$host_stage_dir"
+printf '%s\n' "$$" > "$host_stage_dir/pid"
+printf '%s\n' "$profile_id" > "$host_stage_dir/profile"
+
+host_node_bin=""
+host_broker_bin=""
+if [ "$run_mode" = true ]; then
+  host_path_is_agent_writable() {
+    local candidate_path=$1
+    local writable_index=0
+    if path_contains "$mount_root" "$candidate_path" \
+      || path_contains "$state_root" "$candidate_path"; then
+      return 0
+    fi
+    if [ -n "$common_git_dir" ] \
+      && path_contains "$common_git_dir" "$candidate_path"; then
+      return 0
+    fi
+    while [ "$writable_index" -lt "${#extra_share_paths[@]}" ]; do
+      if [ "${extra_share_modes[$writable_index]}" = rw ] \
+        && path_contains \
+          "${extra_share_paths[$writable_index]}" \
+          "$candidate_path"; then
+        return 0
+      fi
+      writable_index=$((writable_index + 1))
+    done
+    return 1
+  }
+
+  # Agent binaries and launcher internals must remain in the verified guest.
+  # A user blacklist is additive to this small mandatory set.
+  host_exec_denied+=(
+    "$profile_command"
+    agent-container
+    agent-host-exec
+    host-exec
+    claude-container
+    codex-container
+    grok-container
+    container
+    sudo
+  )
+
+  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
+    case "$AGENT_CONTAINER_HOST_BROKER_BIN" in
+      /*) ;;
+      *) die "--container-host-broker must be an absolute path." ;;
+    esac
+    host_broker_bin=$(
+      /bin/realpath "$AGENT_CONTAINER_HOST_BROKER_BIN" 2>/dev/null || true
+    )
+    [ -f "$host_broker_bin" ] && [ -x "$host_broker_bin" ] \
+      || die "--container-host-broker is not executable: $host_broker_bin"
+    ! host_path_is_agent_writable "$host_broker_bin" \
+      || die "Refusing to execute the host broker from an Agent-writable root: $host_broker_bin"
+  else
+    host_node_command="${AGENT_CONTAINER_HOST_NODE_BIN:-$(command -v node || true)}"
+    case "$host_node_command" in
+      /*) ;;
+      *) die "agent-container run requires a host Node.js executable for the host-exec broker." ;;
+    esac
+    host_node_command=$(
+      /bin/realpath "$host_node_command" 2>/dev/null || true
+    )
+    [ -f "$host_node_command" ] && [ -x "$host_node_command" ] \
+      || die "Host Node.js is not executable: $host_node_command"
+    ! host_path_is_agent_writable "$host_node_command" \
+      || die "Refusing to execute host Node.js from an Agent-writable root: $host_node_command"
+    # Resolve version-manager shims while the user's normal shell environment
+    # is still present; the broker later starts from an intentionally clean env.
+    host_node_bin=$(
+      "$host_node_command" -p 'process.execPath' 2>/dev/null || true
+    )
+    case "$host_node_bin" in
+      /*) ;;
+      *) die "Host Node.js could not resolve its native executable." ;;
+    esac
+    host_node_bin=$(/bin/realpath "$host_node_bin" 2>/dev/null || true)
+    [ -f "$host_node_bin" ] && [ -x "$host_node_bin" ] \
+      || die "Resolved host Node.js is not executable: $host_node_bin"
+    ! host_path_is_agent_writable "$host_node_bin" \
+      || die "Refusing a resolved host Node.js inside an Agent-writable root: $host_node_bin"
+    host_broker_bin="$asset_dir/host-exec-broker.mjs"
+  fi
+
+  host_commands_tmp=$(mktemp "$host_stage_dir/.host-commands.XXXXXX") \
+    || die "Unable to create the host command manifest."
+  host_tool_roots_tmp=$(mktemp "$host_stage_dir/.host-tool-roots.XXXXXX") \
+    || die "Unable to create the host tool-root manifest."
+  host_seen_dir="$host_stage_dir/.host-command-seen"
+  mkdir "$host_seen_dir"
+
+  host_node_runtime_root=""
+  if [ -n "$host_node_bin" ]; then
+    host_node_runtime_root=$(dirname -- "$host_node_bin")
+    if [ "$(basename -- "$host_node_runtime_root")" = bin ]; then
+      node_install_prefix=$(dirname -- "$host_node_runtime_root")
+      case "$node_install_prefix" in
+        /) ;;
+        *) host_node_runtime_root="$node_install_prefix" ;;
+      esac
+    fi
+    if path_contains "$host_node_runtime_root" "$host_home_dir"; then
+      host_node_runtime_root=$(dirname -- "$host_node_bin")
+    fi
+    case "$host_node_runtime_root" in
+      ''|/|*:*|*$'\n'*|*$'\r'*|*$'\t'*) host_node_runtime_root="" ;;
+    esac
+    [ -z "$host_node_runtime_root" ] \
+      || printf '%s\n' "$host_node_runtime_root" >> "$host_tool_roots_tmp"
+  fi
+
+  # Stock macOS developer commands are /usr/bin shims. Freeze common shims
+  # (including Git and Python) to the selected Xcode/CommandLineTools
+  # executables and admit their containing runtime tree read-only; this avoids
+  # xcrun trying to create ambient host cache files inside the sandbox.
+  host_developer_path=""
+  host_developer_root=""
+  if [ -x /usr/bin/xcode-select ]; then
+    host_developer_path=$(/usr/bin/xcode-select -p 2>/dev/null || true)
+  fi
+  case "$host_developer_path" in
+    /*)
+      host_developer_path=$(resolve_absolute_dir "$host_developer_path" || true)
+      ;;
+    *) host_developer_path="" ;;
+  esac
+  case "$host_developer_path" in
+    */Contents/Developer)
+      host_developer_root=${host_developer_path%/Contents/Developer}
+      ;;
+    *) host_developer_root="$host_developer_path" ;;
+  esac
+  case "$host_developer_root" in
+    /|*:*|*$'\n'*|*$'\r'*|*$'\t'*) host_developer_root="" ;;
+  esac
+  if [ -n "$host_developer_root" ] \
+    && path_contains "$host_developer_root" "$host_home_dir"; then
+    host_developer_root=""
+  fi
+  [ -z "$host_developer_root" ] \
+    || printf '%s\n' "$host_developer_root" >> "$host_tool_roots_tmp"
+
+  IFS=: read -r -a host_path_entries <<EOF
+${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
+EOF
+  for host_path_entry in "${host_path_entries[@]}"; do
+    [ -n "$host_path_entry" ] || continue
+    case "$host_path_entry" in
+      /*) ;;
+      *) continue ;;
+    esac
+    [ -d "$host_path_entry" ] || continue
+    canonical_host_path=$(resolve_absolute_dir "$host_path_entry" || true)
+    [ -n "$canonical_host_path" ] || continue
+    case "$canonical_host_path" in
+      *$'\n'*|*$'\r'*|*$'\t'*) continue ;;
+    esac
+
+    host_tool_root="$canonical_host_path"
+    case "$canonical_host_path/" in
+      "$host_home_dir/.nvm/"*) host_tool_root="$host_home_dir/.nvm" ;;
+      "$host_home_dir/.pyenv/"*) host_tool_root="$host_home_dir/.pyenv" ;;
+      /opt/homebrew/*) host_tool_root=/opt/homebrew ;;
+      /usr/local/*) host_tool_root=/usr/local ;;
+    esac
+    printf '%s\n' "$host_tool_root" >> "$host_tool_roots_tmp"
+
+    for host_candidate in "$canonical_host_path"/*; do
+      [ -e "$host_candidate" ] || [ -L "$host_candidate" ] || continue
+      [ -f "$host_candidate" ] || continue
+      [ -x "$host_candidate" ] || continue
+      host_command_name=$(basename -- "$host_candidate")
+      valid_host_command_name "$host_command_name" || continue
+      [ ! -e "$host_seen_dir/$host_command_name" ] || continue
+      : > "$host_seen_dir/$host_command_name"
+      array_contains_value "$host_command_name" "${host_exec_denied[@]}" \
+        && continue
+      host_command_mode=fallback
+      if array_contains_value "$host_command_name" "${host_exec_first[@]}"; then
+        host_command_mode=first
+      fi
+      host_executable="$host_candidate"
+      if [ "$host_command_name" = node ] && [ -n "$host_node_bin" ]; then
+        candidate_node=$(/bin/realpath "$host_candidate" 2>/dev/null || true)
+        if [ "$candidate_node" = "$host_node_command" ] \
+          || [ "$candidate_node" = "$host_node_bin" ]; then
+          # A version-manager shim was already executed and validated during
+          # bootstrap. Freeze direct host `node` calls to its process.execPath
+          # so the sandbox does not need mutable shim/cache behavior at runtime.
+          host_executable="$host_node_bin"
+        fi
+      fi
+      selected_developer_tool=""
+      case "$host_command_name" in
+        ar|as|c++|cc|clang|clang++|gcc|git|ld|libtool|lipo|make|nm|otool|pip3|python3|ranlib|size|strings|strip|swift|swiftc|xcodebuild)
+          if [ "$host_candidate" = "/usr/bin/$host_command_name" ] \
+            && [ -n "$host_developer_path" ]; then
+            for developer_tool_candidate in \
+              "$host_developer_path/usr/bin/$host_command_name" \
+              "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin/$host_command_name"; do
+              if [ -f "$developer_tool_candidate" ] \
+                && [ -x "$developer_tool_candidate" ]; then
+                selected_developer_tool="$developer_tool_candidate"
+                break
+              fi
+            done
+          fi
+          ;;
+      esac
+      if [ -n "$selected_developer_tool" ]; then
+        case "$selected_developer_tool" in
+          "$host_developer_root"/*)
+            [ -f "$selected_developer_tool" ] \
+              && [ -x "$selected_developer_tool" ] \
+              && host_executable="$selected_developer_tool"
+            ;;
+        esac
+      fi
+      case "$host_executable" in
+        *$'\n'*|*$'\r'*|*$'\t'*) continue ;;
+      esac
+      canonical_host_executable=$(
+        /bin/realpath "$host_executable" 2>/dev/null || true
+      )
+      [ -f "$canonical_host_executable" ] \
+        && [ -x "$canonical_host_executable" ] \
+        || continue
+      executable_in_tool_root=false
+      for executable_root in \
+        "$host_tool_root" \
+        "$host_node_runtime_root" \
+        "$host_developer_root" \
+        /bin /sbin /usr/bin /usr/sbin; do
+        [ -n "$executable_root" ] || continue
+        if path_contains "$executable_root" "$canonical_host_executable"; then
+          executable_in_tool_root=true
+          break
+        fi
+      done
+      # A PATH directory may contain unrelated symlinks into arbitrary trees
+      # (pipx/uv layouts are common). Skip only that basename instead of writing
+      # a manifest entry that would make the broker reject the entire session.
+      [ "$executable_in_tool_root" = true ] || continue
+      printf '%s\t%s\t%s\n' \
+        "$host_command_mode" "$host_command_name" "$canonical_host_executable" \
+        >> "$host_commands_tmp"
+    done
+  done
+
+  rm -rf "$host_seen_dir"
+  mv "$host_commands_tmp" "$host_stage_dir/host-commands.tsv"
+  sort -u "$host_tool_roots_tmp" > "$host_stage_dir/host-tool-roots.txt"
+  rm -f "$host_tool_roots_tmp"
+  chmod 0600 \
+    "$host_stage_dir/host-commands.tsv" \
+    "$host_stage_dir/host-tool-roots.txt"
+
+  host_roots_tmp=$(mktemp "$host_stage_dir/.host-roots.XXXXXX") \
+    || die "Unable to create the host-exec root manifest."
+  printf 'rw\t%s\n' "$mount_root" >> "$host_roots_tmp"
+  if [ -n "$common_git_dir" ] \
+    && ! path_contains "$mount_root" "$common_git_dir"; then
+    printf 'rw\t%s\n' "$common_git_dir" >> "$host_roots_tmp"
+  fi
+  share_index=0
+  while [ "$share_index" -lt "${#extra_share_paths[@]}" ]; do
+    printf '%s\t%s\n' \
+      "${extra_share_modes[$share_index]}" \
+      "${extra_share_paths[$share_index]}" \
+      >> "$host_roots_tmp"
+    share_index=$((share_index + 1))
+  done
+  mv "$host_roots_tmp" "$host_stage_dir/host-roots.tsv"
+  chmod 0600 "$host_stage_dir/host-roots.tsv"
+
+  host_exec_token=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null \
+    | od -An -tx1 | tr -d ' \n')
+  case "$host_exec_token" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+    *) die "Unable to generate a host-exec session token." ;;
+  esac
+  [ "${#host_exec_token}" -eq 64 ] \
+    || die "Unable to generate a complete host-exec session token."
+  atomic_write_line "$host_stage_dir/host-exec-token" "$host_exec_token"
+fi
+
+# Legacy registration is now visible to an uninstaller holding the same
+# lifecycle mutex. A cold singleton launch has no durable native registration
+# yet, so it keeps the gate through verified create, detached start, and READY.
+if [ "$singleton_requested" != true ]; then
+  release_lifecycle_lock
+  trap - INT TERM HUP
+fi
+
+rm -f "$host_stage_dir/gitconfig"
+gitconfig_tmp=$(mktemp "$host_stage_dir/.gitconfig.XXXXXX") \
+  || die "Unable to create temporary Git configuration staging."
+if [ "$full_git_config" = true ]; then
+  if [ -f "$host_home_dir/.gitconfig" ]; then
+    cp "$host_home_dir/.gitconfig" "$gitconfig_tmp"
+  fi
+  chmod 0600 "$gitconfig_tmp"
+else
+  # Extract only identity values. Never copy include/includeIf, credential,
+  # http, url, or other arbitrary host Git configuration by default.
+  git_user_name=""
+  git_user_email=""
+  if command -v git >/dev/null 2>&1; then
+    git_user_name=$(git config --global --get user.name 2>/dev/null || true)
+    git_user_email=$(git config --global --get user.email 2>/dev/null || true)
+  fi
+  if [ -n "$git_user_name" ]; then
+    git config --file "$gitconfig_tmp" user.name "$git_user_name"
+  fi
+  if [ -n "$git_user_email" ]; then
+    git config --file "$gitconfig_tmp" user.email "$git_user_email"
+  fi
+fi
+mv "$gitconfig_tmp" "$host_stage_dir/gitconfig"
+gitconfig_tmp=""
+
+prepare_singleton_guest_stage() {
+  local singleton_gitconfig_tmp singleton_ssh_stage ssh_metadata
+
+  validate_managed_directory "$singleton_root"
+  validate_managed_directory "$singleton_guest_stage"
+  mkdir -p "$singleton_root" "$singleton_guest_stage"
+  validate_managed_directory "$singleton_root"
+  validate_managed_directory "$singleton_guest_stage"
+  singleton_gitconfig_tmp=$(mktemp \
+    "$singleton_guest_stage/.gitconfig.XXXXXX") \
+    || die "Unable to stage persistent singleton Git identity."
+  cp "$host_stage_dir/gitconfig" "$singleton_gitconfig_tmp"
+  chmod 0600 "$singleton_gitconfig_tmp"
+  if [ -L "$singleton_guest_stage/gitconfig" ] \
+    || { [ -e "$singleton_guest_stage/gitconfig" ] \
+      && [ ! -f "$singleton_guest_stage/gitconfig" ]; }; then
+    rm -f "$singleton_gitconfig_tmp"
+    die "Refusing an unsafe persistent singleton Git configuration path."
+  fi
+  mv -f "$singleton_gitconfig_tmp" "$singleton_guest_stage/gitconfig"
+
+  singleton_ssh_stage="$singleton_guest_stage/ssh"
+  validate_managed_directory "$singleton_ssh_stage"
+  if [ "$mount_ssh_config" = true ]; then
+    mkdir -p "$singleton_ssh_stage"
+    chmod 0700 "$singleton_ssh_stage"
+    for ssh_metadata in config known_hosts known_hosts.old allowed_signers; do
+      rm -f "$singleton_ssh_stage/$ssh_metadata"
+      if [ -f "$host_stage_dir/ssh/$ssh_metadata" ] \
+        && [ ! -L "$host_stage_dir/ssh/$ssh_metadata" ]; then
+        cp "$host_stage_dir/ssh/$ssh_metadata" \
+          "$singleton_ssh_stage/$ssh_metadata"
+        chmod 0600 "$singleton_ssh_stage/$ssh_metadata"
+      fi
+    done
+  elif [ -d "$singleton_ssh_stage" ]; then
+    rm -f \
+      "$singleton_ssh_stage/config" \
+      "$singleton_ssh_stage/known_hosts" \
+      "$singleton_ssh_stage/known_hosts.old" \
+      "$singleton_ssh_stage/allowed_signers"
+    rmdir "$singleton_ssh_stage" 2>/dev/null || true
+  fi
+}
+
+if [ "$mount_ssh_config" = true ]; then
+  mkdir "$host_stage_dir/ssh"
+  chmod 0700 "$host_stage_dir/ssh"
+  for ssh_metadata in config known_hosts known_hosts.old allowed_signers; do
+    if [ -f "$host_home_dir/.ssh/$ssh_metadata" ] \
+      && [ ! -L "$host_home_dir/.ssh/$ssh_metadata" ]; then
+      cp "$host_home_dir/.ssh/$ssh_metadata" "$host_stage_dir/ssh/$ssh_metadata"
+      chmod 0600 "$host_stage_dir/ssh/$ssh_metadata"
+    fi
+  done
+fi
+
+requested_agent_version="${AGENT_CONTAINER_VERSION:-$profile_version}"
+# A warm singleton is an intentionally pinned runtime. Normal launches reuse
+# the version whose image and full configuration were already verified instead
+# of turning every attach into an availability-dependent update check. An
+# explicit --container-version (including `latest`) or rebuild request retains
+# the caller's upgrade intent and follows the regular resolution path below.
+if [ "$singleton_requested" = true ] \
+  && [ "$singleton_existing" = true ] \
+  && [ -z "${AGENT_CONTAINER_VERSION+x}" ] \
+  && [ "$requested_agent_version" = latest ] \
+  && ! is_true "${AGENT_CONTAINER_REBUILD:-false}"; then
+  recorded_singleton_agent_version=$(read_single_line \
+    "$singleton_agent_version_file" || true)
+  valid_agent_version "$recorded_singleton_agent_version" \
+    || die "The existing '$profile_id' singleton has no valid recorded Agent version. Stop it before recovery: agent-container singleton stop $profile_id"
+  requested_agent_version="$recorded_singleton_agent_version"
+fi
+case "$requested_agent_version" in
+  latest) version_lookup_required=true ;;
+  *)
+    valid_agent_version "$requested_agent_version" \
+      || die "--container-version must be 'latest' or an exact native CLI version."
+    version_lookup_required=false
+    ;;
+esac
+
+extra_ca_bundle=""
+extra_ca_fingerprint="none"
+version_ca_bundle=""
+if [ -n "$extra_ca_setting" ]; then
+  staged_ca_bundle="$host_stage_dir/extra-ca-certificates.pem"
+  case "$extra_ca_setting" in
+    auto)
+      installer_anchor="$host_stage_dir/.installer-anchor.pem"
+      extract_macos_verified_anchor \
+        "$profile_installer_url" "$installer_anchor" \
+        || die "macOS could not verify and export the TLS trust anchor for $profile_installer_url. Pass --container-extra-ca /absolute/path.pem to authorize an explicit PEM bundle."
+      mv "$installer_anchor" "$staged_ca_bundle"
+      extra_ca_bundle="$staged_ca_bundle"
+      if [ "$version_lookup_required" = true ]; then
+        version_anchor="$host_stage_dir/.version-anchor.pem"
+        extract_macos_verified_anchor \
+          "$profile_installer_version_url" "$version_anchor" \
+          || die "macOS could not verify and export the TLS trust anchor for $profile_installer_version_url. Pass --container-extra-ca /absolute/path.pem to authorize an explicit PEM bundle."
+        version_ca_bundle="$version_anchor"
+      fi
+      ;;
+    *)
+      [ -f "$extra_ca_setting" ] && [ ! -L "$extra_ca_setting" ] \
+        || die "--container-extra-ca must name a regular, non-symlink PEM file."
+      extra_ca_source=$(/bin/realpath "$extra_ca_setting" 2>/dev/null || true)
+      [ -n "$extra_ca_source" ] && [ -f "$extra_ca_source" ] \
+        && [ ! -L "$extra_ca_source" ] \
+        || die "Unable to resolve --container-extra-ca safely: $extra_ca_setting"
+      validate_extra_ca_bundle "$extra_ca_source" \
+        || die "--container-extra-ca must contain only 1-64 valid, currently-valid CA certificates in PEM form and be no larger than 1 MiB."
+      extra_ca_source_fingerprint_before=$(sha256_file "$extra_ca_source")
+      cp "$extra_ca_source" "$staged_ca_bundle"
+      chmod 0600 "$staged_ca_bundle"
+      extra_ca_source_fingerprint_after=$(sha256_file "$extra_ca_source")
+      extra_ca_staged_fingerprint=$(sha256_file "$staged_ca_bundle")
+      [ "$extra_ca_source_fingerprint_before" = "$extra_ca_source_fingerprint_after" ] \
+        && [ "$extra_ca_source_fingerprint_after" = "$extra_ca_staged_fingerprint" ] \
+        || die "The --container-extra-ca file changed while it was being frozen for the image build."
+      extra_ca_bundle="$staged_ca_bundle"
+      if [ "$version_lookup_required" = true ]; then
+        version_ca_bundle="$staged_ca_bundle"
+      fi
+      warn "Extending the Agent image TLS trust store with the explicitly authorized CA bundle."
+      ;;
+  esac
+  validate_extra_ca_bundle "$extra_ca_bundle" \
+    || die "The staged extra CA bundle failed validation."
+  if [ -n "$version_ca_bundle" ]; then
+    validate_extra_ca_bundle "$version_ca_bundle" \
+      || die "The staged version-endpoint CA bundle failed validation."
+  fi
+  extra_ca_fingerprint=$(sha256_file "$extra_ca_bundle")
+fi
+
+case "$requested_agent_version" in
+  latest)
+    curl_bin=$(command -v curl || true)
+    [ -n "$curl_bin" ] \
+      || die "curl is required to resolve the $profile_display_name latest channel."
+    agent_version_response=$(mktemp "$host_stage_dir/.agent-version-response.XXXXXX") \
+      || die "Unable to create temporary storage for native CLI version resolution."
+    version_curl_args=(
+      --disable
+      --fail
+      --silent
+      --show-error
+      --location
+      --connect-timeout 10
+      --max-time 60
+      --max-filesize 1048576
+      --proto '=https'
+      --tlsv1.2
+    )
+    version_proxy_value=""
+    if [ -n "$https_proxy_value" ]; then
+      version_proxy_value="$https_proxy_value"
+    elif [ -n "$all_proxy_value" ]; then
+      version_proxy_value="$all_proxy_value"
+    fi
+    if [ -n "$version_proxy_value" ]; then
+      version_curl_args+=(--proxy "$version_proxy_value")
+      if host_proxy_resolve_value=$(
+        host_proxy_resolve_override "$version_proxy_value"
+      ); then
+        version_curl_args+=(--resolve "$host_proxy_resolve_value")
+      fi
+    else
+      # curl otherwise consults ambient upper- and lower-case proxy variables.
+      version_curl_args+=(--proxy '')
+    fi
+    version_curl_args+=(--noproxy "$no_proxy_value")
+    if [ -n "$version_ca_bundle" ]; then
+      version_curl_args+=(
+        --ca-native
+        --cacert "$version_ca_bundle"
+        --proxy-ca-native
+        --proxy-cacert "$version_ca_bundle"
+      )
+    fi
+    version_curl_args+=(
+      "$profile_installer_version_url"
+      --output "$agent_version_response"
+    )
+    if ! "$curl_bin" "${version_curl_args[@]}"; then
+      rm -f "$agent_version_response"
+      die "Unable to resolve the $profile_display_name latest channel from $profile_installer_version_url. Enable the host proxy, pass --container-extra-ca /absolute/path.pem for an explicitly trusted interception CA, or pass --container-version with an exact version to skip the lookup."
+    fi
+    agent_version_response_size=$(wc -c < "$agent_version_response" | tr -d '[:space:]')
+    case "$agent_version_response_size" in
+      ''|*[!0-9]*)
+        rm -f "$agent_version_response"
+        die "The $profile_display_name version channel returned an invalid response size."
+        ;;
+    esac
+    if [ "$agent_version_response_size" -le 0 ] \
+      || [ "$agent_version_response_size" -gt 1048576 ]; then
+      rm -f "$agent_version_response"
+      die "The $profile_display_name version channel returned an unsafe response size."
+    fi
+    if ! agent_version=$("$osascript_bin" -l JavaScript - \
+      "$agent_version_response" "$profile_installer_version_format" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('version response is not readable UTF-8');
+  const text = ObjC.unwrap(source);
+  const format = argv[1];
+  let version;
+  if (format === 'plain-semver') {
+    if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9._-]+)?(?:\+[A-Za-z0-9._-]+)?\n?$/.test(text)) {
+      throw new Error('plain version response is not one exact semver');
+    }
+    version = text.endsWith('\n') ? text.slice(0, -1) : text;
+  } else if (format === 'rust-tag-json') {
+    const value = JSON.parse(text);
+    if (value === null || typeof value !== 'object' || Array.isArray(value)
+        || typeof value.tag_name !== 'string' || !value.tag_name.startsWith('rust-v')) {
+      throw new Error('release response has no rust-v tag_name');
+    }
+    version = value.tag_name.slice('rust-v'.length);
+  } else {
+    throw new Error('unsupported version response format');
+  }
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9._-]+)?(?:\+[A-Za-z0-9._-]+)?$/.test(version)) {
+    throw new Error('resolved version is not an exact safe semver');
+  }
+  return version;
+}
+JXA
+    ); then
+      rm -f "$agent_version_response"
+      die "The $profile_display_name version channel returned an invalid exact version."
+    fi
+    rm -f "$agent_version_response"
+    printf 'Resolved %s latest channel to %s.\n' "$profile_display_name" "$agent_version" >&2
+    ;;
+  *)
+    agent_version="$requested_agent_version"
+    ;;
+esac
+if [ -n "$version_ca_bundle" ] \
+  && [ "$version_ca_bundle" != "$extra_ca_bundle" ]; then
+  rm -f -- "$version_ca_bundle"
+  version_ca_bundle=""
+fi
+base_image="${AGENT_CONTAINER_BASE_IMAGE:-$DEFAULT_BASE_IMAGE}"
+case "$base_image" in
+  ''|*[!A-Za-z0-9._:/@-]*) die "--container-base-image is unsafe: $base_image" ;;
+esac
+asset_fingerprint=$(
+  {
+    sha256_file "$asset_dir/Containerfile"
+    sha256_file "$asset_dir/Containerfile.dockerignore"
+    sha256_file "$asset_dir/entrypoint.sh"
+    sha256_file "$asset_dir/host-exec-client"
+    sha256_file "$asset_dir/host-exec-broker.mjs"
+    sha256_file "$asset_dir/agent-workspace-connect"
+    sha256_file "$asset_dir/agent-workspace-session"
+    sha256_file "$profile_file"
+    printf '%s\n' "$agent_version"
+    printf '%s\n' "$base_image"
+    printf 'extra-ca-sha256=%s\n' "$extra_ca_fingerprint"
+  } | sha256_stream
+)
+expected_build_id="$image_name:$asset_fingerprint"
+
+inspected_image_identity=""
+inspected_image_digest=""
+inspect_image_metadata() {
+  local inspected_ref="$1"
+  local inspect_tmp="$host_stage_dir/.image-inspect.$$"
+  local parsed_digest parsed_identity
+
+  inspected_image_identity=""
+  inspected_image_digest=""
+  if ! "$container_bin" image inspect "$inspected_ref" > "$inspect_tmp" 2>/dev/null; then
+    rm -f "$inspect_tmp"
+    return 1
+  fi
+  if [ ! -s "$inspect_tmp" ]; then
+    rm -f "$inspect_tmp"
+    die "Apple image inspect returned empty metadata for '$inspected_ref'."
+  fi
+
+  # Apple container 1.2 emits a JSON array for `image inspect`, even for one
+  # requested reference. Resolve exactly one index descriptor digest. The
+  # create-before-start verification below proves that this same descriptor
+  # was frozen into the stopped container before any Agent entrypoint runs.
+  if ! parsed_digest=$("$osascript_bin" -l JavaScript - "$inspect_tmp" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('image inspect is not readable UTF-8');
+  const images = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(images) || images.length !== 1) {
+    throw new Error('image inspect must contain exactly one image');
+  }
+  const image = images[0];
+  if (image === null || typeof image !== 'object' || Array.isArray(image)) {
+    throw new Error('image inspect record must be an object');
+  }
+  const configuration = image.configuration;
+  if (configuration === null || typeof configuration !== 'object'
+      || Array.isArray(configuration)) {
+    throw new Error('image configuration must be an object');
+  }
+  const descriptor = configuration.descriptor;
+  if (descriptor === null || typeof descriptor !== 'object'
+      || Array.isArray(descriptor)) {
+    throw new Error('image descriptor must be an object');
+  }
+  const digest = descriptor.digest;
+  if (typeof digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    throw new Error('image descriptor digest must be sha256:64hex');
+  }
+  return digest;
+}
+JXA
+  ); then
+    rm -f "$inspect_tmp"
+    die "Apple image inspect returned an invalid or ambiguous descriptor for '$inspected_ref'."
+  fi
+  if ! parsed_identity=$(sha256_file "$inspect_tmp"); then
+    rm -f "$inspect_tmp"
+    die "Unable to fingerprint Apple image metadata for '$inspected_ref'."
+  fi
+  rm -f "$inspect_tmp"
+  inspected_image_identity="$parsed_identity"
+  inspected_image_digest="$parsed_digest"
+}
+
+build_required=false
+image_identity=""
+image_digest=""
+recorded_build_id=""
+recorded_image_identity=""
+if inspect_image_metadata "$image_name"; then
+  image_identity="$inspected_image_identity"
+  image_digest="$inspected_image_digest"
+else
+  build_required=true
+fi
+recorded_build_id=$(read_single_line "$image_marker" || true)
+recorded_image_identity=$(read_single_line "$image_identity_file" || true)
+if [ "$build_required" = false ] \
+  && { [ "$recorded_build_id" != "$expected_build_id" ] \
+    || [ "$recorded_image_identity" != "$image_identity" ]; }; then
+  build_required=true
+fi
+if is_true "${AGENT_CONTAINER_REBUILD:-false}"; then
+  build_required=true
+fi
+
+if [ "$singleton_requested" = true ] \
+  && [ "$singleton_existing" = true ] \
+  && [ "$build_required" = true ]; then
+  die "The running or stopped '$profile_id' singleton image is stale or a rebuild was requested. Stop the singleton before rebuilding it: agent-container singleton stop $profile_id"
+fi
+
+if [ "$build_required" = true ]; then
+  if is_true "${AGENT_CONTAINER_SKIP_BUILD:-false}"; then
+    die "Image '$image_name' is missing or stale, but image building is disabled."
+  fi
+
+  echo "Building $profile_display_name image '$image_name' (version $agent_version)..."
+  build_args=(
+    build
+    --progress plain
+    --tag "$image_name"
+    --file Containerfile
+    --platform linux/arm64
+    --cpus "${AGENT_CONTAINER_BUILD_CPUS:-4}"
+    --memory "${AGENT_CONTAINER_BUILD_MEMORY:-4g}"
+    --label "com.loadchange.agent-container=true"
+    --label "com.loadchange.agent-container.profile=$profile_id"
+    --label "com.loadchange.agent-container.recipe=$asset_fingerprint"
+    --build-arg "BASE_IMAGE=$base_image"
+    --build-arg "AGENT_PROFILE=$profile_id"
+    --build-arg "AGENT_INSTALLER_URL=$profile_installer_url"
+    --build-arg "AGENT_INSTALLER_SHELL=$profile_installer_shell"
+    --build-arg "AGENT_INSTALLER_VERSION_ENV=$profile_installer_version_env"
+    --build-arg "AGENT_INSTALLER_BIN_DIR_ENV=$profile_installer_bin_dir_env"
+    --build-arg "AGENT_INSTALLER_HOME_ENV=$profile_installer_home_env"
+    --build-arg "AGENT_INSTALLER_NONINTERACTIVE_ENV=$profile_installer_noninteractive_env"
+    --build-arg "AGENT_VERSION=$agent_version"
+    --build-arg "AGENT_COMMAND=$profile_command"
+    --build-arg "AGENT_PROBE_ARG=$profile_probe_arg"
+    --build-arg "AGENT_CA_FINGERPRINT=$extra_ca_fingerprint"
+  )
+
+  if [ -n "$extra_ca_bundle" ]; then
+    build_args+=(--secret "id=agent_ca_bundle,src=$extra_ca_bundle")
+  fi
+
+  [ -n "$http_proxy_value" ] && build_args+=(--build-arg "HTTP_PROXY=$http_proxy_value" --build-arg "http_proxy=$http_proxy_value")
+  [ -n "$https_proxy_value" ] && build_args+=(--build-arg "HTTPS_PROXY=$https_proxy_value" --build-arg "https_proxy=$https_proxy_value")
+  [ -n "$all_proxy_value" ] && build_args+=(--build-arg "ALL_PROXY=$all_proxy_value" --build-arg "all_proxy=$all_proxy_value")
+  if [ -n "$http_proxy_value$https_proxy_value$all_proxy_value" ]; then
+    build_args+=(--build-arg "NO_PROXY=$no_proxy_value" --build-arg "no_proxy=$no_proxy_value")
+  fi
+  [ -n "$dns1_value" ] && build_args+=(--dns "$dns1_value")
+  [ -n "$dns2_value" ] && build_args+=(--dns "$dns2_value")
+  if is_true "${AGENT_CONTAINER_REBUILD:-false}"; then
+    build_args+=(--no-cache --pull)
+  fi
+  build_args+=(.)
+
+  if ! (
+    cd "$asset_dir"
+    "$container_bin" "${build_args[@]}"
+  ); then
+    die "The $profile_display_name image build failed. If curl reported certificate error 60, pass --container-extra-ca /absolute/path.pem for the required CA bundle. The default macOS trust bridge is automatic, and TLS verification is never disabled."
+  fi
+  inspect_image_metadata "$image_name" \
+    || die "The native image build completed, but '$image_name' could not be inspected."
+  image_identity="$inspected_image_identity"
+  image_digest="$inspected_image_digest"
+  atomic_write_line "$image_marker" "$expected_build_id"
+  atomic_write_line "$image_identity_file" "$image_identity"
+fi
+if [ -n "$extra_ca_bundle" ]; then
+  rm -f -- "$extra_ca_bundle"
+  extra_ca_bundle=""
+  version_ca_bundle=""
+fi
+atomic_write_line "$image_ref_file" "$image_name"
+
+if [ "$singleton_requested" = true ]; then
+  valid_image_digest "$image_digest" \
+    || die "The resolved '$profile_id' singleton image has an invalid descriptor digest."
+  singleton_gitconfig_hash=$(sha256_file "$host_stage_dir/gitconfig")
+  singleton_ssh_config_hash=none
+  if [ "$mount_ssh_config" = true ]; then
+    singleton_ssh_config_hash=$(sha256_tree "$host_stage_dir/ssh")
+  fi
+  singleton_gh_config_hash=none
+  if [ -n "$gh_config_dir" ]; then
+    singleton_gh_config_hash=$(sha256_tree "$gh_config_dir")
+  fi
+  singleton_git_xdg_config_hash=none
+  if [ -n "$git_xdg_config_dir" ]; then
+    singleton_git_xdg_config_hash=$(sha256_tree "$git_xdg_config_dir")
+  fi
+  singleton_ssh_agent_socket=none
+  if [ "$forward_ssh_agent" = true ]; then
+    [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ] \
+      || die "--container-forward-ssh-agent requires SSH_AUTH_SOCK to name a live socket."
+    singleton_ssh_agent_socket=$(/bin/realpath "$SSH_AUTH_SOCK" 2>/dev/null || true)
+    [ -n "$singleton_ssh_agent_socket" ] \
+      || die "Unable to resolve the SSH agent socket safely."
+    reject_control_characters \
+      "SSH agent socket path" "$singleton_ssh_agent_socket"
+  fi
+  singleton_config_hash=$(
+    {
+      printf 'runtime=%s\n' "$singleton_runtime_config_hash"
+      printf 'recipe=%s\n' "$asset_fingerprint"
+      printf 'image=%s\n' "$image_digest"
+      printf 'agent-version=%s\n' "$agent_version"
+      printf 'extra-ca=%s\n' "$extra_ca_fingerprint"
+      printf 'full-git-config=%s\n' "$full_git_config"
+      printf 'gitconfig=%s\n' "$singleton_gitconfig_hash"
+      printf 'mount-gh=%s\n' "${gh_config_dir:-none}"
+      printf 'gh-config=%s\n' "$singleton_gh_config_hash"
+      printf 'git-xdg=%s\n' "${git_xdg_config_dir:-none}"
+      printf 'git-xdg-config=%s\n' "$singleton_git_xdg_config_hash"
+      printf 'mount-ssh-config=%s\n' "$mount_ssh_config"
+      printf 'ssh-config=%s\n' "$singleton_ssh_config_hash"
+      printf 'forward-ssh-agent=%s\n' "$forward_ssh_agent"
+      printf 'ssh-agent-socket=%s\n' "$singleton_ssh_agent_socket"
+    } | sha256_stream
+  )
+
+  if [ "$singleton_existing" = true ]; then
+    [ "$singleton_existing_config_hash" = "$singleton_config_hash" ] \
+      || die "Running '$profile_id' singleton configuration or image recipe differs from this launch. Stop it before changing VM, network, CA, or image settings."
+    validate_singleton_state "$singleton_config_hash"
+    [ "$singleton_existing_creator_pid" = "$singleton_state_creator_pid" ] \
+      || die "The '$profile_id' singleton creator PID differs between container labels and managed state."
+    [ "$singleton_state_image_digest" = "$image_digest" ] \
+      || die "The '$profile_id' singleton image digest differs from the current verified profile image. Stop it before rebuilding."
+    [ "$singleton_state_agent_version" = "$agent_version" ] \
+      || die "The '$profile_id' singleton Agent version differs from the currently resolved version. Stop it before upgrading."
+    singleton_inspect_tmp=$(mktemp \
+      "$host_stage_dir/.singleton-inspect.XXXXXX") \
+      || die "Unable to allocate singleton inspection storage."
+    if ! "$container_bin" inspect "$singleton_container_name" \
+      > "$singleton_inspect_tmp" 2>/dev/null; then
+      rm -f "$singleton_inspect_tmp"
+      die "The '$profile_id' singleton was listed but could not be inspected."
+    fi
+    case "$singleton_existing_state" in
+      running)
+        verify_singleton_container_inspect \
+          "$singleton_inspect_tmp" running \
+          "$singleton_state_image_digest" "$singleton_state_creator_pid" \
+          || {
+            rm -f "$singleton_inspect_tmp"
+            die "The running '$profile_id' singleton failed full provenance verification."
+          }
+        rm -f "$singleton_inspect_tmp"
+        prepare_singleton_guest_stage
+        run_singleton_client "$@"
+        ;;
+      stopped)
+        verify_singleton_container_inspect \
+          "$singleton_inspect_tmp" stopped \
+          "$singleton_state_image_digest" "$singleton_state_creator_pid" \
+          || {
+            rm -f "$singleton_inspect_tmp"
+            die "The stopped '$profile_id' singleton failed full provenance verification and was retained."
+          }
+        rm -f "$singleton_inspect_tmp"
+        warn "Removing a verified stopped '$profile_id' singleton before recreation."
+        "$container_bin" delete --force "$singleton_container_name" \
+          >/dev/null 2>&1 \
+          || die "Unable to delete the verified stopped '$profile_id' singleton."
+        clear_singleton_state_files "$singleton_root"
+        singleton_existing=false
+        ;;
+      stopping)
+        rm -f "$singleton_inspect_tmp"
+        die "The '$profile_id' singleton is stopping; wait for it to become absent before launching again."
+        ;;
+      *)
+        rm -f "$singleton_inspect_tmp"
+        die "The '$profile_id' singleton has unsupported runtime state '$singleton_existing_state'."
+        ;;
+    esac
+  fi
+fi
+
+if [ "$run_mode" = true ]; then
+  host_gateway="${AGENT_CONTAINER_HOST_GATEWAY:-}"
+  if [ -z "$host_gateway" ]; then
+    network_inspect_tmp="$host_stage_dir/.network-inspect.$$"
+    "$container_bin" network inspect default > "$network_inspect_tmp" 2>/dev/null \
+      || die "Unable to inspect Apple's default container network for host-exec."
+    host_gateway=$(
+      "$osascript_bin" -l JavaScript - "$network_inspect_tmp" 2>/dev/null <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('network inspect is not readable UTF-8');
+  const networks = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(networks) || networks.length !== 1) {
+    throw new Error('network inspect must contain exactly one network');
+  }
+  const gateway = networks[0]
+    && networks[0].status
+    && networks[0].status.ipv4Gateway;
+  if (typeof gateway !== 'string'
+      || !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(gateway)) {
+    throw new Error('default network has no IPv4 gateway');
+  }
+  return gateway;
+}
+JXA
+    ) || {
+      rm -f "$network_inspect_tmp"
+      die "Apple's default container network returned an invalid host gateway."
+    }
+    rm -f "$network_inspect_tmp"
+  fi
+  if ! printf '%s\n' "$host_gateway" \
+    | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1; ok = 1 } END { exit !ok }'; then
+    die "Unsafe host-exec gateway address: $host_gateway"
+  fi
+
+  rm -f "$host_stage_dir/host-exec-endpoint"
+  broker_args=(
+    --session-dir "$host_stage_dir"
+    --bind-address "$host_gateway"
+    --launcher-pid "$$"
+    --real-home "$host_home_dir"
+    --exec-home "$profile_host_exec_home"
+    --sandbox-bin /usr/bin/sandbox-exec
+  )
+  host_broker_path=""
+  broker_path_index=0
+  developer_path_inserted=false
+  while [ "$broker_path_index" -lt "${#host_path_entries[@]}" ]; do
+    broker_path_entry=${host_path_entries[$broker_path_index]}
+    broker_path_index=$((broker_path_index + 1))
+    case "$broker_path_entry" in
+      /*) ;;
+      *) continue ;;
+    esac
+    [ -d "$broker_path_entry" ] || continue
+    broker_path_entry=$(resolve_absolute_dir "$broker_path_entry" || true)
+    case "$broker_path_entry" in
+      ''|*:*|*$'\n'*|*$'\r'*|*$'\t'*) continue ;;
+    esac
+    if [ "$broker_path_entry" = /usr/bin ] \
+      && [ "$developer_path_inserted" = false ] \
+      && [ -n "$host_developer_root" ]; then
+      for developer_bin_dir in \
+        "$host_developer_path/usr/bin" \
+        "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin"; do
+        [ -d "$developer_bin_dir" ] || continue
+        if [ -n "$host_broker_path" ]; then
+          host_broker_path="$host_broker_path:$developer_bin_dir"
+        else
+          host_broker_path="$developer_bin_dir"
+        fi
+      done
+      developer_path_inserted=true
+    fi
+    if [ -n "$host_broker_path" ]; then
+      host_broker_path="$host_broker_path:$broker_path_entry"
+    else
+      host_broker_path="$broker_path_entry"
+    fi
+  done
+  [ -n "$host_broker_path" ] \
+    || host_broker_path=/usr/bin:/bin:/usr/sbin:/sbin
+  broker_env=(
+    "PATH=$host_broker_path"
+    "HOME=$host_home_dir"
+  )
+  [ -n "${LANG:-}" ] && broker_env+=("LANG=$LANG")
+  [ -n "${LC_ALL:-}" ] && broker_env+=("LC_ALL=$LC_ALL")
+  [ -n "${LC_CTYPE:-}" ] && broker_env+=("LC_CTYPE=$LC_CTYPE")
+  [ -n "${LC_MESSAGES:-}" ] && broker_env+=("LC_MESSAGES=$LC_MESSAGES")
+  [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
+  [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
+  [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
+  if [ "$forward_ssh_agent" = true ] \
+    && [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    broker_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+  fi
+  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
+    env -i "${broker_env[@]}" \
+      "$host_broker_bin" "${broker_args[@]}" \
+      > "$host_stage_dir/host-exec-broker.log" 2>&1 &
+  else
+    env -i "${broker_env[@]}" \
+      "$host_node_bin" "$host_broker_bin" "${broker_args[@]}" \
+      > "$host_stage_dir/host-exec-broker.log" 2>&1 &
+  fi
+  host_broker_pid=$!
+
+  broker_ready_attempt=0
+  while [ ! -f "$host_stage_dir/host-exec-endpoint" ] \
+    && session_job_is_active "$host_broker_pid" \
+    && [ "$broker_ready_attempt" -lt 100 ]; do
+    sleep 0.05
+    broker_ready_attempt=$((broker_ready_attempt + 1))
+  done
+  host_exec_endpoint=$(read_single_line "$host_stage_dir/host-exec-endpoint" || true)
+  host_exec_port=""
+  case "$host_exec_endpoint" in
+    "$host_gateway":*) host_exec_port=${host_exec_endpoint#"$host_gateway:"} ;;
+  esac
+  case "$host_exec_port" in
+    ''|0|0*|*[!0-9]*) host_exec_port="" ;;
+  esac
+  if [ -z "$host_exec_port" ] \
+    || [ "${#host_exec_port}" -gt 5 ] \
+    || [ "$host_exec_port" -gt 65535 ] 2>/dev/null; then
+    stop_host_broker
+    die "The host-exec broker did not publish a valid session endpoint."
+  fi
+  chmod 0600 "$host_stage_dir/host-exec-endpoint" \
+    "$host_stage_dir/host-exec-broker.log"
+fi
+
+if [ "$singleton_requested" = true ]; then
+  prepare_singleton_guest_stage
+  atomic_write_line "$singleton_config_hash_file" "$singleton_config_hash"
+  atomic_write_line "$singleton_image_digest_file" "$image_digest"
+  atomic_write_line "$singleton_agent_version_file" "$agent_version"
+  atomic_write_line "$singleton_root/creator-pid" "$$"
+  atomic_write_line "$singleton_phase_file" creating
+  container_name="$singleton_container_name"
+else
+  container_name="agent-$profile_id-$host_uid-$$"
+fi
+
+create_args=(
+  create
+  --name "$container_name"
+  --init
+  --platform linux/arm64
+  --cpus "${AGENT_CONTAINER_CPUS:-4}"
+  --memory "${AGENT_CONTAINER_MEMORY:-4g}"
+  --label "com.loadchange.agent-container=true"
+  --label "com.loadchange.agent-container.profile=$profile_id"
+  --label "com.loadchange.agent-container.host-uid=$host_uid"
+  --label "com.loadchange.agent-container.launcher-pid=$$"
+  --env "HOST_UID=$host_uid"
+  --env "HOST_GID=$host_gid"
+  --env "HOST_HOME=$host_home_dir"
+  --env "AGENT_CONTAINER_PROFILE=$profile_id"
+  --env "GIT_CONFIG_GLOBAL=/run/agent-host/gitconfig"
+  --volume "$profile_home:$host_home_dir"
+)
+
+if [ "${#host_aliases[@]}" -gt 0 ] \
+  || [ "${#blocked_hosts[@]}" -gt 0 ]; then
+  if [ "$singleton_requested" = true ]; then
+    resolve_singleton_host_gateway
+    container_hosts_file="$singleton_guest_stage/container-hosts"
+  else
+    container_hosts_file="$host_stage_dir/container-hosts"
+  fi
+  {
+    printf '%s\n' '127.0.0.1 localhost'
+    for host_alias in "${host_aliases[@]}"; do
+      printf '%s %s\n' "$host_gateway" "$host_alias"
+    done
+    for blocked_host in "${blocked_hosts[@]}"; do
+      printf '0.0.0.0 %s\n' "$blocked_host"
+      printf ':: %s\n' "$blocked_host"
+    done
+  } > "$container_hosts_file"
+  chmod 0600 "$container_hosts_file"
+  create_args+=(--volume "$container_hosts_file:/etc/hosts:ro")
+fi
+
+if [ "$singleton_requested" = true ]; then
+  create_args+=(
+    --cap-add CAP_SYS_ADMIN
+    --label "com.loadchange.agent-container.mode=singleton"
+    --label "com.loadchange.agent-container.config-sha256=$singleton_config_hash"
+    --volume "$singleton_guest_stage:/run/agent-host:ro"
+  )
+else
+  create_args+=(
+    --rm
+    --volume "$host_stage_dir:/run/agent-host:ro"
+    --volume "$mount_root:$mount_root"
+    --workdir "$host_workspace"
+  )
+  if [ -n "$common_git_dir" ] && [ -d "$common_git_dir" ]; then
+    case "$common_git_dir/" in
+      "$mount_root/"*) ;;
+      *) create_args+=(--volume "$common_git_dir:$common_git_dir") ;;
+    esac
+  fi
+fi
+
+share_index=0
+while [ "$share_index" -lt "${#extra_share_paths[@]}" ]; do
+  share_path="${extra_share_paths[$share_index]}"
+  share_mode="${extra_share_modes[$share_index]}"
+  if [ "$share_mode" = ro ]; then
+    create_args+=(--volume "$share_path:$share_path:ro")
+  else
+    create_args+=(--volume "$share_path:$share_path")
+  fi
+  share_index=$((share_index + 1))
+done
+
+if [ -n "$gh_config_dir" ]; then
+  create_args+=(--volume "$gh_config_dir:$host_home_dir/.config/gh:ro")
+fi
+if [ -n "$git_xdg_config_dir" ]; then
+  create_args+=(--volume "$git_xdg_config_dir:$host_home_dir/.config/git:ro")
+fi
+if [ "$mount_ssh_config" = true ]; then
+  if [ "$singleton_requested" = true ]; then
+    create_args+=(--volume "$singleton_guest_stage/ssh:$host_home_dir/.ssh:ro")
+  else
+    create_args+=(--volume "$host_stage_dir/ssh:$host_home_dir/.ssh:ro")
+  fi
+fi
+if [ "$forward_ssh_agent" = true ]; then
+  [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ] \
+    || die "--container-forward-ssh-agent is enabled, but SSH_AUTH_SOCK is not a live socket."
+  create_args+=(--ssh)
+fi
+
+# Apple container 1.2 initializes terminal mode through stdin whenever both
+# --interactive and --tty are present. Requiring both ends to be terminals
+# avoids ENOTTY for the common `producer | agent-container ...` case where
+# stdout is still attached to a terminal.
+container_tty=false
+if [ "$singleton_requested" != true ] \
+  && [ -t 0 ] && [ -t 1 ]; then
+  create_args+=(--tty)
+  container_tty=true
+fi
+if [ "$singleton_requested" != true ]; then
+  [ -n "${TERM:-}" ] && create_args+=(--env "TERM=$TERM")
+  [ -n "${COLORTERM:-}" ] && create_args+=(--env "COLORTERM=$COLORTERM")
+  if [ -n "$profile_disable_update_env" ]; then
+    create_args+=(--env "$profile_disable_update_env=1")
+  fi
+fi
+
+forwarded_env_names=()
+inherit_host_env() {
+  local env_name="$1"
+  printenv "$env_name" >/dev/null 2>&1 || return 1
+  if [ "${#forwarded_env_names[@]}" -eq 0 ] \
+    || ! array_contains_value "$env_name" "${forwarded_env_names[@]}"; then
+    # Passing only the name keeps its value out of the Apple CLI argv and the
+    # fake-runtime argument logs used by the contract tests.
+    create_args+=(--env "$env_name")
+    forwarded_env_names+=("$env_name")
+  fi
+}
+
+if [ "$singleton_requested" != true ]; then
+  if [ "$profile_credential_forward_mode" = true ]; then
+    [ -n "$profile_api_key_env" ] \
+      || die "Profile '$profile_id' does not recognize an API-key environment variable."
+    inherit_host_env "$profile_api_key_env" \
+      || die "--container-forward-api-key is enabled, but no credential recognized for profile '$profile_id' is set and exported."
+  fi
+
+  if [ "${#explicit_forward_env_names[@]}" -gt 0 ]; then
+    for forward_env_name in "${explicit_forward_env_names[@]}"; do
+      inherit_host_env "$forward_env_name" \
+        || die "Explicitly requested environment variable '$forward_env_name' became unavailable before container creation."
+    done
+  fi
+fi
+
+[ -n "$http_proxy_value" ] && create_args+=(--env "HTTP_PROXY=$http_proxy_value" --env "http_proxy=$http_proxy_value")
+[ -n "$https_proxy_value" ] && create_args+=(--env "HTTPS_PROXY=$https_proxy_value" --env "https_proxy=$https_proxy_value")
+[ -n "$all_proxy_value" ] && create_args+=(--env "ALL_PROXY=$all_proxy_value" --env "all_proxy=$all_proxy_value")
+if [ -n "$http_proxy_value$https_proxy_value$all_proxy_value" ]; then
+  create_args+=(--env "NO_PROXY=$no_proxy_value" --env "no_proxy=$no_proxy_value")
+fi
+
+[ -n "$dns1_value" ] && create_args+=(--dns "$dns1_value")
+[ -n "$dns2_value" ] && create_args+=(--dns "$dns2_value")
+[ -n "$timezone_value" ] && create_args+=(--env "TZ=$timezone_value")
+
+if [ "$singleton_requested" = true ]; then
+  create_args+=("$image_name" /bin/sleep infinity)
+else
+  create_args+=("$image_name" "$profile_command" "$@")
+fi
+
+verify_created_container() {
+  local inspect_tmp="$1"
+  local require_unstarted="${2:-true}"
+  if ! "$osascript_bin" -l JavaScript - \
+    "$inspect_tmp" \
+    "$container_name" \
+    "$profile_id" \
+    "$host_uid" \
+    "$$" \
+    "$image_digest" \
+    "$container_tty" \
+    "$require_unstarted" \
+    "$singleton_requested" \
+    "$singleton_config_hash" >/dev/null 2>&1 <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('container inspect is not readable UTF-8');
+  const containers = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(containers) || containers.length !== 1) {
+    throw new Error('container inspect must contain exactly one container');
+  }
+
+  const container = containers[0];
+  if (container === null || typeof container !== 'object' || Array.isArray(container)) {
+    throw new Error('container inspect record must be an object');
+  }
+  const expectedID = argv[1];
+  if (container.id !== expectedID) throw new Error('container id mismatch');
+
+  const configuration = container.configuration;
+  if (configuration === null || typeof configuration !== 'object'
+      || Array.isArray(configuration) || configuration.id !== expectedID) {
+    throw new Error('container configuration id mismatch');
+  }
+  const labels = configuration.labels;
+  const singletonMode = argv[8] === 'true';
+  if (labels === null || typeof labels !== 'object' || Array.isArray(labels)
+      || labels['com.loadchange.agent-container'] !== 'true'
+      || labels['com.loadchange.agent-container.profile'] !== argv[2]
+      || labels['com.loadchange.agent-container.host-uid'] !== argv[3]
+      || labels['com.loadchange.agent-container.launcher-pid'] !== argv[4]
+      || (singletonMode
+        && (labels['com.loadchange.agent-container.mode'] !== 'singleton'
+          || labels['com.loadchange.agent-container.config-sha256'] !== argv[9]))) {
+    throw new Error('container provenance labels mismatch');
+  }
+
+  const status = container.status;
+  const requireUnstarted = argv[7] === 'true';
+  if (status === null || typeof status !== 'object' || Array.isArray(status)
+      || status.state !== 'stopped'
+      || (requireUnstarted && status.startedDate != null)) {
+    throw new Error('newly created container is not stopped');
+  }
+  const image = configuration.image;
+  const descriptor = image && typeof image === 'object' && !Array.isArray(image)
+    ? image.descriptor
+    : null;
+  const digest = descriptor && typeof descriptor === 'object' && !Array.isArray(descriptor)
+    ? descriptor.digest
+    : null;
+  if (typeof digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(digest)
+      || digest !== argv[5]) {
+    throw new Error('created container image digest mismatch');
+  }
+
+  const initProcess = configuration.initProcess;
+  const expectedTTY = argv[6] === 'true';
+  if (initProcess === null || typeof initProcess !== 'object' || Array.isArray(initProcess)
+      || typeof initProcess.terminal !== 'boolean'
+      || initProcess.terminal !== expectedTTY) {
+    throw new Error('created container terminal configuration mismatch');
+  }
+  return 'verified';
+}
+JXA
+  then
+    return 1
+  fi
+}
+
+created_container_provenance_matches() {
+  local inspect_tmp="$1"
+  "$osascript_bin" -l JavaScript - \
+    "$inspect_tmp" \
+    "$container_name" \
+    "$profile_id" \
+    "$host_uid" \
+    "$$" \
+    "$singleton_requested" \
+    "$singleton_config_hash" >/dev/null 2>&1 <<'JXA'
+ObjC.import('Foundation');
+
+function run(argv) {
+  const error = Ref();
+  const source = $.NSString.stringWithContentsOfFileEncodingError(
+    argv[0],
+    $.NSUTF8StringEncoding,
+    error
+  );
+  if (!source) throw new Error('container inspect is not readable UTF-8');
+  const containers = JSON.parse(ObjC.unwrap(source));
+  if (!Array.isArray(containers) || containers.length !== 1) {
+    throw new Error('container inspect must contain exactly one container');
+  }
+  const container = containers[0];
+  if (container === null || typeof container !== 'object' || Array.isArray(container)
+      || container.id !== argv[1]) {
+    throw new Error('container id mismatch');
+  }
+  const configuration = container.configuration;
+  if (configuration === null || typeof configuration !== 'object'
+      || Array.isArray(configuration) || configuration.id !== argv[1]) {
+    throw new Error('container configuration id mismatch');
+  }
+  const labels = configuration.labels;
+  const singletonMode = argv[5] === 'true';
+  if (labels === null || typeof labels !== 'object' || Array.isArray(labels)
+      || labels['com.loadchange.agent-container'] !== 'true'
+      || labels['com.loadchange.agent-container.profile'] !== argv[2]
+      || labels['com.loadchange.agent-container.host-uid'] !== argv[3]
+      || labels['com.loadchange.agent-container.launcher-pid'] !== argv[4]
+      || (singletonMode
+        && (labels['com.loadchange.agent-container.mode'] !== 'singleton'
+          || labels['com.loadchange.agent-container.config-sha256'] !== argv[6]))) {
+    throw new Error('container provenance labels mismatch');
+  }
+  return 'owned';
+}
+JXA
+}
+
+reconcile_failed_singleton_create() {
+  local failed_create_inspect
+
+  failed_create_inspect="$host_stage_dir/.singleton-failed-create.$$"
+  if "$container_bin" inspect "$singleton_container_name" \
+    > "$failed_create_inspect" 2>/dev/null; then
+    if ! verify_created_container "$failed_create_inspect"; then
+      rm -f "$failed_create_inspect"
+      atomic_write_line "$singleton_phase_file" broken
+      return 1
+    fi
+    rm -f "$failed_create_inspect"
+    "$container_bin" delete --force "$singleton_container_name" \
+      >/dev/null 2>&1 \
+      || native_container_name_is_absent "$singleton_container_name" \
+      || {
+        atomic_write_line "$singleton_phase_file" broken
+        return 1
+      }
+  else
+    rm -f "$failed_create_inspect"
+  fi
+
+  if native_container_name_is_absent "$singleton_container_name"; then
+    clear_singleton_state_files "$singleton_root"
+    return 0
+  fi
+  atomic_write_line "$singleton_phase_file" broken
+  return 1
+}
+
+if ! "$container_bin" "${create_args[@]}" >/dev/null; then
+  if [ "$singleton_requested" = true ]; then
+    if reconcile_failed_singleton_create; then
+      die "Apple container could not create the '$profile_id' singleton; no native resource was retained."
+    fi
+    die "Apple container create was ambiguous and the reserved '$profile_id' singleton name could not be proven safe; the resource and broken state were retained."
+  fi
+  die "Apple container could not create the verified Agent container '$container_name'."
+fi
+created_inspect_tmp="$host_stage_dir/.container-inspect.$$"
+if ! "$container_bin" inspect "$container_name" > "$created_inspect_tmp" 2>/dev/null; then
+  rm -f "$created_inspect_tmp"
+  die "Created Agent container could not be inspected; refusing to delete an unverified resource."
+fi
+if ! verify_created_container "$created_inspect_tmp"; then
+  if created_container_provenance_matches "$created_inspect_tmp"; then
+    rm -f "$created_inspect_tmp"
+    if ! "$container_bin" delete --force "$container_name" >/dev/null 2>&1; then
+      die "Created Agent container verification failed, and the proven project-owned '$container_name' could not be deleted. Recover it with: container delete --force $container_name"
+    fi
+    die "Created project-owned Agent container failed image, state, or terminal verification and was deleted."
+  fi
+  rm -f "$created_inspect_tmp"
+  die "Created container provenance could not be proven; refusing to delete or start '$container_name'."
+fi
+rm -f "$created_inspect_tmp"
+
+cleanup_failed_singleton_start() {
+  local failed_inspect="$host_stage_dir/.singleton-failed-start.$$"
+
+  "$container_bin" stop --signal KILL --time 0 \
+    "$singleton_container_name" >/dev/null 2>&1 || true
+  if "$container_bin" inspect "$singleton_container_name" \
+    > "$failed_inspect" 2>/dev/null; then
+    if verify_created_container "$failed_inspect" false; then
+      "$container_bin" delete --force "$singleton_container_name" \
+        >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$failed_inspect"
+  if native_container_name_is_absent "$singleton_container_name"; then
+    clear_singleton_state_files "$singleton_root"
+  else
+    atomic_write_line "$singleton_phase_file" broken
+    warn "Failed '$profile_id' singleton '$singleton_container_name' was retained because safe absence could not be proven; inspect it before using singleton stop."
+  fi
+}
+
+if [ "$singleton_requested" = true ]; then
+  atomic_write_line "$singleton_phase_file" starting
+  if ! "$container_bin" start "$singleton_container_name" >/dev/null; then
+    cleanup_failed_singleton_start
+    die "Apple container could not start the persistent '$profile_id' singleton."
+  fi
+
+  singleton_running_inspect="$host_stage_dir/.singleton-running.$$"
+  if ! "$container_bin" inspect "$singleton_container_name" \
+    > "$singleton_running_inspect" 2>/dev/null \
+    || ! verify_singleton_container_inspect \
+      "$singleton_running_inspect" running "$image_digest" "$$"; then
+    rm -f "$singleton_running_inspect"
+    cleanup_failed_singleton_start
+    die "The started '$profile_id' singleton failed running-state provenance verification."
+  fi
+  rm -f "$singleton_running_inspect"
+  atomic_write_line "$singleton_phase_file" ready
+  run_singleton_client "$@"
+fi
+
+start_args=(start --attach --interactive "$container_name")
+
+child_pid=""
+watchdog_pid=""
+legacy_background_launching=false
+legacy_pending_signal_name=""
+legacy_pending_signal_status=""
+
+legacy_job_is_active() {
+  local wanted_pid="$1"
+  local job_pid job_state
+
+  [ -n "$wanted_pid" ] || return 1
+  for job_state in -pr -ps; do
+    while IFS= read -r job_pid; do
+      [ "$job_pid" = "$wanted_pid" ] && return 0
+    done < <(jobs "$job_state" 2>/dev/null)
+  done
+  return 1
+}
+
+stop_native_container() {
+  local emergency="${1:-false}"
+  local stopped=false
+  if [ "$emergency" = true ]; then
+    "$container_bin" stop --signal KILL --time 0 "$container_name" >/dev/null 2>&1 \
+      && stopped=true
+  else
+    "$container_bin" stop --time 1 "$container_name" >/dev/null 2>&1 \
+      && stopped=true
+  fi
+  if legacy_job_is_active "$child_pid"; then
+    kill -TERM "$child_pid" >/dev/null 2>&1 || true
+  fi
+  # If the threshold raced container registration, terminate the attaching CLI
+  # and retry the named stop briefly so a late-created VM is not left running.
+  if [ "$stopped" = false ]; then
+    for stop_retry in 1 2 3; do
+      sleep 0.2
+      if "$container_bin" stop --signal KILL --time 0 "$container_name" >/dev/null 2>&1; then
+        break
+      fi
+    done
+  fi
+}
+
+stop_fd_watchdog() {
+  [ -n "$watchdog_pid" ] || return 0
+  if legacy_job_is_active "$watchdog_pid"; then
+    kill -TERM "$watchdog_pid" >/dev/null 2>&1 || true
+  fi
+  wait "$watchdog_pid" >/dev/null 2>&1 || true
+  watchdog_pid=""
+}
+
+handle_legacy_signal() {
+  local signal_name="$1"
+  local signal_status="$2"
+
+  if [ "$legacy_background_launching" = true ]; then
+    if [ -z "$legacy_pending_signal_status" ]; then
+      legacy_pending_signal_name=$signal_name
+      legacy_pending_signal_status=$signal_status
+    fi
+    return 0
+  fi
+  if [ -n "$legacy_pending_signal_status" ]; then
+    signal_name=$legacy_pending_signal_name
+    signal_status=$legacy_pending_signal_status
+    legacy_pending_signal_name=""
+    legacy_pending_signal_status=""
+  fi
+
+  trap '' INT TERM HUP
+  set +e
+  stop_fd_watchdog
+  stop_native_container false
+  if [ -n "$child_pid" ]; then
+    wait "$child_pid" >/dev/null 2>&1 || true
+  fi
+  child_pid=""
+  exit "$signal_status"
+}
+
+complete_legacy_background_launch() {
+  legacy_background_launching=false
+  if [ -n "$legacy_pending_signal_status" ]; then
+    handle_legacy_signal \
+      "$legacy_pending_signal_name" \
+      "$legacy_pending_signal_status"
+  fi
+}
+
+trap 'handle_legacy_signal INT 130' INT
+trap 'handle_legacy_signal TERM 143' TERM
+trap 'handle_legacy_signal HUP 129' HUP
+
+fd_watchdog() {
+  local current_files max_files max_files_per_proc max_vnodes free_vnodes
+  local session_file_growth used_vnodes
+  while kill -0 "$child_pid" 2>/dev/null; do
+    current_files=$(sysctl -n kern.num_files 2>/dev/null || true)
+    max_files=$(sysctl -n kern.maxfiles 2>/dev/null || true)
+    max_files_per_proc=$(sysctl -n kern.maxfilesperproc 2>/dev/null || true)
+    max_vnodes=$(sysctl -n kern.maxvnodes 2>/dev/null || true)
+    free_vnodes=$(sysctl -n kern.free_vnodes 2>/dev/null || true)
+    case "$current_files:$max_files:$max_files_per_proc:$max_vnodes:$free_vnodes" in
+      *[!0-9:]*)
+        warn "Host file-table counters became unavailable; the live VirtioFS watchdog stopped monitoring."
+        return
+        ;;
+    esac
+    if [ -z "$current_files" ] \
+      || [ -z "$max_files" ] \
+      || [ -z "$max_files_per_proc" ] \
+      || [ -z "$max_vnodes" ] \
+      || [ -z "$free_vnodes" ] \
+      || [ "$max_files" -le 0 ] \
+      || [ "$max_files_per_proc" -le 0 ] \
+      || [ "$max_vnodes" -le 0 ] \
+      || [ "$free_vnodes" -gt "$max_vnodes" ]; then
+      warn "Host file-table counters became unavailable; the live VirtioFS watchdog stopped monitoring."
+      return
+    fi
+    session_file_growth=$((current_files - host_num_files))
+    [ "$session_file_growth" -ge 0 ] || session_file_growth=0
+    used_vnodes=$((max_vnodes - free_vnodes))
+    if [ "$current_files" -ge "$((max_files * fd_stop_percent / 100))" ] \
+      || [ "$session_file_growth" -ge "$((max_files_per_proc * fd_stop_percent / 100))" ] \
+      || [ "$used_vnodes" -ge "$((max_vnodes * fd_stop_percent / 100))" ]; then
+      warn "Stopping $container_name: host file/vnode use reached the $fd_stop_percent% safety threshold. See $VIRTIOFS_ISSUE_URL"
+      stop_native_container true
+      return
+    fi
+    sleep 2
+  done
+}
+
+set +e
+# The child must be waitable so TERM/HUP sent only to this launcher can run the
+# trap immediately. Explicitly preserving fd 0 prevents Bash from replacing a
+# background command's stdin with /dev/null, including under a real PTY.
+legacy_background_launching=true
+"$container_bin" "${start_args[@]}" <&0 &
+child_pid=$!
+complete_legacy_background_launch
+if ! is_true "${AGENT_CONTAINER_DISABLE_FD_WATCHDOG:-false}"; then
+  legacy_background_launching=true
+  fd_watchdog &
+  watchdog_pid=$!
+  complete_legacy_background_launch
+fi
+wait "$child_pid"
+run_status=$?
+child_pid=""
+stop_fd_watchdog
+set -e
+
+# A normal --rm workload is already absent here. ContainerStart differs from
+# ContainerRun when bootstrap fails, however: it can leave a stopped auto-remove
+# record behind. Reinspect and delete only the exact, still-stopped container
+# whose IDs, labels, image digest, and terminal configuration we already proved.
+# Any absence is normal; any ambiguous replacement is retained fail-closed for
+# the next lifecycle reconciliation instead of being deleted by name alone.
+post_start_inspect="$host_stage_dir/.container-post-start.$$"
+if "$container_bin" inspect "$container_name" \
+  > "$post_start_inspect" 2>/dev/null; then
+  if verify_created_container "$post_start_inspect" false; then
+    if ! "$container_bin" delete --force "$container_name" >/dev/null 2>&1; then
+      # With --rm, Apple container can remove the stopped record between the
+      # successful inspect above and this explicit delete. Treat that race as
+      # the normal absent state; warn only when the name still resolves.
+      if ! native_container_name_is_absent "$container_name"; then
+        warn "Could not remove stopped project-owned container '$container_name'; the next launch will retry provenance-checked recovery."
+      fi
+    fi
+  else
+    warn "Container '$container_name' still exists after start but no longer matches its verified stopped state; it was retained for provenance-checked recovery."
+  fi
+elif ! native_container_name_is_absent "$container_name"; then
+  warn "Could not determine whether '$container_name' was auto-removed; the next launch will perform provenance-checked recovery."
+fi
+rm -f "$post_start_inspect"
+
+exit "$run_status"

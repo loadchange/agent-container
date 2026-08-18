@@ -1,0 +1,108 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ -n "${FAKE_OPENSSL_LOG:-}" ]; then
+  {
+    echo CALL
+    for argument in "$@"; do
+      printf 'ARG=%s\n' "$argument"
+    done
+  } >> "$FAKE_OPENSSL_LOG"
+fi
+
+command_name=${1:-}
+[ -n "$command_name" ] || exit 64
+shift
+
+input_file=""
+previous=""
+for argument in "$@"; do
+  case "$previous" in
+    -in|-certfile) input_file=$argument ;;
+  esac
+  previous=$argument
+done
+
+contains_marker() {
+  local marker=$1
+  [ -n "$input_file" ] && [ -f "$input_file" ] \
+    && grep -Fq -- "$marker" "$input_file"
+}
+
+case "$command_name" in
+  crl2pkcs7)
+    [ -n "$input_file" ] && [ -f "$input_file" ] || exit 65
+    contains_marker 'SU5WQUxJRA==' && exit 1
+    if printf '%s\n' "$@" | grep -Fqx DER; then
+      printf 'FAKE-PKCS7-DER\n'
+    else
+      cat "$input_file"
+    fi
+    ;;
+  pkcs7)
+    input=$(cat)
+    certificate_count=$(printf '%s\n' "$input" \
+      | grep -c '^-----BEGIN CERTIFICATE-----$' || true)
+    [ "$certificate_count" -gt 0 ] || exit 66
+    if printf '%s\n' "$input" | grep -Fq 'Tk9OQ0E='; then
+      printf '%s\n' \
+        'X509v3 Basic Constraints:' \
+        '    CA:FALSE'
+    else
+      while [ "$certificate_count" -gt 0 ]; do
+        printf '%s\n' \
+          'X509v3 Basic Constraints:' \
+          '    CA:TRUE'
+        certificate_count=$((certificate_count - 1))
+      done
+    fi
+    ;;
+  x509)
+    [ -n "$input_file" ] && [ -f "$input_file" ] || exit 67
+    contains_marker 'SU5WQUxJRA==' && exit 1
+    if printf '%s\n' "$@" | grep -Fqx -- -startdate; then
+      if contains_marker 'RlVUVVJFLUNB'; then
+        printf '%s\n' 'notBefore=Jan  1 00:00:00 2999 GMT'
+      else
+        printf '%s\n' 'notBefore=Jan  1 00:00:00 2000 GMT'
+      fi
+      exit 0
+    fi
+    if printf '%s\n' "$@" | grep -Fqx -- -checkend; then
+      contains_marker 'RVhQSVJFRC1DQQ==' && exit 1
+      exit 0
+    fi
+    if printf '%s\n' "$@" | grep -Fqx -- -ext; then
+      if contains_marker 'Tk9OQ0E='; then
+        printf '%s\n' \
+          'X509v3 Basic Constraints:' \
+          '    CA:FALSE'
+      else
+        printf '%s\n' \
+          'X509v3 Basic Constraints:' \
+          '    CA:TRUE'
+      fi
+      exit 0
+    fi
+    if printf '%s\n' "$@" | grep -Fqx -- -text; then
+      if contains_marker 'Tk9OQ0E='; then
+        printf '%s\n' \
+          'X509v3 Basic Constraints:' \
+          '    CA:FALSE'
+      else
+        printf '%s\n' \
+          'X509v3 Basic Constraints:' \
+          '    CA:TRUE'
+      fi
+      exit 0
+    fi
+    if printf '%s\n' "$@" | grep -Fqx DER; then
+      cat "$input_file"
+      exit 0
+    fi
+    cat "$input_file"
+    ;;
+  *)
+    exit 68
+    ;;
+esac

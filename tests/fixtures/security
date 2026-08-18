@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ -n "${FAKE_SECURITY_LOG:-}" ]; then
+  {
+    echo CALL
+    for argument in "$@"; do
+      printf 'ARG=%s\n' "$argument"
+    done
+  } >> "$FAKE_SECURITY_LOG"
+fi
+
+[ "${1:-}" = verify-cert ] && [ "${2:-}" = -P ] && [ -n "${3:-}" ] \
+  || exit 64
+url=$3
+
+if [ "${FAKE_SECURITY_FAIL:-false}" = true ]; then
+  exit 1
+fi
+
+case "$url" in
+  https://claude.ai/install.sh|https://chatgpt.com/codex/install.sh|https://x.ai/cli/install.sh|https://example.test/install.sh)
+    body=${FAKE_SECURITY_INSTALLER_ANCHOR_BODY:-SU5TVEFMTEVSLUFOQ0hPUg==}
+    ;;
+  https://downloads.claude.ai/claude-code-releases/latest|https://releases.openai.com/codex/channels/latest|https://x.ai/cli/stable|https://example.test/latest)
+    body=${FAKE_SECURITY_VERSION_ANCHOR_BODY:-VkVSU0lPTi1BTkNIT1I=}
+    ;;
+  *)
+    exit 65
+    ;;
+esac
+
+case "${FAKE_SECURITY_CHAIN_FORMAT:-nul-cr}" in
+  plain)
+    printf '%s\n' \
+      '-----BEGIN CERTIFICATE-----' \
+      'Tk9OQ0E=' \
+      '-----END CERTIFICATE-----' \
+      '-----BEGIN CERTIFICATE-----' \
+      "$body" \
+      '-----END CERTIFICATE-----'
+    ;;
+  nul-cr)
+    printf '%s\r\n' \
+      '-----BEGIN CERTIFICATE-----' \
+      'Tk9OQ0E=' \
+      '-----END CERTIFICATE-----'
+    printf '\0'
+    printf '%s\r\n' \
+      '-----BEGIN CERTIFICATE-----' \
+      "$body" \
+      '-----END CERTIFICATE-----'
+    ;;
+  three-ca-nul-cr)
+    printf '%s\r\n' \
+      '-----BEGIN CERTIFICATE-----' \
+      'Tk9OQ0E=' \
+      '-----END CERTIFICATE-----'
+    printf '\0'
+    printf '%s\r\n' \
+      '-----BEGIN CERTIFICATE-----' \
+      "$body" \
+      '-----END CERTIFICATE-----'
+    printf '\0'
+    printf '%s\r\n' \
+      '-----BEGIN CERTIFICATE-----' \
+      'Uk9PVC1DQQ==' \
+      '-----END CERTIFICATE-----'
+    ;;
+  *)
+    exit 66
+    ;;
+esac

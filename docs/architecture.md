@@ -1,408 +1,432 @@
-# Architecture: a macOS-native runtime for Agent CLIs
+# Architecture: persistent profile VMs with dynamic workspaces
 
-Date: 2026-07-30
-Validated upstream versions: `apple/container` 1.2.0 and
-`apple/containerization` 0.40.1.
+Validated platform: Apple `container` 1.2.0 on Apple silicon and macOS 26 or
+newer.
 
-## Scope
+## Scope and invariants
 
-`agent-container` is a macOS-only host launcher for command-line coding agents.
-The host must be Apple silicon running macOS 26 or newer. The selected Agent
-CLI does **not** run as a Darwin process: it runs as `linux/arm64` inside a
-short-lived Micro-VM managed by Apple's Containerization stack.
+`agent-container` runs native Linux arm64 Agent CLIs through Apple's public
+`container` CLI. Claude Code, Codex CLI, and Grok CLI are declarative profiles
+of one runtime. The core launcher owns image construction, persistent container
+identity, workspace transport, UID/GID handling, TTY forwarding, security
+policy, and cleanup.
 
-Claude Code, Codex CLI, and Grok CLI are profiles of the same runtime. The core
-owns isolation, lifecycle, identity, mounts, and safety checks; a profile owns
-only the official native-installer contract, release-channel metadata, and
-command. This separation is the foundation for adding more Agent CLIs without
-copying the launcher.
+The normal path has these invariants:
 
-## Decision: use Apple's `container` CLI
+- at most one managed container for each `(profile, host UID)` pair, created on
+  first use;
+- the container remains running until an explicit `singleton stop`;
+- each invocation starts a new Agent process through `container exec`;
+- every invocation keeps its own cwd, TTY or pipes, signals, and exit status;
+- only that invocation's current Git root is dynamically mounted;
+- no real host HOME or predeclared multi-project root set is mounted;
+- clients of one profile share the VM and isolated profile HOME.
 
-The public `container` CLI is the production boundary. This project does not
-link the low-level Containerization Swift package directly and does not use
-`container machine`.
+The stable native name is `agent-<profile>-<uid>-singleton`. The container's
+primary process is an inert lifetime anchor. Agent behavior is never delegated
+to an Agent-specific resident process, so Claude, Codex, and Grok all follow the
+same execution model.
+
+## Why use Apple's `container` CLI
+
+The public CLI is the production API boundary:
 
 ```text
-agent-container (Bash host launcher)
-  -> container CLI (native Swift client)
-    -> container-apiserver (launchd/XPC)
-      -> core-images helper (OCI content and snapshots)
-      -> vmnet network helper
-      -> one container-runtime-linux helper per session
+Rust launcher
+  -> internal shell runtime
+    -> Apple container CLI
+      -> container-apiserver and Apple helper services
         -> Virtualization.framework Micro-VM
-          -> optimized Linux kernel + vminitd
-          -> exact publisher-channel-resolved linux/arm64 native Agent CLI
+          -> Linux arm64 image and native Agent executable
 ```
 
-Directly embedding Containerization would make this project responsible for
-kernel and vminit acquisition, OCI content storage, root filesystem creation,
-APFS snapshots, vmnet allocation, vsock/gRPC, PTY resize, signals, crash
-recovery, cleanup, signing, and entitlements. Apple's services already own
-those responsibilities. Keeping the API behind a versioned CLI also limits the
-impact of Swift API churn; Containerization promises source stability only
-within a minor release.
+This project does not embed the low-level Containerization Swift package and
+does not use `container machine`. Apple's services continue to own OCI content,
+snapshots, vmnet, Virtualization.framework setup, vminitd, PTYs, signals, and
+runtime helper processes. The project adds a stricter identity and lifecycle
+protocol around that supported CLI.
 
-The main design reference is Apple's experimental
-[`examples/sandboxy`](https://github.com/apple/containerization/tree/0.40.1/examples/sandboxy).
-It demonstrates the same per-Agent Micro-VM model. `agent-container` uses the
-supported CLI path rather than copying that experimental application and its
-broad host capabilities.
+`container machine` is a persistent general-purpose VM and can expose a broad
+home share. A managed profile singleton remains a narrowly configured Apple
+container with an inspected image, isolated shadow HOME, and no statically
+mounted workspace.
 
-`container machine` is intentionally not used. It is a persistent,
-general-purpose VM whose default read-write home sharing is broader than this
-project needs. Each invocation instead creates a named, auto-remove container
-with an ephemeral Linux root and a narrowly selected set of host shares.
+## Host launcher split
 
-## Native image model and APFS copy-on-write
-
-The shared `Containerfile` starts from Debian Bookworm slim rather than a
-language-runtime image. Its default is the Linux arm64 manifest pinned as:
+One Rust binary is installed under the generic and compatibility names:
 
 ```text
-mirror.gcr.io/library/debian:bookworm-slim@sha256:9b67294679b30e5d6ab257b40594feeb4a4b81f7fcf4131f4decf0d6a212a9b0
+agent-container
+claude-container
+codex-container
+grok-container
 ```
 
-Node.js and npm are not installed. The image contains common development tools,
-one native Agent release, and the generic entrypoint.
+The binary dispatches from the basename of `argv[0]`, parses only leading
+`--container-*` launcher options, and preserves every other argument as an
+`OsString`. It then uses `exec(2)` to replace itself with the adjacent internal
+`agent-container-runtime`; it does not introduce a signal-forwarding parent.
+The environment used between those two components is private implementation
+detail rather than a public configuration interface.
 
-Every built-in profile currently selects `latest`. Before inspecting or
-building its image, every host launch queries the profile's official version
-channel: Claude's plain-text latest endpoint, Codex's JSON latest channel, or
-Grok's plain-text stable endpoint. The response must reduce to one safe exact
-version. That exact value, rather than the floating channel name, is included in
-the recipe fingerprint and passed to the official installer. An exact
-`AGENT_CONTAINER_VERSION` skips channel resolution; this allows a matching warm
-image to run without channel network access, although a missing image still
-requires a networked build.
+The Rust binary also owns the internal workspace-broker entry point. Keeping
+the broker in the signed host launcher removes a Node.js bootstrap from the
+default path and gives the wire protocol a compact, typed implementation.
 
-Image construction runs the selected official script with a build-only
-`HOME=/opt/agent-native` and no workspace or persistent profile mounts. Claude
-uses `https://claude.ai/install.sh` through `bash`, Codex uses
-`https://chatgpt.com/codex/install.sh` through `sh`, and Grok uses
-`https://x.ai/cli/install.sh` through `bash`. The resolved exact version is
-supplied as the installer's positional argument or documented environment
-variable, so a channel movement between resolution and build cannot silently
-select a different Agent release.
+## Persistent container and independent clients
 
-After installation the recipe resolves the command target, requires `file` to
-identify a Linux ELF64 ARM aarch64 executable, and requires the version probe
-to report the resolved version. Claude and Grok require no adjacent installer
-tree, so their single ELF is copied to `/usr/local/bin` and the temporary tree
-is removed. Claude links against Debian's glibc; Grok is statically linked.
-Codex retains its full versioned standalone tree under
-`/opt/agent-native/.codex/packages/standalone/`, including its adjacent code-mode
-host, `rg`, `bwrap`, and resources; `/usr/local/bin/codex` links into that tree.
-
-Within the project's lifecycle locks and same-user trust boundary, the image
-descriptor selected for a session is treated as immutable. An external
-same-user `container image delete` or prune can still make startup fail, but it
-cannot make the launcher execute an unverified replacement image.
-
-Apple's image service caches OCI content and unpacked roots. On a clone-capable
-backing filesystem such as APFS, its filesystem copy path uses `clonefile`
-copy-on-write semantics rather than sharing one writable installation volume.
-Consequently:
-
-- the exact channel-resolved native Agent version and local image identity are
-  auditable;
-- warm sessions reuse cached image content;
-- concurrent image roots do not share a writable Agent installation;
-- changing the profile, requested Agent version, base image, Containerfile,
-  context allowlist, or entrypoint invalidates the launcher build fingerprint.
-
-The default image reference is `agent-container-<profile>:latest`. Per-profile
-image reference, build fingerprint, and inspected identity are recorded under
-`~/.agent-container/profiles/<profile>/meta/`. Image tags alone are not treated
-as ownership proof. Before the session entrypoint or requested Agent command
-can execute with workspace/profile mounts, the launcher uses a two-stage Apple
-CLI flow: `container create --rm`, strict `container inspect`, then attached
-`container start`. This is a project-level fail-closed
-verification protocol, not a server-side atomic compare-and-start API. The
-stopped container's OCI descriptor digest, project labels, IDs, state, and
-terminal mode must match the preceding image inspection. A tag changed between
-image inspection and creation therefore fails closed instead of starting
-different content.
-
-## Runtime identity and the shadow HOME
-
-The physical-machine-like behavior comes from identity and path continuity,
-not from exposing the real macOS home directory.
-
-For a host home such as `/Users/alice`, the launcher creates this mapping:
+A typical two-project profile looks like this:
 
 ```text
-macOS host                                      Linux guest
-~/.agent-container/profiles/codex/home/   <->  /Users/alice       (rw)
-/Users/alice/work/project/                 <->  same absolute path (rw)
-external Git common directory             <->  same absolute path (rw, if needed)
-per-session staged metadata                <->  /run/agent-host    (ro)
+terminal A                         terminal B
+    |                                  |
+    +-- Rust launcher                  +-- Rust launcher
+    |      |                           |      |
+    |      +-- broker A                |      +-- broker B
+    |          sandboxed SFTP(A)       |          sandboxed SFTP(B)
+    |                                  |
+    +-- container exec A               +-- container exec B
+           |                                  |
+           +-- private mount ns A              +-- private mount ns B
+           +-- SSHFS project A                 +-- SSHFS project B
+           +-- Agent process A                 +-- Agent process B
+                        \                      /
+                         agent-<profile>-<uid>-singleton
+                         one VM + one profile HOME
 ```
 
-The first share is an isolated, persistent **shadow HOME**. It has the same
-absolute guest path as the macOS home, but its contents come from the selected
-profile's private state directory. The actual macOS home root is never mounted
-wholesale; the workspace and any explicitly enabled capability paths are
-separate, narrower shares. Agent login state, settings, histories, and caches
-written below `$HOME` therefore persist for that profile without being shared
-with another profile or with the native macOS installation.
+The first invocation builds or verifies the image, creates a stopped named
+container, verifies its exact digest and provenance, starts it detached, and
+publishes managed state as ready. A later invocation verifies the same native
+record and immediately takes the client path.
 
-The build-only installer HOME is unrelated to this runtime shadow HOME. At
-runtime the launcher also sets the profile-declared updater-disable variable
-when one exists: `DISABLE_AUTOUPDATER=1` for Claude and
-`GROK_DISABLE_AUTOUPDATER=1` for Grok. Release changes are therefore handled by
-the host's channel resolution and fingerprinted image replacement rather than
-an updater mutating a session root.
+`container exec` receives `--interactive` and receives `--tty` only when both
+host stdin and stdout are terminals. Piped invocations therefore do not ask
+Apple 1.2 to initialize a terminal on a non-terminal descriptor. Every exec is
+started as root only long enough for mount-namespace setup; the Agent itself is
+started as the host numeric UID/GID with supplementary groups cleared and
+`no_new_privs` enabled.
 
-Runtime environment inheritance is resolved by the host launcher before
-`container create`. The Claude integration has a fixed, reviewed allowlist of
-non-credential provider/model/telemetry/UI settings; other profiles do not
-receive it. Authentication normally remains a separate explicit capability,
-with `ANTHROPIC_AUTH_TOKEN` recognized as a Claude alternative to the profile's
-primary `ANTHROPIC_API_KEY`. The one automatic exception is a non-empty
-`ANTHROPIC_BASE_URL` paired with an exported `ANTHROPIC_AUTH_TOKEN`: the
-launcher treats those exact names as one intentional custom-provider bundle.
-This is the default credential mode; `true` forwards every credential name
-recognized for the active profile and `false` disables the profile credential
-path. An unset switch selects `auto`, while an explicitly exported empty value
-retains the older disabled behavior. A comma-separated
-`AGENT_CONTAINER_FORWARD_ENV` escape hatch permits future variables by exact
-name after strict validation. There is deliberately no prefix discovery because
-`ANTHROPIC_*` and `CLAUDE_CODE_*` contain secret and host-process state as well
-as ordinary configuration. Every inherited value uses
-`container create --env NAME`, so the value remains in the launcher's
-environment instead of being serialized into its argument vector.
+Client exit terminates only that Agent and its SSHFS session. It does not stop
+the VM or another client. `singleton stop <profile>` is the explicit persistent
+container lifecycle boundary.
 
-The repository root is mounted at its original absolute path. The original
-current directory becomes the guest working directory. This preserves project
-paths recorded by Agent CLIs and Git. Linked worktrees and submodules may need
-an external Git common directory, which is mounted separately at its original
-path.
+## Dynamic workspace transport
 
-VirtioFS exposes numeric ownership and Apple does not currently provide a
-`keep-id`/uidmap facility. The root entrypoint adds a passwd/group record for
-the host numeric UID/GID, or rewrites the single colliding image passwd record
-so `getpwuid` still resolves the isolated shadow HOME. It then executes the
-Agent with `setpriv`, cleared supplementary groups, and `no_new_privs`. It
-never recursively changes ownership of a host share.
+### Motivation
 
-The launcher attaches stdin for both TTY and piped use. It records a TTY in the
-created container only when both stdin and stdout are terminals; attached start
-otherwise tries to put a pipe into raw terminal mode and fails with `ENOTTY` on
-Apple 1.2. It preserves argument boundaries, waits for the Apple CLI, and
-translates `INT`, `TERM`, and `HUP` into a named container stop. This gives
-interactive Agent CLIs normal terminal behavior while keeping cleanup under the
-host launcher.
+Apple `container` 1.2 can specify volumes only while creating a container. It
+cannot add a mount to an already-running container through `container exec`.
+Pre-mounting project A and project B would require knowing every future path,
+would expand the VM's authority, and would reproduce the large-tree VirtioFS
+risk that the persistent design is intended to avoid.
 
-## Explicit run mode and the host-exec broker
+The normal path instead transports one canonical project root for one exec.
+Inside Git, that root is the repository top level; outside Git, it is the
+physical current directory. The original cwd must resolve beneath that root.
 
-The legacy `agent-container <profile> ...` interface starts only the verified
-Linux Agent environment described above. A separate, explicit interface opts
-into a wider host integration boundary:
+### Host broker
+
+For every client, the Rust launcher:
+
+1. canonicalizes an existing directory and rejects `/`;
+2. verifies `/usr/bin/sandbox-exec` and `/usr/libexec/sftp-server` as fixed
+   non-symlink system executables;
+3. generates 32 bytes from `/dev/urandom` and encodes a 64-character lowercase
+   hexadecimal token;
+4. binds the selected Apple host-gateway IPv4 address on TCP port zero;
+5. prints exactly one tab-separated endpoint/token record to its parent;
+6. takes the read end of a private owner-liveness pipe and marks it
+   close-on-exec;
+7. waits at most 30 seconds for one connection while also watching owner
+   liveness;
+8. accepts at most 100 authentication bytes under one absolute five-second
+   deadline;
+9. starts the SFTP server under a parameterized macOS sandbox and relays raw
+   bytes in both directions;
+10. exits when the one connection and SFTP child end.
+
+The authentication frame is versioned and exact. Reading it one byte at a time
+prevents the broker from consuming the beginning of the first SFTP packet. The
+token is not accepted as a command-line argument to the guest transport.
+
+Only the host runtime retains the liveness writer. The broker child explicitly
+closes it, and the Apple CLI child closes it before `container exec`, so neither
+can keep the owner alive accidentally. EOF, a pipe error, or unexpected pipe
+data is fail-closed. It stops pre-connection acceptance or calls
+`shutdown(SHUT_RDWR)` on the attached TCP stream. Consequently, even
+`SIGKILL` of the runtime tears down that client's workspace without stopping
+the singleton or another client's broker.
+
+The SFTP child receives a default-deny sandbox profile. It can execute the fixed
+system SFTP binary, read and write below the canonical workspace, traverse only
+the ancestors needed to reach it, and use standard system runtime files. An
+explicit network deny prevents the child from creating another network
+channel. The unsandboxed Rust parent owns only endpoint acceptance and byte
+relay; it does not interpret SFTP paths or execute workspace commands.
+
+This uses Apple's deprecated `sandbox-exec` interface. The default workspace
+path fails closed if that fixed executable or the profile cannot be used, and
+the policy must be retested on every supported macOS release.
+
+### Guest mount namespace
+
+The container exec enters a new mount namespace with private propagation before
+creating a mountpoint. It validates that:
+
+- the requested root and cwd are canonical absolute paths;
+- neither overlaps protected guest system trees;
+- the cwd is below the root and does not traverse a workspace symlink;
+- the mountpoint is empty and not already mounted;
+- `/dev/fuse`, SSHFS, `fusermount3`, and the fixed transport helper are present;
+- the resulting filesystem type is FUSE/SSHFS.
+
+The guest transport prefixes the one authentication frame and then runs
+`socat -t 1 STDIO TCP4-CONNECT:...` as the raw bidirectional SFTP relay. Local
+stdin EOF produces a TCP write-half-close while the relay can still read the
+peer. Remote EOF ends the relay, after which the parent terminates and reaps a
+producer that may still be blocked on SSHFS stdin. The one-second `socat`
+inactivity bound applies after one side reaches EOF; this is a lifecycle relay,
+not a general tunnel that waits indefinitely for delayed trailing data. Broker
+loss therefore terminates SSHFS. SSHFS mounts the remote current directory at
+the same absolute path with short attribute, entry, and negative caches.
+
+After mount readiness, the helper creates a root-owned cgroup v2 leaf and an
+independent session/process group, conditionally reacquires the exec PTY as its
+controlling terminal, drops to the host identity, and starts the exact
+root-owned profile executable. Every descendant inherits the cgroup even if it
+later calls `setsid`, `setpgid`, or double-forks.
+
+Signal and EXIT cleanup freeze the cgroup leaf, queue TERM to its stable member
+snapshot, unfreeze for the grace period, use the atomic `cgroup.kill` boundary,
+and wait for `populated 0` before stopping SSHFS or unmounting. This avoids
+signalling a recycled PID while still reaching descendants that left the
+original process group. The mount exists only in that private namespace, so
+normal path lookup by another client does not see it. Unexpected SSHFS exit also
+triggers the same Agent-tree cleanup.
+
+Private namespaces prevent accidental mount sharing, but the clients still
+share one kernel, Linux identity, process table, and profile HOME. They are not
+a hard boundary for mutually hostile same-profile workloads.
+
+### Git limitation
+
+The default transport currently carries one root. A linked worktree whose Git
+common directory is outside the worktree root cannot be represented as one
+SFTP mount and is rejected before broker startup. The advanced `run` path can
+use separate Apple volume mounts for that case. Ordinary repositories and
+switching among unrelated roots require no configuration.
+
+## Shadow HOME and static mounts
+
+For host `/Users/alice`, the persistent mapping is:
 
 ```text
-agent-container run <profile> [runtime options...] [-- agent arguments...]
-<profile>-container run [runtime options...] [-- agent arguments...]
+host managed state                                      guest
+~/.agent-container/profiles/codex/home/        <->      /Users/alice  (rw)
+profile singleton static staging               <->      /run/agent-host (ro)
+per-exec host Git root                          <->      same path through SSHFS
 ```
 
-`run` snapshots eligible executable basenames from the launcher's host `PATH`
-before the Agent starts. It writes a frozen per-session manifest containing the
-command basename, canonical executable path, and either `first` or `fallback`
-resolution; the broker independently re-resolves and freezes each target while
-loading the manifest. A PATH symlink whose canonical target is outside its
-admitted tool runtime is skipped individually, so an unrelated pipx/uv-style
-link cannot poison the complete session. When an active Xcode or
-CommandLineTools installation can resolve
-common stock developer shims such as `/usr/bin/git` and `/usr/bin/python3`, the
-launcher freezes those commands to the selected executables so they do not need
-xcrun's ambient host cache at request time. Otherwise it retains the original
-shim. A selected developer runtime is admitted read-only and its actual tool
-directories are inserted immediately before `/usr/bin` in the brokered child
-`PATH`, preserving any user-selected earlier toolchain. The selected Agent
-command, launcher compatibility commands, the
-Apple `container` command, and `sudo` are unconditionally excluded. A repeated
-`--no-host-exec COMMAND` removes another basename; `--host-first COMMAND` moves
-an allowed basename to the host-first set. These lists select direct shim
-routes, not subprocess policy: a routed shell, interpreter, Git hook, or
-credential helper may create more native children. The generated macOS
-filesystem sandbox is applied to the process group and is the enforcement
-boundary for their filesystem access.
+The real `/Users/alice` directory is not mounted. The path-compatible shadow
+HOME lets Agent state persist without exposing unrelated documents or another
+profile's state. All clients of one profile intentionally share it.
 
-The current filesystem boundary is implemented with Apple's deprecated
-`sandbox-exec` interface. `run` fails closed when `/usr/bin/sandbox-exec` is not
-available, but Apple may change or remove this interface in a future macOS
-release. This host bridge therefore requires release-by-release compatibility
-validation and must not be treated as a permanently supported platform API.
+Static opt-ins such as full Git configuration, GitHub CLI configuration, SSH
+metadata, and the live SSH agent are container-creation capabilities. Their
+content or identity contributes to the singleton configuration fingerprint.
+Changing one while the container is running requires an explicit stop and
+recreation; it is never silently added to an existing VM.
 
-Starting the broker necessarily executes one host Node.js process before that
-sandbox exists. The launcher canonicalizes both the selected Node command and
-its reported `process.execPath`, and rejects either path when it is inside the
-workspace, private Agent state, an external writable Git directory, or a
-read-write additional share. This bootstrap remains a trusted native dependency
-and is not part of the guest fallback command surface.
+The default staged Git configuration contains only `user.name` and
+`user.email`. It does not carry credential helpers, includes, HTTP headers, or
+URL rewrites.
 
-The guest entrypoint builds two shim directories around the guest's normal
-`PATH`:
+## Image model
 
-```text
-host-first shims -> guest command directories -> host-fallback shims
-```
+The shared image starts from a digest-pinned Debian Bookworm slim arm64 base.
+It contains common Linux tools, SSHFS/FUSE helpers, the generic entrypoint, and
+one exact native Agent release. It does not install Node.js or npm for normal
+operation.
 
-The usual policy is therefore guest-first: a Linux binary in the image wins,
-and a host command is used only when the guest lacks that basename. `git` is
-host-first by default because this mode is intended to approximate the
-physical-machine repository workflow. The shim does not mount or execute a
-Mach-O file in Linux. It sends the exact argument vector and stdin to a generic
-Linux client, which authenticates to a native macOS broker; the broker executes
-the already-resolved host path without invoking a shell and streams stdout,
-stderr, and the final exit status back.
+Every built-in profile selects a publisher channel. On launch, the host reduces
+that channel response to one safe exact version. The image recipe fingerprint
+includes at least:
 
-Additional shares are repeatable `--share-ro PATH` or `--share-rw PATH`
-options. The launcher canonicalizes each existing directory, mounts it at the
-same absolute guest path, rejects unsafe and overlapping roots, and includes it
-in the VirtioFS budget. The same ordered root manifest becomes the macOS
-sandbox policy for brokered commands:
+- the complete validated profile;
+- resolved exact Agent version;
+- base-image reference;
+- `Containerfile`, build-context allowlist, entrypoint, and workspace helpers;
+- selected guest CA fingerprint;
+- relevant build recipe inputs.
 
-- the repository and required external Git directory are read-write;
-- each additional directory receives exactly its requested read-only or
-  read-write mode;
-- host executable and runtime dependency roots are read-only;
-- the real host HOME is not admitted as a general filesystem root.
+The build uses a private installer HOME and has no runtime profile HOME,
+workspace, API key, SSH agent, or GitHub configuration mounted. After the
+official script runs, the recipe requires a Linux ELF64 ARM aarch64 command and
+an exact version-probe match. Claude and Grok are reduced to one ELF; Codex
+keeps its adjacent standalone resources.
 
-The two enforcement paths are intentionally aligned: `--share-ro` limits both
-the guest mount and brokered host processes to read access, while `--share-rw`
-permits both sides to mutate that tree. A host command cannot use the broker to
-bypass a read-only guest mount.
+Image references are profile-scoped cache names, not ownership proof. Before a
+new singleton executes any client, the launcher inspects the image descriptor,
+creates a stopped container with project labels, and inspects that stopped
+container again. Its name, profile, host UID, creator PID, mode, image digest,
+terminal state, and configuration hash must all match. Ambiguity is retained
+for manual inspection rather than deleted speculatively.
 
-Ordinary brokered commands run with a persistent, per-profile HOME at
-`~/.agent-container/profiles/<id>/host-home`. It is separate from the real host
-HOME and from the Linux shadow HOME. Host Git is a deliberate exception. For
-that one command, the broker selects the real host HOME so Git can discover the
-selected real `.gitconfig` and `.config/git` files, while the sandbox admits
-only those Git configuration inputs rather than the complete HOME. The named
-`.ssh/config`, `.ssh/known_hosts`, `.ssh/known_hosts.old`, and
-`.ssh/allowed_signers` metadata paths are admitted read-only. The broker does
-not separately reject a named path because
-it is a symlink; the symlink target must independently be inside a
-sandbox-authorized root for traversal to succeed. A live host `SSH_AUTH_SOCK`,
-when present, is also admitted to `run` sessions. SSH private-key files are
-never admitted or copied. Git configuration can still select credential helpers
-or external commands, and SSH-agent possession authorizes authentication and
-signing operations; whether a macOS credential helper can reach Keychain from
-the sandbox is platform-dependent.
+On APFS, Apple's image and root filesystem implementation can use clonefile
+copy-on-write. That improves warm root creation but does not make project I/O
+native-speed; the default project path is SFTP/SSHFS.
 
-The broker is a per-launch child, not a persistent service. The launcher creates
-a random 256-bit token, command/root manifests, and authenticated endpoint
-metadata under its restrictive session staging directory. The guest sees those
-files through the existing read-only `/run/agent-host` mount. Each authenticated
-request gets a distinct host process group. Client disconnect, launcher exit,
-VM stop, or broker termination kills that complete group, including ordinary
-background descendants that remain members, before session staging is removed.
-Deliberate `setsid`-style daemonization can escape a PGID and is outside the
-protocol contract; the broker is not a durable service manager. The broker also
-watches the launcher PID so an uncatchable launcher failure does not
-intentionally leave a normal host service behind.
+## CA transport
 
-Host-exec requests are pipe based and do not allocate a pseudo-terminal. Stdin,
-stdout, and stderr can stream through the connection, but commands that require
-a controlling terminal, raw mode, or terminal ioctls must run in the guest or
-outside `agent-container`. This is independent of the outer Agent session,
-which retains the normal PTY behavior described above.
+`--container-extra-ca auto` is the normal default. macOS Security independently
+verifies the known installer endpoint and, when resolving a floating channel,
+the version endpoint. The highest currently-valid issuer explicitly marked
+`CA:TRUE` from each verified chain is scoped to its consumer:
 
-Selecting `run` is the user's authorization for this broader mode. The command
-manifest, token authentication, and macOS sandbox narrow native host execution,
-but they do not make it equivalent to the legacy Micro-VM-only boundary. In
-particular, a brokered host interpreter executes code as the macOS user within
-the admitted roots. Omitting `run` is the way to avoid creating the broker at
-all.
+- the version-chain CA is used only for the host channel request;
+- the installer-chain CA is supplied to the builder and installed into the
+  guest system trust store.
 
-## State and session lifecycle
+The two CAs may differ. The complete Keychain is never copied. An explicit PEM
+bundle must be selected with `--container-extra-ca` and supplies one reviewed
+trust set after strict count, size, validity, Basic Constraints, symlink, and
+stable-digest checks. PEM contents enter BuildKit as a secret; only their
+public digest enters cache/provenance metadata.
 
-The default state root is `~/.agent-container`:
+The base-image pull and early Debian bootstrap precede guest CA installation.
+They need their own trusted route. TLS errors and HTTP authorization errors are
+different layers: certificate error 60 indicates chain verification failure;
+HTTP 403 indicates that TLS succeeded and an origin or enterprise allowlist
+denied access.
+
+## Configuration boundary
+
+The Rust launcher exposes a finite public `--container-*` vocabulary. Value
+options cover resources, image selection, proxies, DNS, timezone, credential
+policy, CA choice, safety thresholds, and development executable paths.
+Boolean options cover rebuild behavior, static Git/GitHub/SSH capabilities, and
+legacy VirtioFS safety controls.
+
+Only leading launcher options are consumed. `--` ends launcher parsing, and an
+unknown leading namespaced option is rejected as a typo. This prevents a
+generic CLI parser from consuming future Agent flags while removing the need
+for users to manipulate the internal Rust-to-runtime environment contract. The
+full public option table is in the README and is mechanically aligned with
+`src/launcher.rs`.
+
+No provider or Agent environment setting is part of that private inherited
+contract. `--container-forward-api-key` is off by default and expands only the
+active profile's `apiKeyEnv` when enabled.
+All other endpoint, model, token, and Agent settings require exact exported
+names in `--container-forward-env`. The option accepts names rather than
+`NAME=VALUE` assignments: values travel through the environment handoff and do
+not enter launcher or Apple CLI argument vectors.
+
+Settings that affect a persistent VM are hashed. A client may not attach with a
+different CPU, memory, network, CA, image, or static capability policy. The
+operator stops that profile and lets the next invocation create the new
+configuration.
+
+## State and lifecycle
+
+The managed state root is:
 
 ```text
-~/.local/share/.agent-container.install.lock/ # lifecycle registration/transaction mutex
 ~/.agent-container/
   .agent-container-owned
   profiles/<id>/
-    home/                 # persistent isolated Agent HOME
-    host-home/            # persistent isolated HOME for ordinary host tools
+    home/
+    host-home/
     meta/
       image-ref
       image-build-id
       image-identity
-    session.lock/         # one image/session transaction per profile
-  sessions/session-<pid>/ # ephemeral metadata, broker manifests/token/endpoint
-  session.lock/           # global native-session safety lock
+    singleton/
+      phase
+      creator-pid
+      agent-version
+      image-digest
+      config.sha256
+      guest-stage/
+  sessions/session-<launcher-pid>/
 ```
 
-The state root must remain below the real host home, must not overlap the
-workspace or Git shares, and must have valid provenance before a non-empty
-directory is adopted. Session staging and locks are removed on normal exit and
-signals.
+The state root must remain below the real HOME, may not overlap shared data,
+and requires exact ownership markers. Persistent profile HOME is preserved
+across singleton stop and ordinary uninstall.
 
-The lock is global rather than per profile because the principal concurrency
-risk is in Apple VirtioFS, not in any specific Agent. Parallel sessions require
-both `AGENT_CONTAINER_ALLOW_CONCURRENT=true` and explicit acceptance of the
-VirtioFS risk. That opt-in permits distinct profiles to overlap; the
-per-profile lock still serializes sessions sharing one mutable,
-provenance-tracked image tag.
+Launch, install, uninstall, and singleton stop use a two-layer lifecycle lock:
+a BSD `lockf` on an open descriptor for the canonical HOME inode plus a strict
+PID/random-owner directory record. The kernel lock survives while inherited
+synchronous children still mutate native state. Owner-aware stale records can
+be quarantined only while holding that lock; malformed or older ambiguous state
+fails closed.
 
-Install and uninstall hold the lifecycle mutex for their entire transaction.
-A launcher holds it only until its `sessions/session-<pid>` registration (and,
-by default, the global session lock) is durable, then releases it before build
-or run. Thus an uninstaller either wins the mutex before a launch begins, or
-sees the live registration and aborts before mutation; explicitly accepted
-concurrent launchers are still possible.
+A cold singleton holds the lock through image verification, container create,
+detached start, running-state inspection, and ready publication. Another client
+waits, then revalidates and attaches. Warm client staging is removed before the
+lock is released. Per-client brokers are not stored as persistent services.
 
-Every native VM also carries project, profile, host-UID, and launcher-PID
-labels in an ID derived from the same values. If SIGKILL prevents shell EXIT
-cleanup, the next lifecycle-locked launch enumerates Apple containers, deletes
-only an exactly matching project-owned orphan, and then removes its complete
-stale session staging. Missing or contradictory provenance is never guessed.
+The control commands remain available even if a profile wrapper was removed:
 
-## Core and profile responsibilities
+```text
+agent-container singleton status <profile>
+agent-container singleton stop <profile>
+```
 
-| Core runtime | Agent profile |
-|---|---|
-| macOS/Apple silicon/version preflight | display name and stable/preview/experimental status |
-| Apple service, VM, PTY, signals, cleanup | official installer URL, shell, and exact-version interface |
-| UID/GID and shadow HOME | installed command and version probe |
-| workspace, Git, capability mounts, and explicit run-mode broker | official version endpoint and response format |
-| image cache and provenance | API-key and optional auto-update-disable variables |
-| VirtioFS file/FD/vnode guards | no shell fragments or arbitrary host mounts |
+Stop verifies the reserved name and full provenance before deletion. Stale
+legacy auto-remove containers are reconciled separately and only when their
+labels and dead launcher PID prove ownership.
 
-Profiles are validated JSON data and are never sourced as shell. See
-[profiles.md](profiles.md) for the schema and extension process.
+## Advanced legacy `run`
+
+`run` deliberately retains the older per-launch lifecycle:
+
+```text
+agent-container [launcher options] run <profile> [run options...] [-- Agent args...]
+```
+
+It creates an attached auto-remove VM, mounts the workspace and optional
+read-only/read-write shares through Apple volumes, and may expose selected
+native host commands through the Node.js host-exec broker. Command paths and
+tool roots are frozen into manifests; the guest uses shims to prefer guest
+binaries except for explicitly host-first commands such as Git. The broker
+authenticates requests and confines native process groups with a generated
+macOS sandbox.
+
+This boundary is broader than the default workspace-only SFTP broker: it can
+execute native code as the macOS user and uses VirtioFS for user trees. It
+exists for linked worktrees, extra shares, and host-tool compatibility, and
+requires stopping that profile's singleton first.
 
 ## Network boundary
 
-Apple's standard CLI currently gives the Micro-VM unrestricted outbound
-networking. The launcher can set proxy, DNS, and timezone values, but it does
-not implement a hostname allowlist or an egress firewall. A proxy setting is
-connectivity configuration, not a security boundary.
+Apple's VM has ordinary outbound networking. Proxy, DNS, timezone, and CA
+options configure connectivity and trust; they do not implement an egress
+allowlist. Proxy and CA overrides are accepted only through their
+`--container-*` options, not implicitly from exported launcher configuration.
+The project does not inject Agent permission-bypass options.
 
-Legacy sessions continue to deny host capabilities and credentials by default
-apart from the narrow Claude custom-provider bundle described above, and the
-project does not automatically add any Agent-specific permission-bypass flag.
-Explicit `run` sessions intentionally add the
-authenticated host broker, selected host Git configuration and live SSH agent
-described above; network reachability is not what confines that broker. Its
-authorization token, frozen command manifest, and macOS filesystem sandbox are
-the relevant controls. See [security.md](security.md) for the complete threat
-model.
+The default workspace broker binds an inspected IPv4 gateway, but possession of
+its single-use 256-bit token is the authentication boundary. Its SFTP child has
+network access denied by the macOS sandbox. The Agent VM itself remains capable
+of reaching provider APIs and other network destinations.
 
 ## Known upstream constraints
 
 - [`container#1097`](https://github.com/apple/container/issues/1097): VirtioFS
-  lookups can retain host file descriptors and exhaust the system-wide table.
-- [`container#165`](https://github.com/apple/container/issues/165): bind mounts
-  have no UID/GID translation.
-- [`container#141`](https://github.com/apple/container/issues/141): host-to-guest
-  filesystem change notifications are unreliable for watch-mode tools.
-- Host-loopback access requires Apple's DNS/PF bridge, which disables Private
-  Relay and loses its redirect rule after restart.
+  lookups can retain host file descriptors. Dynamic SFTP avoids a persistent
+  VirtioFS project mount, but shadow HOME and static opt-ins still need guards.
+- [`container#165`](https://github.com/apple/container/issues/165): Apple bind
+  mounts have no UID/GID translation. The runtime matches numeric identity.
+- [`container#141`](https://github.com/apple/container/issues/141): VirtioFS
+  host-to-guest change notifications can be unreliable. SSHFS has its own FUSE
+  cache and watcher limitations and must be benchmarked independently.
+- `sandbox-exec` is deprecated and can change or disappear in a future macOS
+  release.
+- Host-loopback access needs Apple's administrator-controlled DNS/PF bridge,
+  which disables Private Relay while active and loses its redirect on restart.
 
-These are platform limitations shared by every profile. The launcher reduces
-risk but cannot repair them. Performance and rollout criteria are documented
-in [performance.md](performance.md).
+See [security.md](security.md) for the trust model and
+[performance.md](performance.md) for measurement requirements.

@@ -1,0 +1,708 @@
+#!/bin/bash
+set -euo pipefail
+
+fail() {
+  printf 'agent-workspace-session: %s\n' "$*" >&2
+  exit 64
+}
+
+[ "$EUID" -eq 0 ] \
+  || fail 'the workspace session helper must run as root.'
+
+readonly namespace_sentinel=--agent-workspace-private-mount-namespace
+if [ "${1:-}" != "$namespace_sentinel" ]; then
+  [ "$#" -ge 5 ] \
+    || fail 'usage: agent-workspace-session ROOT CWD UID GID PROFILE_COMMAND [Agent args...]'
+  session_script=$(/usr/bin/readlink -f -- "$0") \
+    || fail 'cannot resolve the workspace session helper.'
+  case "$session_script" in /*) ;; *) fail 'workspace session helper is not absolute.' ;; esac
+  parent_mount_namespace=$(/usr/bin/readlink -- /proc/self/ns/mnt) \
+    || fail 'cannot inspect the current mount namespace.'
+  exec /usr/bin/unshare \
+    --mount \
+    --propagation private \
+    -- "$session_script" \
+    "$namespace_sentinel" \
+    "$parent_mount_namespace" \
+    "$@"
+fi
+
+shift
+[ "$#" -ge 6 ] \
+  || fail 'private mount-namespace handoff is incomplete.'
+parent_mount_namespace=$1
+shift
+current_mount_namespace=$(/usr/bin/readlink -- /proc/self/ns/mnt) \
+  || fail 'cannot inspect the private mount namespace.'
+case "$parent_mount_namespace:$current_mount_namespace" in
+  '':*|*:''|*[!A-Za-z0-9_:\[\]-]*)
+    fail 'mount-namespace identity is malformed.'
+    ;;
+esac
+[ "$current_mount_namespace" != "$parent_mount_namespace" ] \
+  || fail 'unshare did not create a private mount namespace.'
+
+workspace_root=$1
+workspace_cwd=$2
+runtime_uid=$3
+runtime_gid=$4
+profile_command=$5
+shift 5
+agent_arguments=("$@")
+
+validate_normal_absolute_path() {
+  local label=$1
+  local path=$2
+  local normalized
+
+  case "$path" in
+    /*) ;;
+    *) fail "$label must be absolute." ;;
+  esac
+  case "$path" in
+    *$'\n'*|*$'\r'*|*$'\t'*) fail "$label contains a control character." ;;
+  esac
+  [ "${#path}" -le 4096 ] || fail "$label exceeds PATH_MAX."
+  normalized=$(/usr/bin/realpath -m -- "$path") \
+    || fail "$label cannot be normalized."
+  [ "$normalized" = "$path" ] \
+    || fail "$label must already be canonical and lexically normalized."
+}
+
+validate_normal_absolute_path ROOT "$workspace_root"
+validate_normal_absolute_path CWD "$workspace_cwd"
+case "$workspace_root" in
+  /|/bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|/proc|/proc/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|/usr|/usr/*)
+    fail 'ROOT overlaps a protected guest system tree.'
+    ;;
+esac
+case "$workspace_cwd" in
+  "$workspace_root"|"$workspace_root"/*) ;;
+  *) fail 'CWD is outside ROOT.' ;;
+esac
+
+validate_numeric_identity() {
+  local label=$1
+  local value=$2
+  case "$value" in
+    [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]|[1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+    *) fail "$label must be a positive canonical decimal integer." ;;
+  esac
+  [ "$((10#$value))" -le 2147483647 ] \
+    || fail "$label is outside the supported identity range."
+}
+validate_numeric_identity UID "$runtime_uid"
+validate_numeric_identity GID "$runtime_gid"
+
+runtime_passwd_record=$(/usr/bin/getent passwd "$runtime_uid" || true)
+[ -n "$runtime_passwd_record" ] \
+  || fail "UID $runtime_uid has no guest passwd record."
+[ "$(printf '%s\n' "$runtime_passwd_record" | /usr/bin/wc -l)" -eq 1 ] \
+  || fail "UID $runtime_uid has duplicate guest passwd records."
+runtime_user=$(printf '%s\n' "$runtime_passwd_record" | /usr/bin/cut -d: -f1)
+runtime_passwd_gid=$(printf '%s\n' "$runtime_passwd_record" | /usr/bin/cut -d: -f4)
+runtime_home=$(printf '%s\n' "$runtime_passwd_record" | /usr/bin/cut -d: -f6)
+[ "$runtime_passwd_gid" = "$runtime_gid" ] \
+  || fail 'requested GID differs from the guest passwd record.'
+case "$runtime_user:$runtime_home" in
+  :*|*:|*$'\n'*|*$'\r'*|*$'\t'*) fail 'guest passwd identity is unsafe.' ;;
+esac
+case "$runtime_home" in /*) ;; *) fail 'guest passwd HOME is not absolute.' ;; esac
+[ -d "$runtime_home" ] && [ ! -L "$runtime_home" ] \
+  || fail 'isolated Agent HOME is unavailable.'
+
+case "$profile_command" in
+  ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._+-]*)
+    fail 'PROFILE_COMMAND must be one safe executable basename.'
+    ;;
+esac
+[ "${#profile_command}" -le 64 ] \
+  || fail 'PROFILE_COMMAND is too long.'
+agent_executable=$(type -P -- "$profile_command" || true)
+case "$agent_executable" in /*) ;; *) fail 'PROFILE_COMMAND is not installed.' ;; esac
+agent_executable=$(/usr/bin/readlink -f -- "$agent_executable") \
+  || fail 'PROFILE_COMMAND cannot be resolved.'
+[ -f "$agent_executable" ] && [ -x "$agent_executable" ] \
+  || fail 'PROFILE_COMMAND does not resolve to an executable file.'
+[ "$(/usr/bin/stat -c '%u' -- "$agent_executable")" -eq 0 ] \
+  || fail 'PROFILE_COMMAND is not owned by root.'
+agent_mode=$(/usr/bin/stat -c '%a' -- "$agent_executable")
+case "$agent_mode" in ''|*[!0-7]*) fail 'PROFILE_COMMAND has an invalid mode.' ;; esac
+[ "$(((8#$agent_mode) & 8#22))" -eq 0 ] \
+  || fail 'PROFILE_COMMAND is writable by group or other.'
+case "$agent_executable" in
+  "$workspace_root"|"$workspace_root"/*)
+    fail 'PROFILE_COMMAND may not be supplied by the writable workspace.'
+    ;;
+esac
+
+workspace_endpoint="${AGENT_WORKSPACE_ENDPOINT:-}"
+workspace_token="${AGENT_WORKSPACE_TOKEN:-}"
+unset AGENT_WORKSPACE_ENDPOINT AGENT_WORKSPACE_TOKEN
+[ -n "$workspace_endpoint" ] \
+  || fail 'AGENT_WORKSPACE_ENDPOINT is missing.'
+[[ "$workspace_token" =~ ^[0-9a-f]{64}$ ]] \
+  || fail 'AGENT_WORKSPACE_TOKEN must contain exactly 64 lowercase hexadecimal characters.'
+
+for required_path in \
+  /dev/fuse \
+  /etc/fuse.conf \
+  /usr/bin/findmnt \
+  /usr/bin/fusermount3 \
+  /usr/bin/mountpoint \
+  /usr/bin/ps \
+  /usr/bin/setpriv \
+  /usr/bin/setsid \
+  /usr/bin/sshfs \
+  /usr/local/bin/agent-workspace-connect; do
+  [ -e "$required_path" ] || fail "required workspace component is absent: $required_path"
+done
+[ -c /dev/fuse ] && [ -r /dev/fuse ] && [ -w /dev/fuse ] \
+  || fail '/dev/fuse is not an accessible character device.'
+[ -f /etc/fuse.conf ] && [ ! -L /etc/fuse.conf ] \
+  && /bin/grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf \
+  || fail '/etc/fuse.conf does not enable user_allow_other.'
+[ -x /usr/bin/sshfs ] && [ -x /usr/bin/fusermount3 ] \
+  && [ -x /usr/local/bin/agent-workspace-connect ] \
+  || fail 'workspace transport executables are unavailable.'
+for cgroup_component in \
+  /sys/fs/cgroup/cgroup.controllers \
+  /sys/fs/cgroup/cgroup.events \
+  /sys/fs/cgroup/cgroup.freeze \
+  /sys/fs/cgroup/cgroup.procs; do
+  [ -e "$cgroup_component" ] && [ ! -L "$cgroup_component" ] \
+    || fail "required cgroup v2 component is absent: $cgroup_component"
+done
+[ -r /sys/fs/cgroup/cgroup.controllers ] \
+  && [ -r /sys/fs/cgroup/cgroup.events ] \
+  && [ -w /sys/fs/cgroup/cgroup.freeze ] \
+  && [ -w /sys/fs/cgroup/cgroup.procs ] \
+  || fail 'the cgroup v2 process-containment boundary is unavailable.'
+
+mountpoint_created=false
+if [ ! -e "$workspace_root" ]; then
+  mountpoint_created=true
+fi
+# The host launcher intentionally uses a private umask.  Do not inherit it for
+# guest-only path placeholders: the unprivileged Agent must be able to traverse
+# every missing ancestor to reach the SSHFS mount, while directory listings of
+# those placeholders remain unavailable.
+(umask 0066; /usr/bin/mkdir -p -- "$workspace_root")
+[ -d "$workspace_root" ] && [ ! -L "$workspace_root" ] \
+  || fail 'ROOT is not a safe directory mountpoint.'
+[ "$(/usr/bin/realpath -e -- "$workspace_root")" = "$workspace_root" ] \
+  || fail 'ROOT traverses a guest symlink.'
+if /usr/bin/mountpoint -q -- "$workspace_root"; then
+  fail 'ROOT is already a mountpoint in this session namespace.'
+fi
+if [ -n "$(/usr/bin/find "$workspace_root" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+  fail 'ROOT mountpoint is not empty.'
+fi
+
+sshfs_pid=
+agent_pid=
+agent_pgid=
+agent_waited=false
+agent_identity_ready=false
+agent_identity_file=
+agent_cgroup=
+agent_start_fifo=
+agent_start_reader_open=false
+agent_start_writer_open=false
+background_launching=false
+pending_signal_status=
+workspace_mounted=false
+session_runtime_dir=
+session_control_dir=
+
+load_agent_identity() {
+  local identity_pid identity_sid identity_pgid identity_extra
+
+  [ "$agent_identity_ready" = false ] || return 0
+  [ -n "$agent_pid" ] && [ -n "$agent_pgid" ] || return 1
+  [ -n "$agent_identity_file" ] && [ -s "$agent_identity_file" ] \
+    || return 1
+  [ "$(/usr/bin/wc -l < "$agent_identity_file")" -eq 1 ] 2>/dev/null \
+    || return 1
+  IFS=$'\t' read -r \
+    identity_pid identity_sid identity_pgid identity_extra \
+    < "$agent_identity_file" \
+    || return 1
+  case "$identity_pid:$identity_sid:$identity_pgid" in
+    *[!0-9:]*|:*|*::*|*:)
+      return 1
+      ;;
+  esac
+  [ -z "$identity_extra" ] \
+    && [ "$identity_pid" = "$identity_sid" ] \
+    && [ "$identity_pid" = "$identity_pgid" ] \
+    && [ "$identity_pid" = "$agent_pid" ] \
+    && [ "$identity_pgid" = "$agent_pgid" ] \
+    || return 1
+
+  agent_identity_ready=true
+  return 0
+}
+
+cgroup_has_agent_processes() {
+  [ -n "$agent_cgroup" ] \
+    && [ -r "$agent_cgroup/cgroup.events" ] \
+    && /bin/grep -Fqx 'populated 1' "$agent_cgroup/cgroup.events" 2>/dev/null
+}
+
+child_job_is_active() {
+  local wanted_pid=$1
+  local active_pid job_state
+
+  [ -n "$wanted_pid" ] || return 1
+  for job_state in -pr -ps; do
+    while IFS= read -r active_pid; do
+      [ "$active_pid" = "$wanted_pid" ] && return 0
+    done < <(jobs "$job_state" 2>/dev/null)
+  done
+  return 1
+}
+
+term_agent_cgroup_processes() {
+  local contained_pid freeze_attempt malformed_pid
+
+  cgroup_has_agent_processes || return 0
+  printf '1\n' > "$agent_cgroup/cgroup.freeze" 2>/dev/null \
+    || return 1
+
+  # Freezing the leaf prevents a member from exiting and having its numeric PID
+  # reused between membership enumeration and kill(2). No new descendant can
+  # appear while every current task is frozen, either. Queue TERM to the exact
+  # cgroup membership, then unfreeze so ordinary signal handlers get one second
+  # to finish. If freeze cannot converge, skip unsafe PID/PGID signalling and
+  # rely on the atomic cgroup.kill boundary below.
+  freeze_attempt=0
+  while ! /bin/grep -Fqx 'frozen 1' \
+      "$agent_cgroup/cgroup.events" 2>/dev/null \
+    && [ "$freeze_attempt" -lt 100 ]; do
+    /bin/sleep 0.01
+    freeze_attempt=$((freeze_attempt + 1))
+  done
+  if ! /bin/grep -Fqx 'frozen 1' \
+      "$agent_cgroup/cgroup.events" 2>/dev/null; then
+    printf '0\n' > "$agent_cgroup/cgroup.freeze" 2>/dev/null || true
+    return 1
+  fi
+
+  malformed_pid=false
+  while IFS= read -r contained_pid; do
+    case "$contained_pid" in
+      ''|0|*[!0-9]*)
+        malformed_pid=true
+        continue
+        ;;
+    esac
+    kill -TERM "$contained_pid" 2>/dev/null || true
+  done < "$agent_cgroup/cgroup.procs"
+  printf '0\n' > "$agent_cgroup/cgroup.freeze" 2>/dev/null || true
+  [ "$malformed_pid" = false ]
+}
+
+stop_agent_processes() {
+  local retry
+
+  term_agent_cgroup_processes || true
+
+  retry=0
+  while cgroup_has_agent_processes && [ "$retry" -lt 20 ]; do
+    /bin/sleep 0.05
+    retry=$((retry + 1))
+  done
+
+  if cgroup_has_agent_processes; then
+    printf '1\n' > "$agent_cgroup/cgroup.kill" 2>/dev/null || true
+  fi
+
+  if [ -n "$agent_pid" ] && [ "$agent_waited" = false ]; then
+    wait "$agent_pid" 2>/dev/null || true
+    agent_waited=true
+  fi
+
+  # SIGKILL cannot be handled. Keep the FUSE transport and mount alive until
+  # the kernel confirms that this cgroup contains no Agent process. This is
+  # intentionally fail-closed for an uninterruptible guest process.
+  while cgroup_has_agent_processes; do
+    printf '1\n' > "$agent_cgroup/cgroup.kill" 2>/dev/null || true
+    /bin/sleep 0.05
+  done
+
+  agent_pid=
+  agent_pgid=
+  agent_identity_ready=false
+}
+
+cleanup() {
+  local retry
+  set +e
+  trap '' INT TERM HUP
+  trap - EXIT
+
+  if [ "$agent_start_reader_open" = true ]; then
+    exec 8<&-
+    agent_start_reader_open=false
+  fi
+  if [ "$agent_start_writer_open" = true ]; then
+    exec 7>&-
+    agent_start_writer_open=false
+  fi
+
+  stop_agent_processes
+
+  if [ -n "$agent_cgroup" ]; then
+    case "$agent_cgroup" in
+      /sys/fs/cgroup/agent-container-"$runtime_uid"-*)
+        /usr/bin/rmdir -- "$agent_cgroup" 2>/dev/null || true
+        ;;
+    esac
+  fi
+  agent_cgroup=
+
+  # The helper entered the FUSE tree before starting the Agent. Leave it before
+  # asking SSHFS to exit so libfuse can perform the normal, single unmount.
+  # A shell-side unmount first would race libfuse's own teardown and leak a
+  # misleading "failed to unmount: Invalid argument" warning to every client.
+  cd / 2>/dev/null || true
+
+  if [ -n "$sshfs_pid" ] && child_job_is_active "$sshfs_pid"; then
+    kill -TERM "$sshfs_pid" 2>/dev/null || true
+    retry=0
+    while child_job_is_active "$sshfs_pid" && [ "$retry" -lt 20 ]; do
+      /bin/sleep 0.05
+      retry=$((retry + 1))
+    done
+    if child_job_is_active "$sshfs_pid"; then
+      kill -KILL "$sshfs_pid" 2>/dev/null || true
+    fi
+  fi
+  [ -z "$sshfs_pid" ] || wait "$sshfs_pid" 2>/dev/null || true
+  sshfs_pid=
+
+  # TERM is the normal owner of the FUSE teardown. Retain an explicit fallback
+  # for a crashed or forcibly killed SSHFS process that leaves a mount behind.
+  if /usr/bin/mountpoint -q -- "$workspace_root" 2>/dev/null; then
+    /usr/bin/fusermount3 -u -- "$workspace_root" 2>/dev/null \
+      || /usr/bin/umount -- "$workspace_root" 2>/dev/null \
+      || /usr/bin/umount -l -- "$workspace_root" 2>/dev/null \
+      || true
+  fi
+  workspace_mounted=false
+
+  if [ -n "$session_runtime_dir" ]; then
+    case "$session_runtime_dir" in
+      /run/agent-container/session-"$runtime_uid"-*)
+        /bin/rm -rf -- "$session_runtime_dir" 2>/dev/null || true
+        ;;
+    esac
+  fi
+  session_runtime_dir=
+
+  if [ -n "$session_control_dir" ]; then
+    case "$session_control_dir" in
+      /run/agent-container/control-"$runtime_uid"-*)
+        /bin/rm -rf -- "$session_control_dir" 2>/dev/null || true
+        ;;
+    esac
+  fi
+  session_control_dir=
+  agent_identity_file=
+  agent_start_fifo=
+
+  if /usr/bin/mountpoint -q -- "$workspace_root" 2>/dev/null; then
+    /usr/bin/umount -l -- "$workspace_root" 2>/dev/null || true
+  fi
+  if [ "$mountpoint_created" = true ]; then
+    /usr/bin/rmdir -- "$workspace_root" 2>/dev/null || true
+  fi
+  return 0
+}
+
+handle_signal() {
+  local signal_status=$1
+  if [ "$background_launching" = true ]; then
+    [ -n "$pending_signal_status" ] \
+      || pending_signal_status=$signal_status
+    return 0
+  fi
+  if [ -n "$pending_signal_status" ]; then
+    signal_status=$pending_signal_status
+    pending_signal_status=
+  fi
+  trap '' INT TERM HUP
+  set +e
+  exit "$signal_status"
+}
+
+complete_background_launch() {
+  background_launching=false
+  if [ -n "$pending_signal_status" ]; then
+    handle_signal "$pending_signal_status"
+  fi
+}
+
+trap cleanup EXIT
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+trap 'handle_signal 129' HUP
+
+runtime_dir_parent=/run/agent-container
+if [ -L "$runtime_dir_parent" ] \
+  || { [ -e "$runtime_dir_parent" ] && [ ! -d "$runtime_dir_parent" ]; }; then
+  fail 'the session runtime-directory parent is unsafe.'
+fi
+/usr/bin/install -d -o 0 -g 0 -m 0711 -- "$runtime_dir_parent"
+[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$runtime_dir_parent")" = 0:0:711 ] \
+  || fail 'the session runtime-directory parent has unsafe ownership or mode.'
+session_runtime_dir=$(/usr/bin/mktemp -d \
+  "$runtime_dir_parent/session-$runtime_uid-XXXXXXXX") \
+  || fail 'cannot create the private session runtime directory.'
+case "$session_runtime_dir" in
+  /run/agent-container/session-"$runtime_uid"-*) ;;
+  *) fail 'the private session runtime directory has an unsafe path.' ;;
+esac
+/usr/bin/chown "$runtime_uid:$runtime_gid" -- "$session_runtime_dir"
+/usr/bin/chmod 0700 -- "$session_runtime_dir"
+[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$session_runtime_dir")" \
+    = "$runtime_uid:$runtime_gid:700" ] \
+  || fail 'the private session runtime directory has unsafe ownership or mode.'
+session_control_dir=$(/usr/bin/mktemp -d \
+  "$runtime_dir_parent/control-$runtime_uid-XXXXXXXX") \
+  || fail 'cannot create the private session control directory.'
+case "$session_control_dir" in
+  /run/agent-container/control-"$runtime_uid"-*) ;;
+  *) fail 'the private session control directory has an unsafe path.' ;;
+esac
+/usr/bin/chown 0:0 -- "$session_control_dir"
+/usr/bin/chmod 0700 -- "$session_control_dir"
+[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$session_control_dir")" = 0:0:700 ] \
+  || fail 'the private session control directory has unsafe ownership or mode.'
+agent_identity_file="$session_control_dir/agent.identity"
+agent_cgroup=$(/usr/bin/mktemp -d \
+  "/sys/fs/cgroup/agent-container-$runtime_uid-XXXXXXXX") \
+  || fail 'cannot create the private Agent cgroup.'
+case "$agent_cgroup" in
+  /sys/fs/cgroup/agent-container-"$runtime_uid"-*) ;;
+  *) fail 'the private Agent cgroup has an unsafe path.' ;;
+esac
+[ "$(/usr/bin/stat -c '%u:%g:%a' -- "$agent_cgroup")" = 0:0:700 ] \
+  && [ -w "$agent_cgroup/cgroup.procs" ] \
+  && [ -w "$agent_cgroup/cgroup.kill" ] \
+  && [ -w "$agent_cgroup/cgroup.freeze" ] \
+  && [ -r "$agent_cgroup/cgroup.events" ] \
+  || fail 'the private Agent cgroup has unsafe ownership or access.'
+/bin/grep -Fqx 'populated 0' "$agent_cgroup/cgroup.events" \
+  || fail 'the private Agent cgroup was unexpectedly populated.'
+
+background_launching=true
+env \
+  AGENT_WORKSPACE_ENDPOINT="$workspace_endpoint" \
+  AGENT_WORKSPACE_TOKEN="$workspace_token" \
+  /usr/bin/sshfs \
+    agent-container:. \
+    "$workspace_root" \
+    -f \
+    -o allow_other \
+    -o attr_timeout=1 \
+    -o cache=yes \
+    -o cache_timeout=1 \
+    -o entry_timeout=1 \
+    -o idmap=none \
+    -o negative_timeout=1 \
+    -o ssh_command=/usr/local/bin/agent-workspace-connect \
+    < /dev/null &
+sshfs_pid=$!
+complete_background_launch
+workspace_token=
+workspace_endpoint=
+unset workspace_token workspace_endpoint
+
+mount_ready=false
+for mount_attempt in $(/usr/bin/seq 1 200); do
+  if ! child_job_is_active "$sshfs_pid"; then
+    set +e
+    wait "$sshfs_pid"
+    sshfs_status=$?
+    set -e
+    sshfs_pid=
+    fail "sshfs exited before mount readiness (status $sshfs_status)."
+  fi
+  if /usr/bin/mountpoint -q -- "$workspace_root"; then
+    workspace_fstype=$(/usr/bin/findmnt -rn -M "$workspace_root" -o FSTYPE || true)
+    case "$workspace_fstype" in
+      fuse|fuse.sshfs) mount_ready=true; break ;;
+      '') ;;
+      *) fail "ROOT was mounted with unexpected filesystem type '$workspace_fstype'." ;;
+    esac
+  fi
+  /bin/sleep 0.05
+done
+[ "$mount_ready" = true ] \
+  || fail 'sshfs did not mount ROOT within 10 seconds.'
+workspace_mounted=true
+
+[ -d "$workspace_cwd" ] && [ ! -L "$workspace_cwd" ] \
+  || fail 'CWD is not a directory after mounting ROOT.'
+resolved_cwd=$(/usr/bin/realpath -e -- "$workspace_cwd") \
+  || fail 'CWD cannot be resolved through the workspace filesystem.'
+case "$resolved_cwd" in
+  "$workspace_root"|"$workspace_root"/*) ;;
+  *) fail 'resolved CWD escapes ROOT.' ;;
+esac
+[ "$resolved_cwd" = "$workspace_cwd" ] \
+  || fail 'CWD must not traverse a workspace symlink.'
+child_job_is_active "$sshfs_pid" \
+  || fail 'sshfs stopped after mount readiness.'
+
+cd -- "$workspace_cwd"
+agent_start_fifo="$session_control_dir/agent.start"
+/usr/bin/mkfifo -m 0600 -- "$agent_start_fifo" \
+  || fail 'cannot create the Agent bootstrap gate.'
+[ -p "$agent_start_fifo" ] && [ ! -L "$agent_start_fifo" ] \
+  && [ "$(/usr/bin/stat -c '%u:%g:%a' -- "$agent_start_fifo")" = 0:0:600 ] \
+  || fail 'the Agent bootstrap gate is unsafe.'
+# Holding both FIFO ends avoids an open-order deadlock. Open them only after
+# SSHFS is running so no long-lived transport inherits these control fds. The
+# child reads its inherited fd instead of reopening the pathname, so the parent
+# may safely unlink the FIFO before a newly forked child gets scheduled.
+exec 7<> "$agent_start_fifo"
+agent_start_writer_open=true
+exec 8< "$agent_start_fifo"
+agent_start_reader_open=true
+set +e
+setsid_arguments=(/usr/bin/setsid)
+if [ -t 0 ] && [ -t 1 ]; then
+  setsid_arguments+=(--ctty)
+fi
+set +m
+background_launching=true
+(
+  trap '' INT TERM HUP
+  exec 7>&-
+  IFS= read -r bootstrap_gate <&8 || exit 70
+  exec 8<&-
+  [ "$bootstrap_gate" = start ] || exit 70
+  exec /usr/bin/env \
+    --default-signal=HUP \
+    --default-signal=INT \
+    --default-signal=QUIT \
+    --default-signal=TERM \
+    "${setsid_arguments[@]}" \
+    /bin/bash -c '
+    set -euo pipefail
+    agent_cgroup=$1
+    identity_file=$2
+    shift 2
+    session_pid=$$
+    printf "%s\n" "$session_pid" > "$agent_cgroup/cgroup.procs"
+    expected_cgroup=${agent_cgroup#/sys/fs/cgroup}
+    [ "$(/bin/cat /proc/self/cgroup)" = "0::$expected_cgroup" ] \
+      || exit 70
+    session_record=$(/usr/bin/ps -o sid=,pgid= -p "$session_pid")
+    read -r session_sid session_pgid session_extra <<< "$session_record"
+    case "$session_pid:$session_sid:$session_pgid" in
+      *[!0-9:]*|:*|*::*|*:) exit 70 ;;
+    esac
+    [ -z "${session_extra:-}" ] \
+      && [ "$session_pid" = "$session_sid" ] \
+      && [ "$session_pid" = "$session_pgid" ] \
+      || exit 70
+    identity_tmp="$identity_file.tmp"
+    umask 077
+    printf "%s\t%s\t%s\n" \
+      "$session_pid" "$session_sid" "$session_pgid" > "$identity_tmp"
+    /bin/mv -f -- "$identity_tmp" "$identity_file"
+    exec "$@"
+  ' agent-session-bootstrap \
+  "$agent_cgroup" \
+  "$agent_identity_file" \
+  /usr/bin/setpriv \
+    --reuid="$runtime_uid" \
+    --regid="$runtime_gid" \
+    --clear-groups \
+    --no-new-privs \
+    /usr/bin/env \
+      HOME="$runtime_home" \
+      USER="$runtime_user" \
+      LOGNAME="$runtime_user" \
+      XDG_RUNTIME_DIR="$session_runtime_dir" \
+      "$agent_executable" \
+      "${agent_arguments[@]}" \
+    <&0
+) <&0 &
+agent_pid=$!
+agent_pgid=$agent_pid
+exec 8<&-
+agent_start_reader_open=false
+if ! printf '%s\n' "$agent_pid" > "$agent_cgroup/cgroup.procs" \
+  || ! cgroup_has_agent_processes; then
+  kill -KILL "$agent_pid" 2>/dev/null || true
+  wait "$agent_pid" 2>/dev/null || true
+  agent_waited=true
+  complete_background_launch
+  set -e
+  fail 'cannot place the Agent bootstrap into its private cgroup.'
+fi
+if ! printf 'start\n' >&7; then
+  complete_background_launch
+  set -e
+  fail 'cannot release the contained Agent bootstrap.'
+fi
+exec 7>&-
+agent_start_writer_open=false
+/bin/rm -f -- "$agent_start_fifo"
+agent_start_fifo=
+complete_background_launch
+identity_ready=false
+for identity_attempt in $(/usr/bin/seq 1 200); do
+  if load_agent_identity; then
+    identity_ready=true
+    break
+  fi
+  kill -0 "$agent_pid" 2>/dev/null || break
+  /bin/sleep 0.01
+done
+if [ "$identity_ready" != true ]; then
+  if cgroup_has_agent_processes; then
+    set -e
+    fail 'Agent session bootstrap did not publish its process group within two seconds.'
+  fi
+  wait "$agent_pid"
+  bootstrap_status=$?
+  agent_waited=true
+  case "$bootstrap_status" in
+    129|130|131|143)
+      exit "$bootstrap_status"
+      ;;
+  esac
+  set -e
+  fail "Agent session bootstrap failed before publishing its process group (status $bootstrap_status)."
+fi
+/bin/rm -f -- "$agent_identity_file"
+while :; do
+  # Bash drops completed asynchronous jobs from `jobs -p` but retains their
+  # status for an explicit wait. Polling avoids wait -n's failure mode where a
+  # fast Agent is already "no such job" and Bash waits forever on live SSHFS.
+  # Agent is checked first so simultaneous completion preserves its real exit.
+  if ! child_job_is_active "$agent_pid"; then
+    wait "$agent_pid"
+    agent_status=$?
+    agent_waited=true
+    break
+  fi
+  if ! child_job_is_active "$sshfs_pid"; then
+    wait "$sshfs_pid" 2>/dev/null || true
+    sshfs_pid=
+    printf '%s\n' \
+      'agent-workspace-session: workspace transport stopped while the Agent was still running.' \
+      >&2
+    exit 74
+  fi
+  /bin/sleep 0.05
+done
+set -e
+
+exit "$agent_status"

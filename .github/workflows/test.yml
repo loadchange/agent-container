@@ -13,10 +13,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.75.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Validate Rust sources
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --offline
+          cargo clippy --locked --offline --all-targets -- -D warnings
+
+      - name: Reproduce the signed arm64 launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [ "$(uname -m)" = arm64 ] || {
+            echo "macos-contract requires an arm64 runner" >&2
+            exit 1
+          }
+
+          build_one="$RUNNER_TEMP/agent-container-release-one"
+          build_two="$RUNNER_TEMP/agent-container-release-two"
+          test ! -e "$build_one"
+          test ! -e "$build_two"
+
+          for target_dir in "$build_one" "$build_two"; do
+            CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$target_dir" \
+              cargo build \
+                --locked \
+                --offline \
+                --release \
+                --bin agent-container-launcher
+
+            artifact="$target_dir/release/agent-container-launcher"
+            /usr/bin/strip "$artifact"
+            /usr/bin/codesign --force --sign - "$artifact"
+
+            [ "$(/usr/bin/file -b "$artifact")" = \
+              "Mach-O 64-bit executable arm64" ]
+            /usr/bin/codesign --verify --strict "$artifact"
+            /usr/bin/codesign -dvv "$artifact" 2>&1 \
+              | grep -F 'Signature=adhoc' >/dev/null
+          done
+
+          cmp \
+            "$build_one/release/agent-container-launcher" \
+            "$build_two/release/agent-container-launcher"
+          cmp \
+            "$build_one/release/agent-container-launcher" \
+            agent-container-darwin-arm64
+
       - name: Validate Bash syntax
         run: |
           /bin/bash -n \
             agent-container \
+            agent-container-runtime \
+            agent-workspace-connect \
+            agent-workspace-session \
             claude-container \
             codex-container \
             grok-container \
@@ -27,7 +82,16 @@ jobs:
             tests/test-agent-container.sh \
             tests/test-host-exec.sh \
             tests/test-install-uninstall.sh \
-            tests/fixtures/* \
+            tests/test-workspace-bridge.sh \
+            tests/test-workspace-session-live.sh \
+            tests/fixtures/container \
+            tests/fixtures/curl \
+            tests/fixtures/host-exec-broker \
+            tests/fixtures/openssl \
+            tests/fixtures/security \
+            tests/fixtures/sw_vers \
+            tests/fixtures/sysctl \
+            tests/fixtures/uname \
             tests/install-fixtures/*
 
       - name: Validate host broker syntax
@@ -37,6 +101,10 @@ jobs:
         run: |
           ./agent-container profiles
           test -x agent-container
+          test -x agent-container-runtime
+          test -x agent-container-darwin-arm64
+          test -x agent-workspace-connect
+          test -x agent-workspace-session
           test -x claude-container
           test -x codex-container
           test -x grok-container
@@ -47,23 +115,16 @@ jobs:
           test -x tests/test-agent-container.sh
           test -x tests/test-host-exec.sh
           test -x tests/test-install-uninstall.sh
+          test -x tests/test-workspace-bridge.sh
+          test -x tests/test-workspace-session-live.sh
+          test -f tests/fixtures/workspace-bridge-peer.rs
+          test -x tests/fixtures/workspace-session-test-agent
 
       - name: Verify release manifest
-        run: |
-          shasum -a 256 \
-            agent-container \
-            claude-container \
-            codex-container \
-            grok-container \
-            Containerfile \
-            Containerfile.dockerignore \
-            entrypoint.sh \
-            host-exec-client \
-            host-exec-broker.mjs \
-            profiles/claude.json \
-            profiles/codex.json \
-            profiles/grok.json \
-            | cmp - release-manifest.sha256
+        run: shasum -a 256 -c release-manifest.sha256
+
+      - name: Run workspace bridge security tests
+        run: tests/test-workspace-bridge.sh
 
       - name: Run generic runtime contract tests
         run: tests/test-agent-container.sh

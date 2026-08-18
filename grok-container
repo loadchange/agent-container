@@ -2,8 +2,4 @@
 set -euo pipefail
 
 launcher="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/agent-container"
-if [ "${1:-}" = run ]; then
-  shift
-  exec "$launcher" run grok "$@"
-fi
-exec "$launcher" grok "$@"
+exec "$launcher" __agent_container_source_alias grok "$@"

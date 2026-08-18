@@ -3,6 +3,10 @@ set -euo pipefail
 
 output_file=""
 request_url=""
+ca_native=false
+proxy_ca_native=false
+ca_file=""
+proxy_ca_file=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output|-o)
@@ -11,6 +15,22 @@ while [ "$#" -gt 0 ]; do
       ;;
     --connect-timeout|--max-time|--max-filesize|--proto)
       shift 2
+      ;;
+    --cacert)
+      ca_file="${2:-}"
+      shift 2
+      ;;
+    --proxy-cacert)
+      proxy_ca_file="${2:-}"
+      shift 2
+      ;;
+    --ca-native)
+      ca_native=true
+      shift
+      ;;
+    --proxy-ca-native)
+      proxy_ca_native=true
+      shift
       ;;
     --tlsv1.2|--fail|--silent|--show-error|--location)
       shift
@@ -28,6 +48,18 @@ done
 
 if [ -n "${FAKE_CURL_LOG:-}" ]; then
   printf 'URL=%s\n' "$request_url" >> "$FAKE_CURL_LOG"
+  printf 'CA_NATIVE=%s\n' "$ca_native" >> "$FAKE_CURL_LOG"
+  printf 'PROXY_CA_NATIVE=%s\n' "$proxy_ca_native" >> "$FAKE_CURL_LOG"
+  if [ -n "$ca_file" ]; then
+    [ -f "$ca_file" ] || exit 65
+    printf 'CACERT_BODY=%s\n' "$(sed -n '2p' "$ca_file")" \
+      >> "$FAKE_CURL_LOG"
+  fi
+  if [ -n "$proxy_ca_file" ]; then
+    [ -f "$proxy_ca_file" ] || exit 66
+    printf 'PROXY_CACERT_BODY=%s\n' "$(sed -n '2p' "$proxy_ca_file")" \
+      >> "$FAKE_CURL_LOG"
+  fi
 fi
 
 case "$request_url" in
