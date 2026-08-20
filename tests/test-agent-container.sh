@@ -2714,7 +2714,7 @@ for singleton_profile_version in \
   'grok 0.2.114'; do
   singleton_profile=${singleton_profile_version%% *}
   AGENT_CONTAINER_VERSION=${singleton_profile_version#* }
-  run_program "$repo_root/$singleton_profile-container" "from-$singleton_profile" \
+  run_program "$repo_root/bin/$singleton_profile-container" "from-$singleton_profile" \
     >"$case_dir/$singleton_profile.out" \
     2>"$case_dir/$singleton_profile.err"
   assert_line "$case_log" \
