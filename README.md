@@ -123,10 +123,12 @@ changes.
 
 ### Homebrew (recommended)
 
-This repository is its own Homebrew tap:
+This repository is its own Homebrew tap. Because it is not named with the
+`homebrew-` prefix Homebrew's short tap syntax expects, tap it once with the
+explicit repository URL:
 
 ```bash
-brew tap loadchange/agent-container
+brew tap loadchange/agent-container https://github.com/loadchange/agent-container
 brew install agent-container
 ```
 

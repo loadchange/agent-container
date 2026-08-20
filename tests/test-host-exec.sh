@@ -114,6 +114,14 @@ else
   node_tool_root="$node_bin_dir"
 fi
 node_tool_root=$(CDPATH= cd -- "$node_tool_root" && pwd -P)
+# A Homebrew node keg links dylibs from the prefix-wide opt/ tree, outside
+# its own Cellar directory. The production launcher normalizes Homebrew tool
+# roots to the prefix for exactly this reason; mirror that here so the
+# sandboxed node can load its runtime libraries.
+case "$node_tool_root/" in
+  /opt/homebrew/*) node_tool_root=/opt/homebrew ;;
+  /usr/local/*) node_tool_root=/usr/local ;;
+esac
 developer_tool_path=$(xcode-select -p 2>/dev/null) \
   || fail 'xcode-select did not return an active developer directory'
 developer_tool_path=$(CDPATH= cd -- "$developer_tool_path" && pwd -P) \

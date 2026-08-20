@@ -38,8 +38,9 @@ jobs:
 
           # Two isolated builds, each stripped and ad-hoc signed, must agree
           # byte for byte. The native launcher is published through GitHub
-          # Releases; it is not tracked in git.
-          scripts/build-release.sh
+          # Releases; it is not tracked in git. The tarball is packed here so
+          # pull requests can publish it as a downloadable beta artifact.
+          scripts/build-release.sh --tarball
 
       - name: Validate Bash syntax
         run: |
@@ -133,3 +134,16 @@ jobs:
           git diff --check \
             4b825dc642cb6eb9a060e54bf8d69288fbee4904 \
             HEAD
+
+      # Runs last so only a fully validated build is published. The tarball
+      # preserves executable modes (the artifact zip itself does not), and
+      # main pushes are excluded because they publish real releases instead.
+      - name: Publish the pull-request beta artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-container-darwin-arm64-beta
+          path: |
+            dist/agent-container-darwin-arm64.tar.gz
+            dist/release-manifest.sha256
+          if-no-files-found: error
