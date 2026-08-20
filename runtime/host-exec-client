@@ -300,6 +300,13 @@ if [ "$stdin_enabled" = true ]; then
   exec 8<&-
 fi
 
+# The broker is the launcher's own trusted peer behind token authentication,
+# and it emits frames with a fixed key order. The streaming hot path therefore
+# parses the exact expected shapes with shell string operations: base64 data
+# cannot contain a quote or backslash, so prefix/suffix stripping is unambiguous
+# and each output frame costs one base64 process instead of three with jq.
+# Anything that deviates from the expected shapes falls back to strict jq
+# handling below and fails closed.
 exit_status=$protocol_failure_status
 while [ "$received_exit" = false ]; do
   response_line=''
@@ -312,40 +319,58 @@ while [ "$received_exit" = false ]; do
   fi
   [ "${#response_line}" -le "$max_response_line_chars" ] \
     || die 'broker response frame is too large'
-  frame_type=$(printf '%s\n' "$response_line" | jq -er '.type | select(type == "string")' 2>/dev/null) \
-    || die 'broker returned an invalid JSON frame'
 
-  case "$frame_type" in
-    start)
+  case "$response_line" in
+    '{"type":"stdout","data":"'*'"}')
+      frame_data=${response_line#'{"type":"stdout","data":"'}
+      frame_data=${frame_data%'"}'}
+      case "$frame_data" in
+        ''|*[!A-Za-z0-9+/=]*) die 'broker returned malformed stdout base64' ;;
+      esac
+      printf '%s' "$frame_data" | base64 -d \
+        || die 'broker returned malformed stdout base64'
+      ;;
+    '{"type":"stderr","data":"'*'"}')
+      frame_data=${response_line#'{"type":"stderr","data":"'}
+      frame_data=${frame_data%'"}'}
+      case "$frame_data" in
+        ''|*[!A-Za-z0-9+/=]*) die 'broker returned malformed stderr base64' ;;
+      esac
+      printf '%s' "$frame_data" | base64 -d >&2 \
+        || die 'broker returned malformed stderr base64'
+      ;;
+    '{"type":"start",'*)
       # Readiness is intentionally silent; command output remains byte-clean.
       ;;
-    stdout|stderr)
-      frame_data=$(printf '%s\n' "$response_line" \
-        | jq -er '.data | select(type == "string")' 2>/dev/null) \
-        || die "broker returned invalid $frame_type data"
-      if [ "$frame_type" = stdout ]; then
-        printf '%s' "$frame_data" | base64 -d \
-          || die 'broker returned malformed stdout base64'
-      else
-        printf '%s' "$frame_data" | base64 -d >&2 \
-          || die 'broker returned malformed stderr base64'
-      fi
-      ;;
-    error)
-      error_code=$(printf '%s\n' "$response_line" | jq -r '.code // "BROKER_ERROR"' 2>/dev/null)
-      error_message=$(printf '%s\n' "$response_line" | jq -r '.message // "host execution failed"' 2>/dev/null)
-      printf 'host-exec-client: %s: %s\n' "$error_code" "$error_message" >&2
-      exit_status=$protocol_failure_status
-      received_exit=true
-      ;;
-    exit)
-      exit_status=$(printf '%s\n' "$response_line" \
-        | jq -er '.status | select(type == "number" and . >= 0 and . <= 255 and floor == .)' 2>/dev/null) \
+    '{"type":"exit",'*'"status":'*'}')
+      exit_status=${response_line##*'"status":'}
+      exit_status=${exit_status%\}}
+      case "$exit_status" in
+        ''|*[!0-9]*) die 'broker returned an invalid exit status' ;;
+      esac
+      [ "${#exit_status}" -le 3 ] && [ "$exit_status" -le 255 ] \
         || die 'broker returned an invalid exit status'
       received_exit=true
       ;;
     *)
-      die "broker returned an unsupported frame type: $frame_type"
+      frame_type=$(printf '%s\n' "$response_line" \
+        | jq -er '.type | select(type == "string")' 2>/dev/null) \
+        || die 'broker returned an invalid JSON frame'
+      case "$frame_type" in
+        error)
+          error_code=$(printf '%s\n' "$response_line" | jq -r '.code // "BROKER_ERROR"' 2>/dev/null)
+          error_message=$(printf '%s\n' "$response_line" | jq -r '.message // "host execution failed"' 2>/dev/null)
+          printf 'host-exec-client: %s: %s\n' "$error_code" "$error_message" >&2
+          exit_status=$protocol_failure_status
+          received_exit=true
+          ;;
+        start|stdout|stderr|exit)
+          die "broker returned a malformed $frame_type frame"
+          ;;
+        *)
+          die "broker returned an unsupported frame type: $frame_type"
+          ;;
+      esac
       ;;
   esac
 done

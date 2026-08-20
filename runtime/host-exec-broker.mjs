@@ -27,6 +27,17 @@
  *   {"type":"stdout|stderr","data":"<base64>"} ...
  *   {"type":"exit","code":0,"signal":null,"status":0}
  *   {"type":"error","code":"...","message":"..."}
+ * An authenticated {"v":1,"type":"catalog","token":"..."} request instead
+ * returns the complete enabled command catalog as one
+ * {"type":"catalog","commands":[{"name":...,"mode":"first|fallback"},...]}
+ * line and closes; guest session helpers use it to create local PATH shims.
+ *
+ * The command manifest is either staged directly by the launcher
+ * (host-commands.tsv) or generated here from a launcher-staged catalog
+ * specification (host-catalog.json) that freezes the host PATH directories,
+ * deny/first policy, and the resolved Node.js and Xcode/CommandLineTools
+ * executables. Building the catalog in-process replaces a per-candidate
+ * fork/exec walk in the shell launcher with plain syscalls.
  *
  * PTYs, terminal resize, file-descriptor passing, and reconnecting to a
  * detached service are intentionally out of scope for this first version.
@@ -38,6 +49,7 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   readFile,
   realpath,
   rename,
@@ -55,6 +67,7 @@ const FILES = Object.freeze({
   commands: 'host-commands.tsv',
   roots: 'host-roots.tsv',
   toolRoots: 'host-tool-roots.txt',
+  catalog: 'host-catalog.json',
   token: 'host-exec-token',
   endpoint: 'host-exec-endpoint',
 });
@@ -68,7 +81,10 @@ const LIMITS = Object.freeze({
   rootManifestBytes: 64 * 1024,
   rootManifestLines: 128,
   commandManifestBytes: 4 * 1024 * 1024,
-  commandManifestLines: 4096,
+  commandManifestLines: 8192,
+  catalogSpecificationBytes: 256 * 1024,
+  catalogDirectories: 64,
+  catalogNameListEntries: 512,
   manifestPathBytes: 4096,
   sandboxProfileBytes: 128 * 1024,
   requestLineBytes: 512 * 1024,
@@ -82,8 +98,8 @@ const LIMITS = Object.freeze({
   envTotalBytes: 256 * 1024,
   stdinFrameBytes: 64 * 1024,
   stdinTotalBytes: 64 * 1024 * 1024,
-  connections: 32,
-  activeCommands: 8,
+  connections: 64,
+  activeCommands: 32,
   authenticationMs: 15_000,
   terminateGraceMs: 1_000,
   launcherPollMs: 500,
@@ -135,6 +151,16 @@ const SYSTEM_EXEC_ROOTS = Object.freeze([
   '/usr/bin',
   '/usr/sbin',
 ]);
+
+// Stock macOS developer commands are /usr/bin shims that consult xcrun and
+// mutable caches. Catalog entries for these names are frozen to the selected
+// Xcode/CommandLineTools executables so the sandbox never needs ambient
+// developer-cache behavior.
+const DEVELOPER_SHIM_COMMANDS = Object.freeze(new Set([
+  'ar', 'as', 'c++', 'cc', 'clang', 'clang++', 'gcc', 'git', 'ld', 'libtool',
+  'lipo', 'make', 'nm', 'otool', 'pip3', 'python3', 'ranlib', 'size',
+  'strings', 'strip', 'swift', 'swiftc', 'xcodebuild',
+]));
 
 class BrokerError extends Error {
   constructor(code, message) {
@@ -383,6 +409,305 @@ function validateRootRelationships(roots) {
   }
 }
 
+async function manifestFileExists(sessionDir, filename) {
+  try {
+    const info = await lstat(path.join(sessionDir, filename));
+    return info.isFile() && !info.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function validateCatalogNameList(value, label) {
+  if (!Array.isArray(value) || value.length > LIMITS.catalogNameListEntries) {
+    fail('INVALID_MANIFEST', `${FILES.catalog} ${label} is not a bounded array.`);
+  }
+  const names = new Set();
+  for (const name of value) {
+    if (typeof name !== 'string' || !SAFE_COMMAND_NAME.test(name)) {
+      fail('INVALID_MANIFEST', `${FILES.catalog} ${label} contains an unsafe command name.`);
+    }
+    names.add(name);
+  }
+  return names;
+}
+
+function validateCatalogPathField(value, label) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string' || !path.isAbsolute(value)
+    || hasUnsafePathCharacters(value) || value.includes('\t')
+    || byteLength(value) > LIMITS.manifestPathBytes) {
+    fail('INVALID_MANIFEST', `${FILES.catalog} ${label} must be one absolute path.`);
+  }
+  return value;
+}
+
+async function readCatalogSpecification(sessionDir) {
+  const specificationPath = path.join(sessionDir, FILES.catalog);
+  let info;
+  try {
+    info = await lstat(specificationPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    fail('INVALID_MANIFEST', `${FILES.catalog} cannot be inspected.`);
+  }
+  if (!info.isFile() || info.isSymbolicLink()
+    || info.size > LIMITS.catalogSpecificationBytes) {
+    fail('INVALID_MANIFEST', `${FILES.catalog} must be a small, non-symlink regular file.`);
+  }
+  let raw;
+  try {
+    raw = JSON.parse(await readFile(specificationPath, 'utf8'));
+  } catch {
+    fail('INVALID_MANIFEST', `${FILES.catalog} is not valid JSON.`);
+  }
+  const allowedKeys = new Set([
+    'v',
+    'pathDirectories',
+    'deny',
+    'first',
+    'nodeCommand',
+    'nodeExecPath',
+    'developerPath',
+    'developerRoot',
+  ]);
+  if (!isPlainObject(raw)
+    || Object.keys(raw).some((key) => !allowedKeys.has(key))
+    || raw.v !== 1) {
+    fail('INVALID_MANIFEST', `${FILES.catalog} is not a supported catalog specification.`);
+  }
+  if (!Array.isArray(raw.pathDirectories)
+    || raw.pathDirectories.length === 0
+    || raw.pathDirectories.length > LIMITS.catalogDirectories) {
+    fail('INVALID_MANIFEST', `${FILES.catalog} pathDirectories is not a bounded non-empty array.`);
+  }
+  const pathDirectories = [];
+  for (const directory of raw.pathDirectories) {
+    if (typeof directory !== 'string' || !path.isAbsolute(directory)
+      || hasUnsafePathCharacters(directory) || directory.includes('\t')
+      || byteLength(directory) > LIMITS.manifestPathBytes) {
+      fail('INVALID_MANIFEST', `${FILES.catalog} pathDirectories contains an unsafe path.`);
+    }
+    if (!pathDirectories.includes(directory)) pathDirectories.push(directory);
+  }
+  return Object.freeze({
+    pathDirectories: Object.freeze(pathDirectories),
+    deny: validateCatalogNameList(raw.deny ?? [], 'deny'),
+    first: validateCatalogNameList(raw.first ?? [], 'first'),
+    nodeCommand: validateCatalogPathField(raw.nodeCommand, 'nodeCommand'),
+    nodeExecPath: validateCatalogPathField(raw.nodeExecPath, 'nodeExecPath'),
+    developerPath: validateCatalogPathField(raw.developerPath, 'developerPath'),
+    developerRoot: validateCatalogPathField(raw.developerRoot, 'developerRoot'),
+  });
+}
+
+async function writeGeneratedManifest(sessionDir, filename, content) {
+  const destination = path.join(sessionDir, filename);
+  const temporaryPath = path.join(
+    sessionDir,
+    `.${filename}.${process.pid}.${Date.now()}.tmp`,
+  );
+  const handle = await open(temporaryPath, 'wx', 0o600);
+  try {
+    await handle.writeFile(content, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(temporaryPath, destination);
+  } catch (error) {
+    await rm(temporaryPath, { force: true });
+    throw error;
+  }
+}
+
+async function usableExecutableFile(candidate) {
+  try {
+    const info = await stat(candidate);
+    if (!info.isFile()) return false;
+    await access(candidate, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Build host-commands.tsv and host-tool-roots.txt from the launcher-frozen
+// catalog specification. The walk mirrors the retired shell implementation:
+// the first PATH occurrence claims a command name, developer and Node.js
+// shims are frozen to their resolved executables, and a symlink whose target
+// leaves every declared tool root is skipped rather than poisoning the
+// session. Selection here is convenience ordering; the per-command sandbox
+// remains the execution boundary.
+async function buildCatalogManifests(sessionDir, realHome, execHome, roots, specification) {
+  const writableRoots = roots
+    .filter((root) => root.mode === 'rw')
+    .map((root) => root.path);
+  const toolRoots = new Set();
+
+  let nodeRuntimeRoot = null;
+  if (specification.nodeExecPath) {
+    nodeRuntimeRoot = path.dirname(specification.nodeExecPath);
+    if (path.basename(nodeRuntimeRoot) === 'bin') {
+      const nodePrefix = path.dirname(nodeRuntimeRoot);
+      if (nodePrefix !== '/') nodeRuntimeRoot = nodePrefix;
+    }
+    if (pathContains(nodeRuntimeRoot, realHome)) {
+      nodeRuntimeRoot = path.dirname(specification.nodeExecPath);
+    }
+    if (nodeRuntimeRoot === '/' || pathContains(nodeRuntimeRoot, realHome)) {
+      nodeRuntimeRoot = null;
+    }
+    if (nodeRuntimeRoot) toolRoots.add(nodeRuntimeRoot);
+  }
+  if (specification.developerRoot) toolRoots.add(specification.developerRoot);
+
+  const seenNames = new Set();
+  const commands = [];
+  let droppedByCap = 0;
+  for (const directory of specification.pathDirectories) {
+    let canonicalDirectory;
+    try {
+      canonicalDirectory = await realpath(directory);
+      if (!(await stat(canonicalDirectory)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    if (hasUnsafePathCharacters(canonicalDirectory)
+      || canonicalDirectory.includes('\t')) {
+      continue;
+    }
+
+    let directoryRoot = canonicalDirectory;
+    for (const managedTree of ['.nvm', '.pyenv']) {
+      const managedRoot = path.join(realHome, managedTree);
+      if (pathContains(managedRoot, canonicalDirectory)) {
+        directoryRoot = managedRoot;
+        break;
+      }
+    }
+    if (directoryRoot === canonicalDirectory) {
+      if (pathContains('/opt/homebrew', canonicalDirectory)) {
+        directoryRoot = '/opt/homebrew';
+      } else if (pathContains('/usr/local', canonicalDirectory)) {
+        directoryRoot = '/usr/local';
+      }
+    }
+    // A root the manifest loader would reject (/ or an ancestor of the real
+    // home) must not fail the whole channel; skip only that directory.
+    if (directoryRoot === '/' || pathContains(directoryRoot, realHome)) {
+      process.stderr.write(`host-exec-broker: skipping unusable PATH directory ${canonicalDirectory}\n`);
+      continue;
+    }
+    toolRoots.add(directoryRoot);
+
+    let entryNames;
+    try {
+      entryNames = (await readdir(canonicalDirectory)).sort();
+    } catch {
+      continue;
+    }
+    for (const entryName of entryNames) {
+      if (!SAFE_COMMAND_NAME.test(entryName)
+        || entryName === '.' || entryName === '..') {
+        continue;
+      }
+      if (seenNames.has(entryName)) continue;
+      if (specification.deny.has(entryName)) continue;
+      const candidate = path.join(canonicalDirectory, entryName);
+      // Claim the name only once this occurrence is a usable executable, like
+      // normal PATH lookup and the retired shell walk: a plain file earlier in
+      // PATH must not suppress a real command of the same name later in PATH.
+      if (!(await usableExecutableFile(candidate))) continue;
+      seenNames.add(entryName);
+
+      let executable = candidate;
+      if (entryName === 'node' && specification.nodeExecPath) {
+        let resolvedCandidate = null;
+        try {
+          resolvedCandidate = await realpath(candidate);
+        } catch {
+          resolvedCandidate = null;
+        }
+        if (resolvedCandidate === specification.nodeCommand
+          || resolvedCandidate === specification.nodeExecPath) {
+          executable = specification.nodeExecPath;
+        }
+      }
+      if (DEVELOPER_SHIM_COMMANDS.has(entryName)
+        && candidate === `/usr/bin/${entryName}`
+        && specification.developerPath) {
+        for (const developerCandidate of [
+          path.join(specification.developerPath, 'usr', 'bin', entryName),
+          path.join(
+            specification.developerPath,
+            'Toolchains', 'XcodeDefault.xctoolchain', 'usr', 'bin',
+            entryName,
+          ),
+        ]) {
+          if (!(await usableExecutableFile(developerCandidate))) continue;
+          if (specification.developerRoot
+            && pathContains(specification.developerRoot, developerCandidate)) {
+            executable = developerCandidate;
+          }
+          break;
+        }
+      }
+
+      let canonicalExecutable;
+      try {
+        canonicalExecutable = await realpath(executable);
+      } catch {
+        continue;
+      }
+      if (hasUnsafePathCharacters(canonicalExecutable)
+        || canonicalExecutable.includes('\t')
+        || !(await usableExecutableFile(canonicalExecutable))) {
+        continue;
+      }
+      const containingRoots = [
+        directoryRoot,
+        nodeRuntimeRoot,
+        specification.developerRoot,
+        ...SYSTEM_EXEC_ROOTS,
+      ].filter(Boolean);
+      if (!containingRoots.some((root) => pathContains(root, canonicalExecutable))) {
+        continue;
+      }
+      if (writableRoots.some((root) => pathContains(root, canonicalExecutable))
+        || pathContains(execHome, canonicalExecutable)) {
+        continue;
+      }
+      if (commands.length >= LIMITS.commandManifestLines) {
+        droppedByCap += 1;
+        continue;
+      }
+      commands.push({
+        mode: specification.first.has(entryName) ? 'first' : 'fallback',
+        name: entryName,
+        executable: canonicalExecutable,
+      });
+    }
+  }
+  if (droppedByCap > 0) {
+    process.stderr.write(`host-exec-broker: command catalog reached its ${LIMITS.commandManifestLines}-entry bound; ${droppedByCap} later PATH commands were dropped\n`);
+  }
+  if (commands.length === 0) {
+    fail('INVALID_MANIFEST', 'No host command could be cataloged from the staged PATH directories.');
+  }
+
+  const commandLines = commands
+    .map((command) => `${command.mode}\t${command.name}\t${command.executable}\n`)
+    .join('');
+  if (byteLength(commandLines) > LIMITS.commandManifestBytes) {
+    fail('INVALID_MANIFEST', 'The generated host command manifest is too large.');
+  }
+  const toolRootLines = [...toolRoots].sort().map((root) => `${root}\n`).join('');
+  await writeGeneratedManifest(sessionDir, FILES.toolRoots, toolRootLines);
+  await writeGeneratedManifest(sessionDir, FILES.commands, commandLines);
+}
+
 async function loadConfiguration(argumentsValue) {
   const sessionDir = await canonicalDirectory(argumentsValue.sessionDirInput, '--session-dir');
   const realHome = await canonicalDirectory(argumentsValue.realHomeInput, '--real-home');
@@ -404,6 +729,17 @@ async function loadConfiguration(argumentsValue) {
     fail('INVALID_MANIFEST', `${FILES.roots} must declare at least one execution root.`);
   }
   validateRootRelationships(roots);
+
+  // A launcher may stage the complete command manifest directly, or stage a
+  // catalog specification for this broker to expand. Generated manifests are
+  // re-read through the exact same validation path as staged ones.
+  if (!(await manifestFileExists(sessionDir, FILES.commands))) {
+    const specification = await readCatalogSpecification(sessionDir);
+    if (specification === null) {
+      fail('INVALID_MANIFEST', `${FILES.commands} and ${FILES.catalog} are both missing.`);
+    }
+    await buildCatalogManifests(sessionDir, realHome, execHome, roots, specification);
+  }
 
   const toolRootText = await readTrustedManifest(sessionDir, FILES.toolRoots);
   const toolRootRecords = await parseCanonicalRootLines(
@@ -467,6 +803,17 @@ function isForwardableEnvironmentName(name) {
     && !SECRET_ENV_PATTERN.test(name);
 }
 
+function verifySessionToken(token, configuration) {
+  if (typeof token !== 'string' || !TOKEN_PATTERN.test(token)) {
+    fail('AUTH_FAILED', 'Authentication failed.');
+  }
+  const suppliedToken = Buffer.from(token, 'ascii');
+  if (suppliedToken.length !== configuration.tokenBuffer.length
+    || !timingSafeEqual(suppliedToken, configuration.tokenBuffer)) {
+    fail('AUTH_FAILED', 'Authentication failed.');
+  }
+}
+
 function validateRequest(request, configuration) {
   if (!isPlainObject(request)
     || Object.keys(request).some((key) => !ALLOWED_REQUEST_KEYS.has(key))
@@ -475,14 +822,7 @@ function validateRequest(request, configuration) {
     fail('INVALID_REQUEST', 'The first frame is not a supported run request.');
   }
 
-  if (typeof request.token !== 'string' || !TOKEN_PATTERN.test(request.token)) {
-    fail('AUTH_FAILED', 'Authentication failed.');
-  }
-  const suppliedToken = Buffer.from(request.token, 'ascii');
-  if (suppliedToken.length !== configuration.tokenBuffer.length
-    || !timingSafeEqual(suppliedToken, configuration.tokenBuffer)) {
-    fail('AUTH_FAILED', 'Authentication failed.');
-  }
+  verifySessionToken(request.token, configuration);
 
   if (typeof request.command !== 'string' || !SAFE_COMMAND_NAME.test(request.command)) {
     fail('INVALID_REQUEST', 'command is not a safe basename.');
@@ -551,6 +891,25 @@ async function resolveRequestCwd(cwdInput, configuration) {
     fail('CWD_DENIED', 'cwd is outside the declared execution roots.');
   }
   return cwd;
+}
+
+// A catalog request answers with the enabled command names and their guest
+// PATH mode, then ends the connection. Guest session helpers use it to build
+// local shims; command executable paths stay host-side.
+function handleCatalogRequest(context, request, configuration) {
+  const allowedKeys = new Set(['v', 'type', 'token']);
+  if (!isPlainObject(request)
+    || Object.keys(request).some((key) => !allowedKeys.has(key))
+    || request.v !== 1) {
+    fail('INVALID_REQUEST', 'The first frame is not a supported catalog request.');
+  }
+  verifySessionToken(request.token, configuration);
+  const commands = [...configuration.commands.values()]
+    .map((command) => ({ name: command.name, mode: command.mode }));
+  if (enterTerminalState(context)) {
+    sendFrame(context.socket, { type: 'catalog', commands });
+    closeSocketSoon(context.socket);
+  }
 }
 
 function sandboxPathRules(operation, paths) {
@@ -894,6 +1253,10 @@ function processBufferedLines(context, configuration, activeContexts) {
     }
 
     if (context.phase === 'awaiting_request') {
+      if (isPlainObject(frame) && frame.type === 'catalog') {
+        handleCatalogRequest(context, frame, configuration);
+        continue;
+      }
       const validated = validateRequest(frame, configuration);
       if (context.authTimer) clearTimeout(context.authTimer);
       context.authTimer = undefined;

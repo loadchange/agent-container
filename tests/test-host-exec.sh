@@ -699,4 +699,172 @@ pass 'sandbox-exec denies writes beneath a declared read-only root'
   || fail "sandbox read outside declared roots was not denied: $(sed -n '1,3p' "$client_stdout")"
 pass 'sandbox-exec denies reads outside every declared root'
 
+# ---------------------------------------------------------------------------
+# Catalog-builder mode: a second broker expands a launcher-staged
+# host-catalog.json into the command manifest itself, serves the guest
+# catalog request, and runs a command selected through the generated catalog.
+kill -TERM "$broker_pid" 2>/dev/null || true
+wait "$broker_pid" 2>/dev/null || true
+broker_pid=''
+
+catalog_session_dir="$test_root/catalog-session"
+catalog_shadow_bin="$test_root/catalog-shadow-bin"
+catalog_tool_bin="$test_root/catalog-tool-bin"
+catalog_poison_target="$test_root/catalog-poison-target"
+mkdir -m 0700 \
+  "$catalog_session_dir" \
+  "$catalog_shadow_bin" \
+  "$catalog_tool_bin" \
+  "$catalog_poison_target"
+# A non-executable file earlier in PATH must not claim a command name away
+# from a real executable later in PATH; normal PATH lookup skips it.
+printf '%s\n' 'not a program' > "$catalog_shadow_bin/uv"
+chmod 0644 "$catalog_shadow_bin/uv"
+printf '%s\n' '#!/bin/sh' 'printf "uv-from-host %s\n" "${1:-}"' \
+  > "$catalog_tool_bin/uv"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$catalog_tool_bin/gh"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$catalog_tool_bin/denied-tool"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$catalog_poison_target/poison-tool"
+chmod 0755 \
+  "$catalog_tool_bin/uv" \
+  "$catalog_tool_bin/gh" \
+  "$catalog_tool_bin/denied-tool" \
+  "$catalog_poison_target/poison-tool"
+ln -s "$catalog_poison_target/poison-tool" "$catalog_tool_bin/poison-tool"
+ln -s "$node_executable" "$catalog_tool_bin/node"
+printf '{"v":1,"pathDirectories":["%s","%s"],"deny":["denied-tool","sudo"],"first":["gh"],"nodeCommand":"%s","nodeExecPath":"%s","developerPath":null,"developerRoot":null}\n' \
+  "$catalog_shadow_bin" "$catalog_tool_bin" "$node_executable" "$node_executable" \
+  > "$catalog_session_dir/host-catalog.json"
+printf 'rw\t%s\n' "$workspace" > "$catalog_session_dir/host-roots.tsv"
+printf '%s\n' "$token" > "$catalog_session_dir/host-exec-token"
+chmod 0600 \
+  "$catalog_session_dir/host-catalog.json" \
+  "$catalog_session_dir/host-roots.tsv" \
+  "$catalog_session_dir/host-exec-token"
+
+PATH="$controlled_path" \
+  node "$broker_script" \
+    --session-dir "$catalog_session_dir" \
+    --bind-address 127.0.0.1 \
+    --launcher-pid "$$" \
+    --real-home "$broker_real_home" \
+    --exec-home "$exec_home" \
+    --sandbox-bin "$sandbox_bin" \
+    > "$broker_stdout" 2> "$broker_stderr" &
+broker_pid=$!
+catalog_endpoint_file="$catalog_session_dir/host-exec-endpoint"
+ready_wait=0
+while [ ! -s "$catalog_endpoint_file" ] && [ "$ready_wait" -lt 200 ]; do
+  kill -0 "$broker_pid" 2>/dev/null \
+    || fail "catalog broker exited before readiness: $(sed -n '1,4p' "$broker_stderr")"
+  sleep 0.05
+  ready_wait=$((ready_wait + 1))
+done
+[ -s "$catalog_endpoint_file" ] \
+  || fail "catalog broker did not become ready: $(sed -n '1,4p' "$broker_stderr")"
+catalog_endpoint=$(sed -n '1p' "$catalog_endpoint_file")
+
+generated_manifest="$catalog_session_dir/host-commands.tsv"
+[ -f "$generated_manifest" ] \
+  || fail 'the catalog builder did not generate host-commands.tsv'
+grep -Fxq "$(printf 'fallback\tuv\t%s' "$catalog_tool_bin/uv")" \
+  "$generated_manifest" \
+  || fail 'a non-executable earlier PATH entry suppressed the fallback uv command'
+if grep -Fq "$catalog_shadow_bin" "$generated_manifest"; then
+  fail 'a non-executable PATH entry entered the generated catalog'
+fi
+grep -Fxq "$(printf 'first\tgh\t%s' "$catalog_tool_bin/gh")" \
+  "$generated_manifest" \
+  || fail 'the generated catalog did not honor the host-first policy for gh'
+grep -Fxq "$(printf 'fallback\tnode\t%s' "$node_executable")" \
+  "$generated_manifest" \
+  || fail 'the generated catalog did not freeze node to its resolved executable'
+if grep -Fq 'denied-tool' "$generated_manifest"; then
+  fail 'a denied command entered the generated catalog'
+fi
+if grep -Fq 'poison-tool' "$generated_manifest"; then
+  fail 'a cross-root executable symlink entered the generated catalog'
+fi
+grep -Fxq "$catalog_tool_bin" "$catalog_session_dir/host-tool-roots.txt" \
+  || fail 'the generated tool roots are missing the cataloged PATH directory'
+pass 'the broker expands a staged catalog specification into validated manifests'
+
+catalog_probe_stdout="$test_root/catalog-probe.stdout"
+catalog_probe_stderr="$test_root/catalog-probe.stderr"
+set +e
+node - "$catalog_endpoint" "$token" \
+  > "$catalog_probe_stdout" 2> "$catalog_probe_stderr" <<'NODE'
+const net = require('node:net');
+const [endpoint, token] = process.argv.slice(2);
+const separator = endpoint.lastIndexOf(':');
+const socket = net.connect({
+  host: endpoint.slice(0, separator),
+  port: Number(endpoint.slice(separator + 1)),
+});
+let buffered = '';
+const timer = setTimeout(() => {
+  process.stderr.write('catalog probe timed out\n');
+  process.exit(1);
+}, 8000);
+socket.on('connect', () => {
+  socket.write(`${JSON.stringify({ v: 1, type: 'catalog', token })}\n`);
+});
+socket.on('data', (chunk) => { buffered += chunk; });
+socket.on('error', (error) => {
+  process.stderr.write(`${error.message}\n`);
+  process.exit(1);
+});
+socket.on('close', () => {
+  clearTimeout(timer);
+  let frame;
+  try {
+    frame = JSON.parse(buffered.split('\n')[0]);
+  } catch {
+    process.stderr.write('catalog response is not JSON\n');
+    process.exit(1);
+  }
+  if (frame.type !== 'catalog' || !Array.isArray(frame.commands)) {
+    process.stderr.write('unexpected catalog frame\n');
+    process.exit(1);
+  }
+  for (const entry of frame.commands) {
+    process.stdout.write(`${entry.mode}\t${entry.name}\n`);
+  }
+  process.exit(0);
+});
+NODE
+catalog_probe_status=$?
+set -e
+[ "$catalog_probe_status" -eq 0 ] \
+  || fail "catalog TCP probe failed: $(sed -n '1,3p' "$catalog_probe_stderr")"
+grep -Fxq "$(printf 'fallback\tuv')" "$catalog_probe_stdout" \
+  || fail 'the catalog request response is missing the uv command'
+grep -Fxq "$(printf 'first\tgh')" "$catalog_probe_stdout" \
+  || fail 'the catalog request response is missing the host-first gh command'
+if grep -Fq 'denied-tool' "$catalog_probe_stdout"; then
+  fail 'the catalog request leaked a denied command'
+fi
+pass 'an authenticated catalog request returns the generated command list'
+
+( CDPATH= cd -- "$workspace" \
+    && AGENT_HOST_EXEC_DIR="$catalog_session_dir" \
+      /bin/bash -c "$client_source" host-exec uv --version < /dev/null ) \
+  > "$client_stdout" 2> "$client_stderr"
+[ "$(sed -n '1p' "$client_stdout")" = 'uv-from-host --version' ] \
+  || fail "a catalog-selected command did not execute on the host: $(sed -n '1,3p' "$client_stderr")"
+pass 'a command selected through the generated catalog executes on the host'
+
+set +e
+( CDPATH= cd -- "$workspace" \
+    && AGENT_HOST_EXEC_DIR="$catalog_session_dir" \
+      /bin/bash -c "$client_source" host-exec denied-tool < /dev/null ) \
+  > "$client_stdout" 2> "$client_stderr"
+denied_catalog_status=$?
+set -e
+[ "$denied_catalog_status" -eq 125 ] \
+  || fail "a denied catalog command returned $denied_catalog_status instead of 125"
+grep -Fq 'COMMAND_DENIED' "$client_stderr" \
+  || fail 'a denied catalog command was not rejected with COMMAND_DENIED'
+pass 'deny-listed commands stay rejected through the generated catalog'
+
 printf '1..%s\n' "$tests_passed"

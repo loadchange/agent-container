@@ -905,6 +905,8 @@ Container launcher options (must precede the profile or Agent arguments):
   --container-bin PATH            Apple container CLI override
   --container-host-broker PATH    host-exec broker override
   --container-host-node PATH      host Node.js override
+  --container-host-exec-deny LIST comma-separated host commands never proxied
+  --container-host-exec-first LIST comma-separated host commands that shadow guest copies
   --container-host-gateway IP     default-network host gateway override
   --container-host-alias HOSTS    comma-separated guest names mapped to the host gateway
   --container-block-host HOSTS    comma-separated guest names mapped to IPv4/IPv6 blackholes
@@ -913,6 +915,7 @@ Container launcher options (must precede the profile or Agent arguments):
 
 Boolean container options:
   --container-enable-experimental
+  --container-host-tools
   --container-rebuild
   --container-skip-build
   --container-full-git-config
@@ -1339,11 +1342,14 @@ if [ -n "${AGENT_CONTAINER_FORWARD_API_KEY+x}" ]; then
   esac
 fi
 
-# Host git and gh proxying is the default for normal singleton clients so
-# repository pushes and GitHub operations use the operator's host identity and
-# credentials. The default degrades to the guest binaries with a warning when
-# the host broker runtime is unavailable; an explicit --container-host-tools
-# instead fails closed, and --no-container-host-tools disables the channel.
+# Host tool proxying is the default for normal singleton clients: the guest
+# PATH mirrors the complete host command catalog, so commands the verified
+# guest image does not provide (node, npm, uv, cargo, ...) transparently run
+# as sandboxed host executables against the same workspace path, and git/gh
+# run host-first with the operator's identity and credentials. The default
+# degrades to the guest binaries with a warning when the host broker runtime
+# is unavailable; an explicit --container-host-tools instead fails closed,
+# and --no-container-host-tools disables the channel.
 host_tools_mode=true
 host_tools_explicit=false
 if [ -n "${AGENT_CONTAINER_HOST_TOOLS+x}" ]; then
@@ -1355,6 +1361,43 @@ if [ -n "${AGENT_CONTAINER_HOST_TOOLS+x}" ]; then
       die "--container-host-tools must be true or false."
       ;;
   esac
+fi
+
+# Both launch modes share one host-tool policy vocabulary. The launcher list
+# options extend run mode's --no-host-exec/--host-first to ordinary singleton
+# clients; deny always wins over first.
+parse_host_exec_name_list() {
+  local option_name="$1"
+  local list_value="$2"
+  local list_kind="$3"
+  local parsed_name
+  local -a parsed_names
+
+  case "$list_value" in
+    ,*|*,|*,,*|*$'\n'*|*$'\r'*|*$'\t'*)
+      die "$option_name must be a comma-separated list of command names without empty entries."
+      ;;
+  esac
+  IFS=, read -r -a parsed_names <<EOF
+$list_value
+EOF
+  for parsed_name in "${parsed_names[@]}"; do
+    valid_host_command_name "$parsed_name" \
+      || die "$option_name contains an unsafe command name: $parsed_name"
+    if [ "$list_kind" = deny ]; then
+      host_exec_denied+=("$parsed_name")
+    else
+      host_exec_first+=("$parsed_name")
+    fi
+  done
+}
+if [ -n "${AGENT_CONTAINER_HOST_EXEC_DENY:-}" ]; then
+  parse_host_exec_name_list --container-host-exec-deny \
+    "$AGENT_CONTAINER_HOST_EXEC_DENY" deny
+fi
+if [ -n "${AGENT_CONTAINER_HOST_EXEC_FIRST:-}" ]; then
+  parse_host_exec_name_list --container-host-exec-first \
+    "$AGENT_CONTAINER_HOST_EXEC_FIRST" first
 fi
 
 # Every Agent endpoint, model, token, and setting uses this one explicit path.
@@ -2553,7 +2596,7 @@ run_singleton_client() {
   resolve_singleton_host_gateway
   resolve_workspace_launcher
   if [ "$host_tools_mode" = true ]; then
-    # Start this client's host git/gh broker before any liveness descriptor
+    # Start this client's host-tool broker before any liveness descriptor
     # exists so the broker never inherits the workspace-owner pipe.
     start_singleton_host_tools_broker
   fi
@@ -2721,14 +2764,13 @@ run_singleton_client() {
   if [ "$singleton_host_tools_active" = true ]; then
     # Like the workspace channel, only the exact names enter the Apple CLI
     # argument vector; the endpoint and token values travel through the
-    # inherited environment to the guest session helper.
+    # inherited environment to the guest session helper, which retrieves the
+    # complete command catalog from the authenticated broker itself.
     export AGENT_WORKSPACE_HOST_EXEC_ENDPOINT="$host_exec_endpoint"
     export AGENT_WORKSPACE_HOST_EXEC_TOKEN="$host_exec_token"
-    export AGENT_WORKSPACE_HOST_EXEC_COMMANDS="$singleton_host_exec_commands"
     singleton_exec_args+=(
       --env AGENT_WORKSPACE_HOST_EXEC_ENDPOINT
       --env AGENT_WORKSPACE_HOST_EXEC_TOKEN
-      --env AGENT_WORKSPACE_HOST_EXEC_COMMANDS
     )
   fi
 
@@ -2952,6 +2994,7 @@ if [ "$singleton_requested" = true ]; then
 fi
 
 host_node_bin=""
+host_node_command=""
 host_broker_bin=""
 host_exec_runtime_error=""
 host_exec_endpoint=""
@@ -3026,8 +3069,6 @@ resolve_host_developer_root() {
 # message in host_exec_runtime_error: legacy run treats every failure as
 # fatal, while the default singleton host-tool channel may degrade.
 resolve_host_exec_broker_runtime() {
-  local host_node_command
-
   host_exec_runtime_error=""
   if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
     case "$AGENT_CONTAINER_HOST_BROKER_BIN" in
@@ -3217,137 +3258,121 @@ start_host_exec_broker() {
     "$host_stage_dir/host-exec-broker.log"
 }
 
-# The default host git/gh channel stages a fixed two-command manifest whose
-# only writable execution root is the selected workspace. It never catalogs
-# the wider PATH surface that legacy run exposes.
+# One host-tool catalog implementation serves both launch modes. The launcher
+# freezes the ordered PATH directories, the deny/first policy, and the
+# resolved Node.js and Xcode/CommandLineTools executables into a catalog
+# specification; the broker expands it into the validated command manifest
+# in-process instead of a per-candidate fork/exec walk in this shell.
 singleton_host_tools_active=false
-singleton_host_exec_commands=""
-resolved_tool_executable=""
-resolved_tool_root=""
 
-fail_singleton_host_tools() {
-  local reason="$1"
-  singleton_host_tools_active=false
-  if [ "$host_tools_explicit" = true ] && [ "$host_tools_mode" = true ]; then
-    die "$reason Pass --no-container-host-tools to launch with guest git/gh only."
-  fi
-  warn "$reason Host git/gh proxying is disabled for this client; the guest binaries will be used. Pass --no-container-host-tools to silence this warning."
-  return 0
+json_escape_string() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '%s' "$value"
 }
 
-# Returns 1 when the host simply does not provide the command (a quiet guest
-# fallback) and 2 when a present command was rejected as unsafe (warned).
-resolve_singleton_host_tool() {
-  local tool_name="$1"
-  local tool_command tool_dir developer_candidate
+json_string_or_null() {
+  local value=$1
+  if [ -n "$value" ]; then
+    printf '"%s"' "$(json_escape_string "$value")"
+  else
+    printf 'null'
+  fi
+}
 
-  resolved_tool_executable=""
-  resolved_tool_root=""
-  tool_command=$(command -v -- "$tool_name" 2>/dev/null || true)
-  case "$tool_command" in
-    /*) ;;
-    *) return 1 ;;
-  esac
-  resolved_tool_executable=$(/bin/realpath "$tool_command" 2>/dev/null || true)
-  [ -f "$resolved_tool_executable" ] && [ -x "$resolved_tool_executable" ] \
-    || return 2
+stage_host_exec_catalog() {
+  local catalog_tmp path_entry policy_name json_separator
+  local -a catalog_directories catalog_denied catalog_first
 
-  # Freeze the /usr/bin developer shim to the selected Xcode/CommandLineTools
-  # executable exactly as legacy run does, so the sandbox never needs mutable
-  # xcrun cache behavior.
-  if [ "$resolved_tool_executable" = "/usr/bin/$tool_name" ]; then
-    resolve_host_developer_root
-    if [ -n "$host_developer_root" ]; then
-      for developer_candidate in \
-        "$host_developer_path/usr/bin/$tool_name" \
-        "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin/$tool_name"; do
-        if [ -f "$developer_candidate" ] && [ -x "$developer_candidate" ]; then
-          resolved_tool_executable=$(
-            /bin/realpath "$developer_candidate" 2>/dev/null || true
-          )
-          break
-        fi
-      done
-      [ -f "$resolved_tool_executable" ] && [ -x "$resolved_tool_executable" ] \
-        || return 2
+  catalog_directories=()
+  for path_entry in "${host_path_entries[@]}"; do
+    [ -n "$path_entry" ] || continue
+    case "$path_entry" in
+      /*) ;;
+      *) continue ;;
+    esac
+    [ -d "$path_entry" ] || continue
+    path_entry=$(resolve_absolute_dir "$path_entry" || true)
+    case "$path_entry" in
+      ''|*$'\n'*|*$'\r'*|*$'\t'*) continue ;;
+    esac
+    if [ "${#catalog_directories[@]}" -gt 0 ] \
+      && array_contains_value "$path_entry" "${catalog_directories[@]}"; then
+      continue
     fi
-  fi
+    if [ "${#catalog_directories[@]}" -ge 64 ]; then
+      warn "The host PATH lists more than 64 directories; later entries were not cataloged."
+      break
+    fi
+    catalog_directories+=("$path_entry")
+  done
+  [ "${#catalog_directories[@]}" -gt 0 ] || return 1
 
-  case "$resolved_tool_executable" in
-    *$'\n'*|*$'\r'*|*$'\t'*) return 2 ;;
-  esac
-  if host_path_is_agent_writable "$resolved_tool_executable"; then
-    return 2
-  fi
+  # Agent binaries and launcher internals must remain in the verified guest.
+  # The user deny list is additive to this small mandatory set, and deny
+  # always wins over a host-first request for the same name.
+  catalog_denied=(
+    "$profile_command"
+    agent-container
+    agent-host-exec
+    host-exec
+    claude-container
+    codex-container
+    grok-container
+    container
+    sudo
+  )
+  for policy_name in ${host_exec_denied[@]+"${host_exec_denied[@]}"}; do
+    array_contains_value "$policy_name" "${catalog_denied[@]}" \
+      || catalog_denied+=("$policy_name")
+  done
+  catalog_first=()
+  for policy_name in "${host_exec_first[@]}"; do
+    array_contains_value "$policy_name" "${catalog_denied[@]}" \
+      && continue
+    if [ "${#catalog_first[@]}" -gt 0 ] \
+      && array_contains_value "$policy_name" "${catalog_first[@]}"; then
+      continue
+    fi
+    catalog_first+=("$policy_name")
+  done
 
-  tool_dir=$(dirname -- "$resolved_tool_executable")
-  resolved_tool_root="$tool_dir"
-  case "$tool_dir/" in
-    "$host_home_dir/.nvm/"*) resolved_tool_root="$host_home_dir/.nvm" ;;
-    "$host_home_dir/.pyenv/"*) resolved_tool_root="$host_home_dir/.pyenv" ;;
-    /opt/homebrew/*) resolved_tool_root=/opt/homebrew ;;
-    /usr/local/*) resolved_tool_root=/usr/local ;;
-  esac
-  if [ -n "$host_developer_root" ] \
-    && path_contains "$host_developer_root" "$resolved_tool_executable"; then
-    resolved_tool_root="$host_developer_root"
-  fi
-  case "$resolved_tool_root" in
-    ''|/|*:*|*$'\n'*|*$'\r'*|*$'\t'*) return 2 ;;
-  esac
-}
-
-stage_singleton_host_tools() {
-  local tool_name tool_resolution commands_tmp tool_roots_tmp roots_tmp
-  local staged_any
-
-  singleton_host_exec_commands=""
-  commands_tmp=$(mktemp "$host_stage_dir/.host-commands.XXXXXX") || return 1
-  tool_roots_tmp=$(mktemp "$host_stage_dir/.host-tool-roots.XXXXXX") || {
-    rm -f "$commands_tmp"
+  resolve_host_developer_root
+  catalog_tmp=$(mktemp "$host_stage_dir/.host-catalog.XXXXXX") || return 1
+  {
+    printf '{"v":1,"pathDirectories":['
+    json_separator=''
+    for path_entry in "${catalog_directories[@]}"; do
+      printf '%s"%s"' "$json_separator" "$(json_escape_string "$path_entry")"
+      json_separator=,
+    done
+    printf '],"deny":['
+    json_separator=''
+    for policy_name in "${catalog_denied[@]}"; do
+      printf '%s"%s"' "$json_separator" "$(json_escape_string "$policy_name")"
+      json_separator=,
+    done
+    printf '],"first":['
+    json_separator=''
+    for policy_name in ${catalog_first[@]+"${catalog_first[@]}"}; do
+      printf '%s"%s"' "$json_separator" "$(json_escape_string "$policy_name")"
+      json_separator=,
+    done
+    printf '],"nodeCommand":%s' "$(json_string_or_null "$host_node_command")"
+    printf ',"nodeExecPath":%s' "$(json_string_or_null "$host_node_bin")"
+    printf ',"developerPath":%s' "$(json_string_or_null "$host_developer_path")"
+    printf ',"developerRoot":%s' "$(json_string_or_null "$host_developer_root")"
+    printf '}\n'
+  } > "$catalog_tmp" || {
+    rm -f "$catalog_tmp"
     return 1
   }
-  staged_any=false
-  for tool_name in git gh; do
-    tool_resolution=0
-    resolve_singleton_host_tool "$tool_name" || tool_resolution=$?
-    if [ "$tool_resolution" -eq 1 ]; then
-      # The host simply does not provide this command; the guest binary is
-      # the quiet, expected fallback.
-      continue
-    fi
-    if [ "$tool_resolution" -ne 0 ]; then
-      warn "Host $tool_name was rejected as unsafe for proxying; the guest $tool_name will be used."
-      continue
-    fi
-    printf 'first\t%s\t%s\n' \
-      "$tool_name" "$resolved_tool_executable" >> "$commands_tmp"
-    printf '%s\n' "$resolved_tool_root" >> "$tool_roots_tmp"
-    if [ -n "$singleton_host_exec_commands" ]; then
-      singleton_host_exec_commands="$singleton_host_exec_commands,$tool_name"
-    else
-      singleton_host_exec_commands="$tool_name"
-    fi
-    staged_any=true
-  done
-  if [ "$staged_any" != true ]; then
-    rm -f "$commands_tmp" "$tool_roots_tmp"
-    return 1
-  fi
-  mv "$commands_tmp" "$host_stage_dir/host-commands.tsv"
-  sort -u "$tool_roots_tmp" > "$host_stage_dir/host-tool-roots.txt"
-  rm -f "$tool_roots_tmp"
+  chmod 0600 "$catalog_tmp"
+  mv "$catalog_tmp" "$host_stage_dir/host-catalog.json"
+}
 
-  roots_tmp=$(mktemp "$host_stage_dir/.host-roots.XXXXXX") || return 1
-  # Dynamic singleton sharing already rejects worktrees whose Git common
-  # directory lies outside the workspace root, so one writable root suffices.
-  printf 'rw\t%s\n' "$mount_root" >> "$roots_tmp"
-  mv "$roots_tmp" "$host_stage_dir/host-roots.tsv"
-  chmod 0600 \
-    "$host_stage_dir/host-commands.tsv" \
-    "$host_stage_dir/host-tool-roots.txt" \
-    "$host_stage_dir/host-roots.tsv"
-
+stage_host_exec_token() {
   host_exec_token=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null \
     | od -An -tx1 | tr -d ' \n')
   [ "${#host_exec_token}" -eq 64 ] || return 1
@@ -3357,19 +3382,43 @@ stage_singleton_host_tools() {
   atomic_write_line "$host_stage_dir/host-exec-token" "$host_exec_token"
 }
 
+fail_singleton_host_tools() {
+  local reason="$1"
+  singleton_host_tools_active=false
+  if [ "$host_tools_explicit" = true ] && [ "$host_tools_mode" = true ]; then
+    die "$reason Pass --no-container-host-tools to launch with guest tools only."
+  fi
+  warn "$reason Host tool proxying is disabled for this client; the guest binaries will be used. Pass --no-container-host-tools to silence this warning."
+  return 0
+}
+
+stage_singleton_host_tools() {
+  local roots_tmp
+
+  stage_host_exec_catalog || return 1
+  roots_tmp=$(mktemp "$host_stage_dir/.host-roots.XXXXXX") || return 1
+  # Dynamic singleton sharing already rejects worktrees whose Git common
+  # directory lies outside the workspace root, so one writable root suffices.
+  printf 'rw\t%s\n' "$mount_root" >> "$roots_tmp"
+  mv "$roots_tmp" "$host_stage_dir/host-roots.tsv"
+  chmod 0600 \
+    "$host_stage_dir/host-catalog.json" \
+    "$host_stage_dir/host-roots.tsv"
+  stage_host_exec_token
+}
+
 start_singleton_host_tools_broker() {
   singleton_host_tools_active=false
-  singleton_host_exec_commands=""
   if ! resolve_host_exec_broker_runtime; then
-    fail_singleton_host_tools "Host git/gh proxying is unavailable: $host_exec_runtime_error"
+    fail_singleton_host_tools "Host tool proxying is unavailable: $host_exec_runtime_error"
     return 0
   fi
   if ! stage_singleton_host_tools; then
-    fail_singleton_host_tools "Neither a host git nor a host gh executable could be safely staged."
+    fail_singleton_host_tools "The host tool catalog could not be staged."
     return 0
   fi
   if ! start_host_exec_broker; then
-    fail_singleton_host_tools "Host git/gh proxying is unavailable: $host_exec_runtime_error"
+    fail_singleton_host_tools "Host tool proxying is unavailable: $host_exec_runtime_error"
     return 0
   fi
   singleton_host_tools_active=true
@@ -3381,168 +3430,13 @@ if [ "$singleton_requested" = true ] \
   # An explicit opt-in fails closed before any native image or container
   # mutation when the broker runtime cannot exist at all.
   resolve_host_exec_broker_runtime \
-    || die "Host git/gh proxying is unavailable: $host_exec_runtime_error Pass --no-container-host-tools to launch with guest git/gh only."
+    || die "Host tool proxying is unavailable: $host_exec_runtime_error Pass --no-container-host-tools to launch with guest tools only."
 fi
 
 if [ "$run_mode" = true ]; then
-  # Agent binaries and launcher internals must remain in the verified guest.
-  # A user blacklist is additive to this small mandatory set.
-  host_exec_denied+=(
-    "$profile_command"
-    agent-container
-    agent-host-exec
-    host-exec
-    claude-container
-    codex-container
-    grok-container
-    container
-    sudo
-  )
-
   resolve_host_exec_broker_runtime || die "$host_exec_runtime_error"
-
-  host_commands_tmp=$(mktemp "$host_stage_dir/.host-commands.XXXXXX") \
-    || die "Unable to create the host command manifest."
-  host_tool_roots_tmp=$(mktemp "$host_stage_dir/.host-tool-roots.XXXXXX") \
-    || die "Unable to create the host tool-root manifest."
-  host_seen_dir="$host_stage_dir/.host-command-seen"
-  mkdir "$host_seen_dir"
-
-  host_node_runtime_root=""
-  if [ -n "$host_node_bin" ]; then
-    host_node_runtime_root=$(dirname -- "$host_node_bin")
-    if [ "$(basename -- "$host_node_runtime_root")" = bin ]; then
-      node_install_prefix=$(dirname -- "$host_node_runtime_root")
-      case "$node_install_prefix" in
-        /) ;;
-        *) host_node_runtime_root="$node_install_prefix" ;;
-      esac
-    fi
-    if path_contains "$host_node_runtime_root" "$host_home_dir"; then
-      host_node_runtime_root=$(dirname -- "$host_node_bin")
-    fi
-    case "$host_node_runtime_root" in
-      ''|/|*:*|*$'\n'*|*$'\r'*|*$'\t'*) host_node_runtime_root="" ;;
-    esac
-    [ -z "$host_node_runtime_root" ] \
-      || printf '%s\n' "$host_node_runtime_root" >> "$host_tool_roots_tmp"
-  fi
-
-  resolve_host_developer_root
-  [ -z "$host_developer_root" ] \
-    || printf '%s\n' "$host_developer_root" >> "$host_tool_roots_tmp"
-
-  for host_path_entry in "${host_path_entries[@]}"; do
-    [ -n "$host_path_entry" ] || continue
-    case "$host_path_entry" in
-      /*) ;;
-      *) continue ;;
-    esac
-    [ -d "$host_path_entry" ] || continue
-    canonical_host_path=$(resolve_absolute_dir "$host_path_entry" || true)
-    [ -n "$canonical_host_path" ] || continue
-    case "$canonical_host_path" in
-      *$'\n'*|*$'\r'*|*$'\t'*) continue ;;
-    esac
-
-    host_tool_root="$canonical_host_path"
-    case "$canonical_host_path/" in
-      "$host_home_dir/.nvm/"*) host_tool_root="$host_home_dir/.nvm" ;;
-      "$host_home_dir/.pyenv/"*) host_tool_root="$host_home_dir/.pyenv" ;;
-      /opt/homebrew/*) host_tool_root=/opt/homebrew ;;
-      /usr/local/*) host_tool_root=/usr/local ;;
-    esac
-    printf '%s\n' "$host_tool_root" >> "$host_tool_roots_tmp"
-
-    for host_candidate in "$canonical_host_path"/*; do
-      [ -e "$host_candidate" ] || [ -L "$host_candidate" ] || continue
-      [ -f "$host_candidate" ] || continue
-      [ -x "$host_candidate" ] || continue
-      host_command_name=$(basename -- "$host_candidate")
-      valid_host_command_name "$host_command_name" || continue
-      [ ! -e "$host_seen_dir/$host_command_name" ] || continue
-      : > "$host_seen_dir/$host_command_name"
-      array_contains_value "$host_command_name" "${host_exec_denied[@]}" \
-        && continue
-      host_command_mode=fallback
-      if array_contains_value "$host_command_name" "${host_exec_first[@]}"; then
-        host_command_mode=first
-      fi
-      host_executable="$host_candidate"
-      if [ "$host_command_name" = node ] && [ -n "$host_node_bin" ]; then
-        candidate_node=$(/bin/realpath "$host_candidate" 2>/dev/null || true)
-        if [ "$candidate_node" = "$host_node_command" ] \
-          || [ "$candidate_node" = "$host_node_bin" ]; then
-          # A version-manager shim was already executed and validated during
-          # bootstrap. Freeze direct host `node` calls to its process.execPath
-          # so the sandbox does not need mutable shim/cache behavior at runtime.
-          host_executable="$host_node_bin"
-        fi
-      fi
-      selected_developer_tool=""
-      case "$host_command_name" in
-        ar|as|c++|cc|clang|clang++|gcc|git|ld|libtool|lipo|make|nm|otool|pip3|python3|ranlib|size|strings|strip|swift|swiftc|xcodebuild)
-          if [ "$host_candidate" = "/usr/bin/$host_command_name" ] \
-            && [ -n "$host_developer_path" ]; then
-            for developer_tool_candidate in \
-              "$host_developer_path/usr/bin/$host_command_name" \
-              "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin/$host_command_name"; do
-              if [ -f "$developer_tool_candidate" ] \
-                && [ -x "$developer_tool_candidate" ]; then
-                selected_developer_tool="$developer_tool_candidate"
-                break
-              fi
-            done
-          fi
-          ;;
-      esac
-      if [ -n "$selected_developer_tool" ]; then
-        case "$selected_developer_tool" in
-          "$host_developer_root"/*)
-            [ -f "$selected_developer_tool" ] \
-              && [ -x "$selected_developer_tool" ] \
-              && host_executable="$selected_developer_tool"
-            ;;
-        esac
-      fi
-      case "$host_executable" in
-        *$'\n'*|*$'\r'*|*$'\t'*) continue ;;
-      esac
-      canonical_host_executable=$(
-        /bin/realpath "$host_executable" 2>/dev/null || true
-      )
-      [ -f "$canonical_host_executable" ] \
-        && [ -x "$canonical_host_executable" ] \
-        || continue
-      executable_in_tool_root=false
-      for executable_root in \
-        "$host_tool_root" \
-        "$host_node_runtime_root" \
-        "$host_developer_root" \
-        /bin /sbin /usr/bin /usr/sbin; do
-        [ -n "$executable_root" ] || continue
-        if path_contains "$executable_root" "$canonical_host_executable"; then
-          executable_in_tool_root=true
-          break
-        fi
-      done
-      # A PATH directory may contain unrelated symlinks into arbitrary trees
-      # (pipx/uv layouts are common). Skip only that basename instead of writing
-      # a manifest entry that would make the broker reject the entire session.
-      [ "$executable_in_tool_root" = true ] || continue
-      printf '%s\t%s\t%s\n' \
-        "$host_command_mode" "$host_command_name" "$canonical_host_executable" \
-        >> "$host_commands_tmp"
-    done
-  done
-
-  rm -rf "$host_seen_dir"
-  mv "$host_commands_tmp" "$host_stage_dir/host-commands.tsv"
-  sort -u "$host_tool_roots_tmp" > "$host_stage_dir/host-tool-roots.txt"
-  rm -f "$host_tool_roots_tmp"
-  chmod 0600 \
-    "$host_stage_dir/host-commands.tsv" \
-    "$host_stage_dir/host-tool-roots.txt"
+  stage_host_exec_catalog \
+    || die "Unable to stage the host tool catalog specification."
 
   host_roots_tmp=$(mktemp "$host_stage_dir/.host-roots.XXXXXX") \
     || die "Unable to create the host-exec root manifest."
@@ -3562,15 +3456,8 @@ if [ "$run_mode" = true ]; then
   mv "$host_roots_tmp" "$host_stage_dir/host-roots.tsv"
   chmod 0600 "$host_stage_dir/host-roots.tsv"
 
-  host_exec_token=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null \
-    | od -An -tx1 | tr -d ' \n')
-  case "$host_exec_token" in
-    [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
-    *) die "Unable to generate a host-exec session token." ;;
-  esac
-  [ "${#host_exec_token}" -eq 64 ] \
-    || die "Unable to generate a complete host-exec session token."
-  atomic_write_line "$host_stage_dir/host-exec-token" "$host_exec_token"
+  stage_host_exec_token \
+    || die "Unable to generate a host-exec session token."
 fi
 
 # Legacy registration is now visible to an uninstaller holding the same

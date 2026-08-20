@@ -233,6 +233,8 @@ reset_case_environment() {
     AGENT_CONTAINER_FORWARD_SSH_AGENT \
     AGENT_CONTAINER_FULL_GIT_CONFIG \
     AGENT_CONTAINER_HOST_BROKER_BIN \
+    AGENT_CONTAINER_HOST_EXEC_DENY \
+    AGENT_CONTAINER_HOST_EXEC_FIRST \
     AGENT_CONTAINER_HOST_GATEWAY \
     AGENT_CONTAINER_HOST_NODE_BIN \
     AGENT_CONTAINER_HOST_TOOLS \
@@ -436,6 +438,14 @@ launch_exec() {
   [ -z "${AGENT_CONTAINER_FD_STOP_PERCENT:-}" ] \
     || launcher_options+=(
       --container-fd-stop-percent "$AGENT_CONTAINER_FD_STOP_PERCENT"
+    )
+  [ -z "${AGENT_CONTAINER_HOST_EXEC_DENY:-}" ] \
+    || launcher_options+=(
+      --container-host-exec-deny "$AGENT_CONTAINER_HOST_EXEC_DENY"
+    )
+  [ -z "${AGENT_CONTAINER_HOST_EXEC_FIRST:-}" ] \
+    || launcher_options+=(
+      --container-host-exec-first "$AGENT_CONTAINER_HOST_EXEC_FIRST"
     )
   if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
     launcher_options+=(
@@ -929,16 +939,15 @@ run_program "$repo_root/bin/grok-container" --version \
   >"$case_dir/out" 2>"$case_dir/err"
 assert_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_ENDPOINT'
 assert_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_TOKEN'
-assert_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_COMMANDS'
-awk -F '\t' '
-  $1 == "first" && $2 == "git" && $3 ~ /^\// { matches += 1 }
-  END { exit matches == 1 ? 0 : 1 }
-' "$case_dir/captured-session/host-commands.tsv" \
-  || fail "the singleton client did not stage exactly one absolute host-first Git command"
-assert_line "$case_dir/captured-session/host-commands.tsv" \
-  "$(printf 'first\tgh\t%s' "$singleton_host_tools_bin/gh")"
-assert_line "$case_dir/captured-session/host-tool-roots.txt" \
-  "$singleton_host_tools_bin"
+assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_COMMANDS'
+# The launcher stages the frozen catalog specification; the broker expands it
+# into the command manifest and serves the guest catalog request itself.
+assert_contains "$case_dir/captured-session/host-catalog.json" \
+  '"first":["git","gh"]'
+assert_contains "$case_dir/captured-session/host-catalog.json" \
+  "\"$singleton_host_tools_bin\""
+assert_contains "$case_dir/captured-session/host-catalog.json" \
+  '"deny":["grok","agent-container","agent-host-exec","host-exec","claude-container","codex-container","grok-container","container","sudo"]'
 assert_line "$case_dir/captured-session/host-roots.tsv" \
   "$(printf 'rw\t%s' "$case_workspace")"
 awk -F '\t' '
@@ -954,8 +963,8 @@ singleton_staged_token=$(sed -n '1p' \
   "$case_dir/captured-session/host-exec-token")
 assert_secret_absent "$case_log" "$singleton_staged_token" host-exec-token
 assert_line "$case_dir/captured-session/mode" 'singleton-client'
-assert_not_contains "$case_dir/err" 'Host git/gh proxying is disabled'
-pass "singleton clients stage host-first git/gh and hand the channel over by name only"
+assert_not_contains "$case_dir/err" 'Host tool proxying is disabled'
+pass "singleton clients stage the full host-tool catalog and hand the channel over by name only"
 
 tests_run=$((tests_run + 1))
 new_case singleton_host_tools_disabled
@@ -966,8 +975,8 @@ run_program "$repo_root/bin/grok-container" --version \
 assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_ENDPOINT'
 assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_TOKEN'
 assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_COMMANDS'
-assert_not_contains "$case_dir/err" 'Host git/gh proxying'
-pass "--no-container-host-tools launches without a host git/gh channel or warning"
+assert_not_contains "$case_dir/err" 'Host tool proxying'
+pass "--no-container-host-tools launches without a host-tool channel or warning"
 
 tests_run=$((tests_run + 1))
 new_case singleton_host_tools_strict_failure
@@ -989,10 +998,55 @@ AGENT_CONTAINER_HOST_TOOLS=
 AGENT_CONTAINER_HOST_NODE_BIN=/nonexistent-agent-container-node
 run_program "$repo_root/bin/grok-container" --version \
   >"$case_dir/out" 2>"$case_dir/err"
-assert_contains "$case_dir/err" 'Host git/gh proxying is disabled'
+assert_contains "$case_dir/err" 'Host tool proxying is disabled'
 assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_ENDPOINT'
 assert_line "$case_log" 'ARG=/usr/local/bin/agent-workspace-session'
-pass "the default host-tools channel degrades to guest git/gh with one warning"
+pass "the default host-tools channel degrades to guest binaries with one warning"
+
+tests_run=$((tests_run + 1))
+new_case singleton_host_exec_policy_options
+TEST_SINGLETON_LAUNCH=true
+policy_capture_broker="$case_dir/capture-host-broker"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'session_dir='
+  printf '%s\n' 'previous='
+  printf '%s\n' 'for argument in "$@"; do'
+  printf '%s\n' '  [ "$previous" != --session-dir ] || session_dir=$argument'
+  printf '%s\n' '  previous=$argument'
+  printf '%s\n' 'done'
+  printf '%s\n' '[ -n "$session_dir" ] || exit 66'
+  printf 'cp -R "$session_dir" %q\n' "$case_dir/captured-session"
+  printf 'exec %q "$@"\n' "$fixture_dir/host-exec-broker"
+} > "$policy_capture_broker"
+chmod 0755 "$policy_capture_broker"
+AGENT_CONTAINER_HOST_BROKER_BIN="$policy_capture_broker"
+AGENT_CONTAINER_HOST_TOOLS=
+AGENT_CONTAINER_HOST_EXEC_DENY=curl,wget
+AGENT_CONTAINER_HOST_EXEC_FIRST=python3,git
+run_program "$repo_root/bin/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_ENDPOINT'
+assert_contains "$case_dir/captured-session/host-catalog.json" \
+  ',"sudo","curl","wget"]'
+# The built-in git/gh host-first defaults absorb duplicate requests.
+assert_contains "$case_dir/captured-session/host-catalog.json" \
+  '"first":["git","gh","python3"]'
+pass "launcher deny/first list options reach the shared host-tool catalog"
+
+tests_run=$((tests_run + 1))
+new_case singleton_host_exec_policy_rejects_unsafe_names
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_HOST_TOOLS=
+AGENT_CONTAINER_HOST_EXEC_DENY='rm -rf'
+if run_program "$repo_root/bin/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "an unsafe --container-host-exec-deny name should fail closed"
+fi
+assert_contains "$case_dir/err" 'unsafe command name'
+assert_no_line "$case_log" 'ARG=create'
+pass "unsafe host-exec policy names fail before any native mutation"
 
 tests_run=$((tests_run + 1))
 new_case generic_run_read_only_share
@@ -1020,22 +1074,14 @@ expected_tail=$(printf 'ARG=%s\n' grok 'two words' '' '*')
 actual_tail=$(command_arguments "$case_log" create | tail -n 4)
 [ "$actual_tail" = "$expected_tail" ] \
   || fail "generic run changed Agent argument boundaries"
-awk -F '\t' '
-  $1 == "first" && $2 == "git" && $3 ~ /^\// { matches += 1 }
-  END { exit matches == 1 ? 0 : 1 }
-' "$case_dir/captured-host-stage/host-commands.tsv" \
-  || {
-    awk -F '\t' '$2 == "git" { print "observed Git manifest: " $0 }' \
-      "$case_dir/captured-host-stage/host-commands.tsv" >&2
-    fail "run mode did not stage exactly one absolute host-first Git command"
-  }
-awk -F '\t' '
-  $1 == "first" && $2 == "gh" && $3 ~ /^\// { matches += 1 }
-  END { exit matches == 1 ? 0 : 1 }
-' "$case_dir/captured-host-stage/host-commands.tsv" \
-  || fail "run mode did not stage the available host gh as host-first"
-assert_line "$case_dir/captured-host-stage/host-commands.tsv" \
-  "$(printf 'first\tgh\t%s' "$run_host_gh_bin/gh")"
+# Run mode stages the same frozen catalog specification as singleton clients;
+# the broker owns manifest expansion for both launch modes.
+assert_contains "$case_dir/captured-host-stage/host-catalog.json" \
+  '"first":["git","gh"]'
+assert_contains "$case_dir/captured-host-stage/host-catalog.json" \
+  "\"$run_host_gh_bin\""
+assert_contains "$case_dir/captured-host-stage/host-catalog.json" \
+  '"deny":["grok","agent-container","agent-host-exec","host-exec","claude-container","codex-container","grok-container","container","sudo"]'
 assert_contains "$repo_root/runtime/entrypoint.sh" \
   'runtime_path="$host_first_dir:$runtime_path:$host_fallback_dir"'
 assert_contains "$repo_root/runtime/entrypoint.sh" 'PATH="$runtime_path"'
@@ -1052,7 +1098,7 @@ assert_line "$case_dir/captured-host-stage/fake-host-broker-args" \
   'ARG=--sandbox-bin'
 assert_line "$case_dir/captured-host-stage/fake-host-broker-args" \
   'ARG=/usr/bin/sandbox-exec'
-pass "generic run stages host-first Git and one read-only extra share"
+pass "generic run stages the shared host-tool catalog and one read-only extra share"
 
 tests_run=$((tests_run + 1))
 new_case unsafe_host_node_bootstrap
@@ -1093,13 +1139,12 @@ if ! run_program "$repo_root/bin/agent-container" run grok -- --version \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "a cross-root PATH symlink poisoned run startup: $(sed -n '1p' "$case_dir/err")"
 fi
-if awk -F '\t' '$2 == "poison-tool" { found = 1 } END { exit !found }' \
-  "$case_dir/captured-host-stage/host-commands.tsv"; then
-  fail "a cross-root executable symlink entered the host command manifest"
-fi
-assert_line "$case_dir/captured-host-stage/host-commands.tsv" \
-  "$(printf 'fallback\tsafe-tool\t%s' "$poison_bin/safe-tool")"
-pass "run skips cross-root executable symlinks without poisoning the session"
+# The launcher freezes only the directory list; the broker's catalog builder
+# owns the cross-root symlink skip, which tests/test-host-exec.sh proves
+# against the real Node.js broker.
+assert_contains "$case_dir/captured-host-stage/host-catalog.json" \
+  "\"$poison_bin\""
+pass "run freezes PATH directories and defers command selection to the broker"
 
 tests_run=$((tests_run + 1))
 new_case wrapper_run_read_write_share
@@ -1132,10 +1177,10 @@ if ! run_program "$repo_root/bin/agent-container" run codex \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "run with guest Git override failed: $(sed -n '1p' "$case_dir/err")"
 fi
-if awk -F '\t' '$2 == "git" { found = 1 } END { exit !found }' \
-  "$case_dir/captured-host-stage/host-commands.tsv"; then
-  fail "--no-host-exec git left Git in the host command manifest"
-fi
+assert_contains "$case_dir/captured-host-stage/host-catalog.json" \
+  ',"sudo","git"]'
+assert_contains "$case_dir/captured-host-stage/host-catalog.json" \
+  '"first":["gh"]'
 expected_tail=$(printf 'ARG=%s\n' codex --version)
 actual_tail=$(command_arguments "$case_log" create | tail -n 2)
 [ "$actual_tail" = "$expected_tail" ] \
