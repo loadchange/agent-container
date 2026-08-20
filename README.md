@@ -201,9 +201,13 @@ ad-hoc signed, and byte-compared before it is staged.
 
 | Profile | Command | Official native installer | Publisher channel | Status |
 |---|---|---|---|---|
-| `claude` | `claude-container` | `https://claude.ai/install.sh` | Claude `latest` | preview |
+| `claude` | `claude-container` | `https://downloads.claude.ai/claude-code-releases/bootstrap.sh` | Claude `latest` | preview |
 | `codex` | `codex-container` | `https://chatgpt.com/codex/install.sh` | Codex `latest` | preview |
 | `grok` | `grok-container` | `https://x.ai/cli/install.sh` | Grok `stable` | preview |
+
+Claude uses the publisher's direct bootstrap object rather than its redirecting
+`claude.ai/install.sh` alias. This keeps image bootstrap independent of host
+aliases or enterprise DNS policy applied to the Claude web application.
 
 All three profiles are enabled normally; Grok needs no special opt-in. The host
 resolves a floating publisher channel to one exact version before deciding

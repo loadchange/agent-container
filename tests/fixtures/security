@@ -19,7 +19,7 @@ if [ "${FAKE_SECURITY_FAIL:-false}" = true ]; then
 fi
 
 case "$url" in
-  https://claude.ai/install.sh|https://chatgpt.com/codex/install.sh|https://x.ai/cli/install.sh|https://example.test/install.sh)
+  https://downloads.claude.ai/claude-code-releases/bootstrap.sh|https://chatgpt.com/codex/install.sh|https://x.ai/cli/install.sh|https://example.test/install.sh)
     body=${FAKE_SECURITY_INSTALLER_ANCHOR_BODY:-SU5TVEFMTEVSLUFOQ0hPUg==}
     ;;
   https://downloads.claude.ai/claude-code-releases/latest|https://releases.openai.com/codex/channels/latest|https://x.ai/cli/stable|https://example.test/latest)

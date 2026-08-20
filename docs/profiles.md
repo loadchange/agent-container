@@ -15,9 +15,14 @@ agent-container profiles
 
 | ID | Agent | Status | Official installer | Version channel | Final image payload |
 |---|---|---|---|---|---|
-| `claude` | Claude Code | preview | `https://claude.ai/install.sh` | `https://downloads.claude.ai/claude-code-releases/latest` | one ELF |
+| `claude` | Claude Code | preview | `https://downloads.claude.ai/claude-code-releases/bootstrap.sh` | `https://downloads.claude.ai/claude-code-releases/latest` | one ELF |
 | `codex` | Codex CLI | preview | `https://chatgpt.com/codex/install.sh` | `https://releases.openai.com/codex/channels/latest` | standalone tree |
 | `grok` | Grok CLI | preview | `https://x.ai/cli/install.sh` | `https://x.ai/cli/stable` | one ELF |
+
+The Claude profile names Anthropic's direct bootstrap object instead of the
+redirecting `claude.ai/install.sh` alias. Builder TLS and DNS therefore do not
+depend on host policy for the Claude web application before reaching the same
+publisher download endpoint.
 
 All three are ordinary built-in profiles. Every normal invocation reuses one
 container per profile and host UID; no profile supplies its own resident Agent

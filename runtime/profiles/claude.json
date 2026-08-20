@@ -4,7 +4,7 @@
   "displayName": "Claude Code",
   "status": "preview",
   "installerKind": "native-script",
-  "installerUrl": "https://claude.ai/install.sh",
+  "installerUrl": "https://downloads.claude.ai/claude-code-releases/bootstrap.sh",
   "installerShell": "bash",
   "installerVersionUrl": "https://downloads.claude.ai/claude-code-releases/latest",
   "installerVersionFormat": "plain-semver",
