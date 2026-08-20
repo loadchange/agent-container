@@ -709,8 +709,8 @@ path/image ownership cannot be proved.
 
 ```text
 bin/        source-tree command shims (installed releases use direct symlinks)
-runtime/    release payload: runtime script, Containerfile, broker, guest helpers
-profiles/   per-agent build recipes (claude, codex, grok)
+runtime/    complete release payload: runtime script, Containerfile, broker,
+            guest helpers, and per-agent profiles (claude, codex, grok)
 src/        Rust launcher and workspace broker
 scripts/    reproducible release build, manifest and formula generation
 Formula/    Homebrew formula (this repository is its own tap)

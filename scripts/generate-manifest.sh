@@ -27,9 +27,9 @@ readonly RELEASE_ASSET_SOURCES=(
   "host-exec-broker.mjs:runtime/host-exec-broker.mjs"
   "agent-workspace-connect:runtime/agent-workspace-connect"
   "agent-workspace-session:runtime/agent-workspace-session"
-  "profiles/claude.json:profiles/claude.json"
-  "profiles/codex.json:profiles/codex.json"
-  "profiles/grok.json:profiles/grok.json"
+  "profiles/claude.json:runtime/profiles/claude.json"
+  "profiles/codex.json:runtime/profiles/codex.json"
+  "profiles/grok.json:runtime/profiles/grok.json"
 )
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)

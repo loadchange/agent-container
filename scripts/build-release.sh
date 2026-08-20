@@ -120,7 +120,7 @@ install -m 0644 "$repo_root/runtime/Containerfile.dockerignore" \
 install -m 0644 "$repo_root/runtime/host-exec-broker.mjs" \
   "$dist_dir/host-exec-broker.mjs"
 for profile_id in claude codex grok; do
-  install -m 0644 "$repo_root/profiles/$profile_id.json" \
+  install -m 0644 "$repo_root/runtime/profiles/$profile_id.json" \
     "$dist_dir/profiles/$profile_id.json"
 done
 

@@ -337,7 +337,7 @@ copy_case_assets() {
     "$repo_root/runtime/agent-workspace-connect" \
     "$repo_root/runtime/agent-workspace-session" \
     "$case_asset_dir/"
-  cp "$repo_root"/profiles/*.json "$case_asset_dir/profiles/"
+  cp "$repo_root"/runtime/profiles/*.json "$case_asset_dir/profiles/"
 }
 
 launch_exec() {
@@ -683,7 +683,7 @@ pass "malformed profile JSON fails closed"
 tests_run=$((tests_run + 1))
 new_case unsupported_schema
 copy_case_assets
-sed 's/"schema": 2/"schema": 3/' "$repo_root/profiles/claude.json" \
+sed 's/"schema": 2/"schema": 3/' "$repo_root/runtime/profiles/claude.json" \
   > "$case_asset_dir/profiles/schema.json"
 sed 's/"id": "claude"/"id": "schema"/' \
   "$case_asset_dir/profiles/schema.json" > "$case_dir/schema-fixed-id.json"
@@ -699,7 +699,7 @@ pass "profile schema versions are enforced"
 tests_run=$((tests_run + 1))
 new_case mismatched_profile_id
 copy_case_assets
-cp "$repo_root/profiles/claude.json" "$case_asset_dir/profiles/alias.json"
+cp "$repo_root/runtime/profiles/claude.json" "$case_asset_dir/profiles/alias.json"
 if run_program "$repo_root/bin/agent-container" alias \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "profile id/filename mismatch should be rejected"
@@ -748,7 +748,7 @@ copy_case_assets
 sed \
   -e 's/"id": "claude"/"id": "unsafe-api"/' \
   -e 's/"apiKeyEnv": "ANTHROPIC_API_KEY"/"apiKeyEnv": "SSH_AUTH_SOCK"/' \
-  "$repo_root/profiles/claude.json" \
+  "$repo_root/runtime/profiles/claude.json" \
   > "$case_asset_dir/profiles/unsafe-api.json"
 if run_program "$repo_root/bin/agent-container" unsafe-api --version \
   >"$case_dir/api.out" 2>"$case_dir/api.err"; then
@@ -759,7 +759,7 @@ assert_contains "$case_dir/api.err" "unsafe apiKeyEnv"
 sed \
   -e 's/"id": "claude"/"id": "unsafe-update"/' \
   -e 's/"disableAutoUpdateEnv": "DISABLE_AUTOUPDATER"/"disableAutoUpdateEnv": "PATH"/' \
-  "$repo_root/profiles/claude.json" \
+  "$repo_root/runtime/profiles/claude.json" \
   > "$case_asset_dir/profiles/unsafe-update.json"
 if run_program "$repo_root/bin/agent-container" unsafe-update --version \
   >"$case_dir/update.out" 2>"$case_dir/update.err"; then
@@ -770,7 +770,7 @@ assert_contains "$case_dir/update.err" "unsafe disableAutoUpdateEnv"
 sed \
   -e 's/"id": "claude"/"id": "unsafe-installer"/' \
   -e 's/"installerVersionEnv": ""/"installerVersionEnv": "HOME"/' \
-  "$repo_root/profiles/claude.json" \
+  "$repo_root/runtime/profiles/claude.json" \
   > "$case_asset_dir/profiles/unsafe-installer.json"
 if run_program "$repo_root/bin/agent-container" unsafe-installer --version \
   >"$case_dir/installer.out" 2>"$case_dir/installer.err"; then
@@ -782,7 +782,7 @@ sed \
   -e 's/"id": "claude"/"id": "unsafe-reuse"/' \
   -e 's/"apiKeyEnv": "ANTHROPIC_API_KEY"/"apiKeyEnv": "PROFILE_SETTING"/' \
   -e 's/"disableAutoUpdateEnv": "DISABLE_AUTOUPDATER"/"disableAutoUpdateEnv": "PROFILE_SETTING"/' \
-  "$repo_root/profiles/claude.json" \
+  "$repo_root/runtime/profiles/claude.json" \
   > "$case_asset_dir/profiles/unsafe-reuse.json"
 if run_program "$repo_root/bin/agent-container" unsafe-reuse --version \
   >"$case_dir/reuse.out" 2>"$case_dir/reuse.err"; then
@@ -794,7 +794,7 @@ assert_contains "$case_dir/reuse.err" \
 sed \
   -e 's/"id": "claude"/"id": "dynamic-update"/' \
   -e 's/"disableAutoUpdateEnv": "DISABLE_AUTOUPDATER"/"disableAutoUpdateEnv": "PROFILE_UPDATE"/' \
-  "$repo_root/profiles/claude.json" \
+  "$repo_root/runtime/profiles/claude.json" \
   > "$case_asset_dir/profiles/dynamic-update.json"
 AGENT_CONTAINER_FORWARD_ENV=PROFILE_UPDATE
 if run_program "$repo_root/bin/agent-container" dynamic-update --version \
