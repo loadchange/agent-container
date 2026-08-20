@@ -2872,6 +2872,12 @@ chmod 0755 \
   "$slow_release/agent-container-runtime" \
   "$slow_release/agent-container-darwin-arm64" \
   "$slow_test_bin/sleep"
+# Installed releases resolve the physical workspace launcher from the asset
+# directory, which the installer always stages alongside the runtime. Model
+# that layout so the delayed fake is the launcher this case dispatches.
+cp "$slow_release/agent-container-darwin-arm64" \
+  "$case_asset_dir/agent-container-darwin-arm64"
+chmod 0755 "$case_asset_dir/agent-container-darwin-arm64"
 TEST_RUNNER_PATH="$slow_test_bin:$fixture_dir:/usr/bin:/bin"
 
 run_program "$slow_release/agent-container" grok delayed-broker-client \
