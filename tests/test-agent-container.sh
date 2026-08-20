@@ -1001,6 +1001,15 @@ AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
 FAKE_CAPTURE_HOST_STAGE_DIR="$case_dir/captured-host-stage"
 read_only_share="$case_dir/read only sibling"
 mkdir "$read_only_share"
+# Whether the ambient machine provides gh (and where) varies between CI
+# runners and developer hosts, while the program under test only sees the
+# controlled PATH below. Stage a private host gh on that PATH so host-first
+# staging is proven identically everywhere.
+run_host_gh_bin="$case_dir/host-gh-bin"
+mkdir "$run_host_gh_bin"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$run_host_gh_bin/gh"
+chmod 0755 "$run_host_gh_bin/gh"
+TEST_RUNNER_PATH="$run_host_gh_bin:$fixture_dir:/usr/bin:/bin"
 if ! run_program "$repo_root/bin/agent-container" run grok \
   --share-ro "$read_only_share" -- "two words" "" '*' \
   >"$case_dir/out" 2>"$case_dir/err"; then
@@ -1020,13 +1029,13 @@ awk -F '\t' '
       "$case_dir/captured-host-stage/host-commands.tsv" >&2
     fail "run mode did not stage exactly one absolute host-first Git command"
   }
-if command -v gh >/dev/null 2>&1; then
-  awk -F '\t' '
-    $1 == "first" && $2 == "gh" && $3 ~ /^\// { matches += 1 }
-    END { exit matches == 1 ? 0 : 1 }
-  ' "$case_dir/captured-host-stage/host-commands.tsv" \
-    || fail "run mode did not stage the available host gh as host-first"
-fi
+awk -F '\t' '
+  $1 == "first" && $2 == "gh" && $3 ~ /^\// { matches += 1 }
+  END { exit matches == 1 ? 0 : 1 }
+' "$case_dir/captured-host-stage/host-commands.tsv" \
+  || fail "run mode did not stage the available host gh as host-first"
+assert_line "$case_dir/captured-host-stage/host-commands.tsv" \
+  "$(printf 'first\tgh\t%s' "$run_host_gh_bin/gh")"
 assert_contains "$repo_root/runtime/entrypoint.sh" \
   'runtime_path="$host_first_dir:$runtime_path:$host_fallback_dir"'
 assert_contains "$repo_root/runtime/entrypoint.sh" 'PATH="$runtime_path"'
