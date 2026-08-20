@@ -614,10 +614,13 @@ async function buildCatalogManifests(sessionDir, realHome, execHome, roots, spec
         continue;
       }
       if (seenNames.has(entryName)) continue;
-      seenNames.add(entryName);
       if (specification.deny.has(entryName)) continue;
       const candidate = path.join(canonicalDirectory, entryName);
+      // Claim the name only once this occurrence is a usable executable, like
+      // normal PATH lookup and the retired shell walk: a plain file earlier in
+      // PATH must not suppress a real command of the same name later in PATH.
       if (!(await usableExecutableFile(candidate))) continue;
+      seenNames.add(entryName);
 
       let executable = candidate;
       if (entryName === 'node' && specification.nodeExecPath) {

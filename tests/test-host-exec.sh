@@ -708,9 +708,18 @@ wait "$broker_pid" 2>/dev/null || true
 broker_pid=''
 
 catalog_session_dir="$test_root/catalog-session"
+catalog_shadow_bin="$test_root/catalog-shadow-bin"
 catalog_tool_bin="$test_root/catalog-tool-bin"
 catalog_poison_target="$test_root/catalog-poison-target"
-mkdir -m 0700 "$catalog_session_dir" "$catalog_tool_bin" "$catalog_poison_target"
+mkdir -m 0700 \
+  "$catalog_session_dir" \
+  "$catalog_shadow_bin" \
+  "$catalog_tool_bin" \
+  "$catalog_poison_target"
+# A non-executable file earlier in PATH must not claim a command name away
+# from a real executable later in PATH; normal PATH lookup skips it.
+printf '%s\n' 'not a program' > "$catalog_shadow_bin/uv"
+chmod 0644 "$catalog_shadow_bin/uv"
 printf '%s\n' '#!/bin/sh' 'printf "uv-from-host %s\n" "${1:-}"' \
   > "$catalog_tool_bin/uv"
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$catalog_tool_bin/gh"
@@ -723,8 +732,8 @@ chmod 0755 \
   "$catalog_poison_target/poison-tool"
 ln -s "$catalog_poison_target/poison-tool" "$catalog_tool_bin/poison-tool"
 ln -s "$node_executable" "$catalog_tool_bin/node"
-printf '{"v":1,"pathDirectories":["%s"],"deny":["denied-tool","sudo"],"first":["gh"],"nodeCommand":"%s","nodeExecPath":"%s","developerPath":null,"developerRoot":null}\n' \
-  "$catalog_tool_bin" "$node_executable" "$node_executable" \
+printf '{"v":1,"pathDirectories":["%s","%s"],"deny":["denied-tool","sudo"],"first":["gh"],"nodeCommand":"%s","nodeExecPath":"%s","developerPath":null,"developerRoot":null}\n' \
+  "$catalog_shadow_bin" "$catalog_tool_bin" "$node_executable" "$node_executable" \
   > "$catalog_session_dir/host-catalog.json"
 printf 'rw\t%s\n' "$workspace" > "$catalog_session_dir/host-roots.tsv"
 printf '%s\n' "$token" > "$catalog_session_dir/host-exec-token"
@@ -760,7 +769,10 @@ generated_manifest="$catalog_session_dir/host-commands.tsv"
   || fail 'the catalog builder did not generate host-commands.tsv'
 grep -Fxq "$(printf 'fallback\tuv\t%s' "$catalog_tool_bin/uv")" \
   "$generated_manifest" \
-  || fail 'the generated catalog is missing the fallback uv command'
+  || fail 'a non-executable earlier PATH entry suppressed the fallback uv command'
+if grep -Fq "$catalog_shadow_bin" "$generated_manifest"; then
+  fail 'a non-executable PATH entry entered the generated catalog'
+fi
 grep -Fxq "$(printf 'first\tgh\t%s' "$catalog_tool_bin/gh")" \
   "$generated_manifest" \
   || fail 'the generated catalog did not honor the host-first policy for gh'
