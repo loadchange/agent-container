@@ -19,8 +19,10 @@ The normal path has these invariants:
 - each invocation starts a new Agent process through `container exec`;
 - every invocation keeps its own cwd, TTY or pipes, signals, and exit status;
 - only that invocation's current Git root is dynamically mounted;
-- guest `git` and `gh` default to sandboxed host executables through a
-  per-client host-tool broker (`--no-container-host-tools` opts out);
+- the guest PATH mirrors the host command catalog through a per-client
+  host-tool broker: `git` and `gh` default to host-first sandboxed host
+  executables, and commands the guest image does not provide fall back to
+  sandboxed host executables (`--no-container-host-tools` opts out);
 - no real host HOME or predeclared multi-project root set is mounted;
 - clients of one profile share the VM and isolated profile HOME.
 
@@ -219,27 +221,41 @@ SFTP mount and is rejected before broker startup. The advanced `run` path can
 use separate Apple volume mounts for that case. Ordinary repositories and
 switching among unrelated roots require no configuration.
 
-## Host tool broker (git and gh)
+## Host tool broker
 
 Alongside the workspace broker, each client starts one host-tool broker by
-default: the authenticated Node.js broker shared with legacy `run`, loaded
-with a fixed manifest of exactly `git` and `gh`. The launcher resolves each
-command to a canonical host executable (freezing the `/usr/bin` developer
-shims to the selected Xcode/CommandLineTools installation), declares the
-canonical workspace as the only writable execution root, stages a fresh
-256-bit token, and binds the broker to its own PID so the channel ends with
-the client.
+default: the authenticated Node.js broker shared with legacy `run`. Both
+launch modes use one catalog implementation. The launcher freezes the ordered
+host `PATH` directories, the deny/first policy, and the resolved Node.js and
+Xcode/CommandLineTools executables into a catalog specification
+(`host-catalog.json`), declares the canonical workspace as the only writable
+execution root, stages a fresh 256-bit token, and binds the broker to its own
+PID so the channel ends with the client. The broker expands the specification
+into the validated command manifest in-process — canonicalizing every
+executable, freezing `/usr/bin` developer shims to the selected developer
+installation, skipping symlinks whose targets leave every declared tool root,
+and excluding Agent-writable paths — instead of a per-candidate fork/exec
+walk in the shell launcher.
 
-The endpoint, token, and staged command list travel to the guest as
-`AGENT_WORKSPACE_HOST_EXEC_*` values on the same private environment path as
-the workspace transport. The root session helper writes them into the client's
-private runtime directory, creates per-session `git`/`gh` shims ahead of the
-Agent `PATH`, and points the guest client at that directory through
-`AGENT_HOST_EXEC_DIR`. Proxied `git` and `gh` run on macOS with the real HOME,
-so pushes and GitHub calls use host credential helpers and logins while the
-generated sandbox confines writes to the workspace. Host `git` also operates
-on the real project directory, avoiding SFTP round-trips for metadata-heavy
-Git work.
+The endpoint and token travel to the guest as `AGENT_WORKSPACE_HOST_EXEC_*`
+values on the same private environment path as the workspace transport. The
+root session helper writes them into the client's private runtime directory,
+retrieves the command catalog from the authenticated broker, and builds two
+shim directories of tiny wrapper scripts: host-first names (`git`, `gh`, and
+any `--container-host-exec-first` additions) ahead of the Agent `PATH`, and
+every other cataloged name behind it, so a host command runs exactly when the
+verified guest image does not provide that name. `AGENT_HOST_EXEC_DIR` points
+the guest client at the per-session credentials.
+
+Proxied `git` and `gh` run on macOS with the real HOME, so pushes and GitHub
+calls use host credential helpers and logins; every other proxied command
+receives the isolated broker execution HOME, keeping host dotfiles and stored
+credentials out of generic tools while their caches persist per profile. The
+generated sandbox confines writes to the workspace and that execution HOME.
+Host tools operate on the real project directory, avoiding SFTP round-trips
+for metadata- and I/O-heavy work entirely; the per-invocation broker channel
+adds roughly 0.2 s of startup latency, has no PTY, and leaves host-side
+processes and listening ports on macOS rather than in the guest.
 
 When the broker runtime is unavailable — most commonly a Mac without Node.js —
 the default launch warns once and continues with guest binaries; an explicit
@@ -418,18 +434,16 @@ agent-container [launcher options] run <profile> [run options...] [-- Agent args
 ```
 
 It creates an attached auto-remove VM, mounts the workspace and optional
-read-only/read-write shares through Apple volumes, and may expose selected
-native host commands through the Node.js host-exec broker. Command paths and
-tool roots are frozen into manifests; the guest uses shims to prefer guest
-binaries except for explicitly host-first commands such as Git and gh. Unlike
-the default two-command host-tool channel, this broker catalogs every eligible
-host `PATH` command. It authenticates requests and confines native process
-groups with a generated macOS sandbox.
+read-only/read-write shares through Apple volumes, and exposes native host
+commands through the same host-exec broker and catalog implementation as the
+default path; the guest builds its shims from the broker-generated manifest at
+container start instead of a catalog request. Guest binaries are preferred
+except for explicitly host-first commands such as Git and gh.
 
-This boundary is broader than the default workspace-only SFTP broker: it can
-execute native code as the macOS user and uses VirtioFS for user trees. It
-exists for linked worktrees, extra shares, and host-tool compatibility, and
-requires stopping that profile's singleton first.
+This boundary differs from the default path in transport, not in command
+surface: it uses VirtioFS for user trees and per-launch container lifecycle.
+It exists for linked worktrees and extra shares, and requires stopping that
+profile's singleton first.
 
 ## Network boundary
 

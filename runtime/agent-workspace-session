@@ -144,18 +144,19 @@ unset AGENT_WORKSPACE_ENDPOINT AGENT_WORKSPACE_TOKEN
 [[ "$workspace_token" =~ ^[0-9a-f]{64}$ ]] \
   || fail 'AGENT_WORKSPACE_TOKEN must contain exactly 64 lowercase hexadecimal characters.'
 
-# The optional host git/gh channel arrives on the same private environment
-# path as the workspace transport. All three fields must agree; a partial
-# handoff is treated as corruption rather than silently ignored.
+# The optional host-tool channel arrives on the same private environment
+# path as the workspace transport. Both fields must agree; a partial handoff
+# is treated as corruption rather than silently ignored. The command catalog
+# itself is retrieved from the authenticated broker rather than trusted from
+# an environment value.
 host_exec_endpoint="${AGENT_WORKSPACE_HOST_EXEC_ENDPOINT:-}"
 host_exec_token="${AGENT_WORKSPACE_HOST_EXEC_TOKEN:-}"
-host_exec_commands="${AGENT_WORKSPACE_HOST_EXEC_COMMANDS:-}"
 unset AGENT_WORKSPACE_HOST_EXEC_ENDPOINT \
-  AGENT_WORKSPACE_HOST_EXEC_TOKEN \
-  AGENT_WORKSPACE_HOST_EXEC_COMMANDS
+  AGENT_WORKSPACE_HOST_EXEC_TOKEN
 host_exec_requested=false
-host_exec_command_list=()
-if [ -n "$host_exec_endpoint$host_exec_token$host_exec_commands" ]; then
+host_exec_host=""
+host_exec_port=""
+if [ -n "$host_exec_endpoint$host_exec_token" ]; then
   host_exec_requested=true
   case "$host_exec_endpoint" in
     ''|*$'\n'*|*$'\r'*|*$'\t'*|*:*:*)
@@ -168,27 +169,22 @@ if [ -n "$host_exec_endpoint$host_exec_token$host_exec_commands" ]; then
     [0-9]*.*.*.*:[1-9]*) ;;
     *) fail 'AGENT_WORKSPACE_HOST_EXEC_ENDPOINT must be one IPv4:port endpoint.' ;;
   esac
-  [[ "$host_exec_token" =~ ^[0-9a-f]{64}$ ]] \
-    || fail 'AGENT_WORKSPACE_HOST_EXEC_TOKEN must contain exactly 64 lowercase hexadecimal characters.'
-  case "$host_exec_commands" in
-    ''|,*|*,|*,,*)
-      fail 'AGENT_WORKSPACE_HOST_EXEC_COMMANDS must be a comma-separated command list.'
+  host_exec_host=${host_exec_endpoint%:*}
+  host_exec_port=${host_exec_endpoint##*:}
+  case "$host_exec_host" in
+    *[!0-9.]*|''|.*|*..*|*.)
+      fail 'AGENT_WORKSPACE_HOST_EXEC_ENDPOINT host is not IPv4.'
       ;;
   esac
-  IFS=, read -r -a host_exec_command_list <<EOF
-$host_exec_commands
-EOF
-  [ "${#host_exec_command_list[@]}" -le 16 ] \
-    || fail 'AGENT_WORKSPACE_HOST_EXEC_COMMANDS lists too many commands.'
-  for host_exec_command in "${host_exec_command_list[@]}"; do
-    case "$host_exec_command" in
-      ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._+-]*)
-        fail 'AGENT_WORKSPACE_HOST_EXEC_COMMANDS contains an unsafe command name.'
-        ;;
-    esac
-    [ "${#host_exec_command}" -le 64 ] \
-      || fail 'AGENT_WORKSPACE_HOST_EXEC_COMMANDS contains an oversized command name.'
-  done
+  case "$host_exec_port" in
+    *[!0-9]*|'')
+      fail 'AGENT_WORKSPACE_HOST_EXEC_ENDPOINT port is not decimal.'
+      ;;
+  esac
+  [ "$host_exec_port" -ge 1 ] && [ "$host_exec_port" -le 65535 ] \
+    || fail 'AGENT_WORKSPACE_HOST_EXEC_ENDPOINT port is outside 1..65535.'
+  [[ "$host_exec_token" =~ ^[0-9a-f]{64}$ ]] \
+    || fail 'AGENT_WORKSPACE_HOST_EXEC_TOKEN must contain exactly 64 lowercase hexadecimal characters.'
 fi
 
 for required_path in \
@@ -518,12 +514,23 @@ esac
     = "$runtime_uid:$runtime_gid:700" ] \
   || fail 'the private session runtime directory has unsafe ownership or mode.'
 
-# Host git/gh shims and their session credentials live inside the private
+# Host-tool shims and their session credentials live inside the private
 # per-session runtime directory: the Agent owns and may read them, other
 # sessions never observe them, and normal session cleanup removes them.
+# The complete command catalog comes from the authenticated broker. Commands
+# the broker marks `first` shadow the guest copies from the front of PATH;
+# `fallback` commands sit behind every guest directory so a host command is
+# used exactly when the verified guest image does not provide it. Shims are
+# tiny root-owned wrapper scripts written by shell builtins: one chmod per
+# directory replaces thousands of per-command symlink processes.
 host_exec_state_dir=
-host_exec_shim_dir=
+host_exec_first_dir=
+host_exec_fallback_dir=
 if [ "$host_exec_requested" = true ]; then
+  for host_exec_tool in /usr/bin/head /usr/bin/jq /usr/bin/timeout; do
+    [ -x "$host_exec_tool" ] \
+      || fail "required host-tool catalog component is absent: $host_exec_tool"
+  done
   host_exec_state_dir="$session_runtime_dir/host-exec"
   /usr/bin/install -d -o "$runtime_uid" -g "$runtime_gid" -m 0700 \
     -- "$host_exec_state_dir" \
@@ -539,20 +546,83 @@ if [ "$host_exec_requested" = true ]; then
     "$host_exec_state_dir/host-exec-endpoint" \
     "$host_exec_state_dir/host-exec-token" \
     || fail 'cannot assign the host-exec session credentials.'
-  host_exec_shim_dir="$session_runtime_dir/host-bin"
-  /usr/bin/install -d -o "$runtime_uid" -g "$runtime_gid" -m 0700 \
-    -- "$host_exec_shim_dir" \
-    || fail 'cannot create the host-exec shim directory.'
-  for host_exec_command in "${host_exec_command_list[@]}"; do
-    /bin/ln -s /usr/local/bin/agent-host-exec \
-      "$host_exec_shim_dir/$host_exec_command" \
-      || fail 'cannot create a host-exec command shim.'
-  done
+
+  if ! exec {host_exec_catalog_fd}<>"/dev/tcp/$host_exec_host/$host_exec_port"; then
+    fail 'cannot connect to the host-tool broker for the command catalog.'
+  fi
+  printf '{"v":1,"type":"catalog","token":"%s"}\n' "$host_exec_token" \
+    >&"$host_exec_catalog_fd" \
+    || fail 'cannot request the host-tool command catalog.'
+  host_exec_catalog_response=$(/usr/bin/timeout 15 /usr/bin/head -c 4194304 \
+    <&"$host_exec_catalog_fd") \
+    || fail 'the host-tool broker did not return the command catalog.'
+  exec {host_exec_catalog_fd}<&-
+  [ -n "$host_exec_catalog_response" ] \
+    || fail 'the host-tool broker returned an empty command catalog.'
+  host_exec_catalog_tsv=$(printf '%s\n' "$host_exec_catalog_response" \
+    | /usr/bin/jq -er '
+      if (type == "object")
+        and (.type == "catalog")
+        and ((.commands | type) == "array")
+        and ((.commands | length) >= 1)
+        and ((.commands | length) <= 8192)
+        and (all(.commands[];
+          (type == "object")
+          and ((.mode == "first") or (.mode == "fallback"))
+          and ((.name | type) == "string")))
+      then .commands[] | "\(.mode)\t\(.name)"
+      else error("invalid catalog")
+      end') \
+    || fail 'the host-tool broker returned an invalid command catalog.'
+
+  host_exec_first_dir="$session_runtime_dir/host-first-bin"
+  host_exec_fallback_dir="$session_runtime_dir/host-fallback-bin"
+  /usr/bin/install -d -o 0 -g 0 -m 0755 \
+    -- "$host_exec_first_dir" "$host_exec_fallback_dir" \
+    || fail 'cannot create the host-tool shim directories.'
+  host_exec_first_count=0
+  host_exec_fallback_count=0
+  while IFS=$'\t' read -r host_exec_mode host_exec_command; do
+    case "$host_exec_command" in
+      ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._+-]*)
+        fail 'the host-tool catalog contains an unsafe command name.'
+        ;;
+    esac
+    [ "${#host_exec_command}" -le 64 ] \
+      || fail 'the host-tool catalog contains an oversized command name.'
+    case "$host_exec_mode" in
+      first) host_exec_shim_dir="$host_exec_first_dir" ;;
+      fallback) host_exec_shim_dir="$host_exec_fallback_dir" ;;
+      *) fail 'the host-tool catalog contains an invalid command mode.' ;;
+    esac
+    if [ -e "$host_exec_first_dir/$host_exec_command" ] \
+      || [ -e "$host_exec_fallback_dir/$host_exec_command" ]; then
+      fail 'the host-tool catalog contains a duplicate command name.'
+    fi
+    printf '%s\n' '#!/bin/bash' \
+      'exec /usr/local/bin/agent-host-exec "${0##*/}" "$@"' \
+      > "$host_exec_shim_dir/$host_exec_command" \
+      || fail 'cannot create a host-tool command shim.'
+    if [ "$host_exec_mode" = first ]; then
+      host_exec_first_count=$((host_exec_first_count + 1))
+    else
+      host_exec_fallback_count=$((host_exec_fallback_count + 1))
+    fi
+  done <<EOF
+$host_exec_catalog_tsv
+EOF
+  [ "$host_exec_first_count" -eq 0 ] \
+    || /bin/chmod 0755 -- "$host_exec_first_dir"/* \
+    || fail 'cannot publish the host-first command shims.'
+  [ "$host_exec_fallback_count" -eq 0 ] \
+    || /bin/chmod 0755 -- "$host_exec_fallback_dir"/* \
+    || fail 'cannot publish the host-fallback command shims.'
+  host_exec_catalog_response=
+  host_exec_catalog_tsv=
 fi
 host_exec_endpoint=
 host_exec_token=
-host_exec_commands=
-unset host_exec_endpoint host_exec_token host_exec_commands
+unset host_exec_endpoint host_exec_token
 
 agent_environment=(
   HOME="$runtime_home"
@@ -560,9 +630,9 @@ agent_environment=(
   LOGNAME="$runtime_user"
   XDG_RUNTIME_DIR="$session_runtime_dir"
 )
-if [ -n "$host_exec_shim_dir" ]; then
+if [ -n "$host_exec_first_dir" ]; then
   agent_environment+=(
-    PATH="$host_exec_shim_dir:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+    PATH="$host_exec_first_dir:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}:$host_exec_fallback_dir"
     AGENT_HOST_EXEC_DIR="$host_exec_state_dir"
   )
 fi

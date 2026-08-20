@@ -61,8 +61,11 @@ or a configured root list. For each invocation, the launcher:
 1. resolves the current Git top-level directory, or the current directory when
    outside Git;
 2. starts a one-connection Rust workspace broker on macOS;
-3. starts a per-client host-tool broker so guest `git` and `gh` default to
-   sandboxed host executables with the host identity and credentials;
+3. starts a per-client host-tool broker that mirrors the complete host PATH
+   catalog into the guest: `git` and `gh` default to sandboxed host
+   executables with the host identity and credentials, and every host command
+   the guest image does not provide (node, npm, npx, uv, cargo, ...) runs as
+   the corresponding sandboxed host executable;
 4. starts `container exec` in a private guest mount namespace;
 5. mounts that one host project at the same absolute path through SSHFS and raw
    SFTP;
@@ -216,8 +219,9 @@ resolves a floating publisher channel to one exact version before deciding
 whether an image is reusable. Claude and Grok install one native ELF; Codex
 retains its complete standalone tree because its executable depends on adjacent
 helpers and resources. Node.js and npm are not installed in the normal Agent
-image; a host Node.js installation powers the default host git/gh broker, and
-its absence only degrades that channel to the guest binaries.
+image; the host installations serve those commands through the default
+host-tool broker, which a host Node.js runtime powers. Its absence only
+degrades that channel to the guest binaries.
 
 The first invocation may build the image and create the profile singleton. A
 version probe is a convenient prebuild:
@@ -338,29 +342,52 @@ selected project. SSHFS caching is intentionally short, but remote/FUSE
 semantics are not identical to a native APFS directory. File-watch tools should
 be tested and may need polling or a restart after host-side edits.
 
-## Host git and gh
+## Host tools
 
-By default, `git` and `gh` inside a singleton client resolve to per-session
-shims that run the corresponding **host** executables through an authenticated
-host-tool broker. Host `git` and `gh` therefore operate with the operator's
-real Git configuration, credential helpers, and GitHub CLI login, so
-`git push` and `gh pr create` work exactly as they do in a host terminal.
-Every other command still runs in the guest, and the guest `git`/`gh`
-binaries remain available as fallbacks.
+By default, every client's guest PATH mirrors the complete host command
+catalog through an authenticated host-tool broker. Working inside the
+container is intended to feel like working in a host terminal:
 
-The channel is deliberately narrow:
+- commands the verified guest image provides (bash, coreutils, rg, jq, ...)
+  run natively in the guest at full speed;
+- commands the guest does not provide (node, npm, npx, uv, cargo, go, ...)
+  resolve to per-session shims that run the corresponding **host**
+  executables — the host's exact versions and caches — against the same
+  workspace path on the real filesystem;
+- `git` and `gh` are host-first: they shadow the guest copies and operate
+  with the operator's real Git configuration, credential helpers, and GitHub
+  CLI login, so `git push` and `gh pr create` work exactly as they do in a
+  host terminal.
 
-- the manifest contains exactly the two commands; the broker rejects anything
-  else;
+The launcher freezes the host PATH directories and policy into a catalog
+specification; the broker expands it in-process (no per-command fork/exec
+walk), validates every executable, and serves the resulting catalog to the
+guest session, which builds host-first and host-fallback shim directories
+around the guest PATH.
+
+The channel keeps its original security shape:
+
 - each proxied process runs under a generated macOS `sandbox-exec` profile
-  whose only writable tree is the current workspace root;
+  whose only writable trees are the current workspace root and the isolated
+  broker execution HOME — never the real host HOME;
+- only `git` and `gh` receive the real HOME; every other proxied command runs
+  with the isolated execution HOME, so host credentials and dotfiles stay
+  unavailable to generic tools;
 - `git` may additionally read `~/.gitconfig`, XDG Git configuration, and SSH
   metadata (never private-key files); `gh` may additionally read
   `~/.config/gh`;
 - the broker lives only as long as its client and authenticates every request
   with a per-client 256-bit token that never enters an argument vector;
-- host `git` operates on the real project directory, so large Git operations
-  avoid SFTP round-trips entirely.
+- Agent binaries, the launcher's own commands, `container`, and `sudo` are
+  never proxied; `--container-host-exec-deny` removes further names and
+  `--container-host-exec-first` promotes names over guest copies.
+
+Because host tools operate on the real project directory, I/O-heavy work
+(`git status`, `npm install`, `uv sync`, test runs) avoids SFTP round-trips
+entirely. Each proxied invocation still crosses the broker channel
+(~0.2 s per command start); host-side processes, PIDs, and listening ports
+live on macOS, not in the guest, and interactive TTY programs (REPLs,
+`npm login`) are not forwarded yet.
 
 The broker uses the host Node.js runtime. When Node.js (or another
 prerequisite) is unavailable, the default launch prints one warning and falls
@@ -398,6 +425,8 @@ Boolean options use `--container-<name>` and `--no-container-<name>`.
 | `--container-dns2 VALUE` | unset | Secondary build/guest DNS server |
 | `--container-timezone VALUE` | unset | Guest `TZ`, such as `Asia/Singapore` |
 | `--container-forward-env VALUE` | unset | Comma-separated exact exported names for provider, model, token, or Agent settings |
+| `--container-host-exec-deny VALUE` | unset | Comma-separated host commands never proxied into the guest |
+| `--container-host-exec-first VALUE` | unset | Comma-separated host commands preferred over guest copies, like the built-in `git`/`gh` |
 | `--container-host-alias VALUE` | unset | Comma-separated guest DNS names mapped to the Apple host gateway while preserving URL/SNI |
 | `--container-block-host VALUE` | unset | Comma-separated guest DNS names mapped to IPv4 and IPv6 blackholes |
 | `--container-max-files VALUE` | `40000` | Safety budget for remaining VirtioFS-backed trees and legacy `run` shares |
@@ -418,7 +447,7 @@ Boolean options use `--container-<name>` and `--no-container-<name>`.
 | `--container-accept-virtiofs-risk` | off | Continue past selected Apple VirtioFS risk checks |
 | `--container-allow-concurrent` | off | Permit overlapping legacy `run` VMs; also requires risk acceptance |
 | `--container-disable-fd-watchdog` | off | Disable the legacy `run` live file/vnode watchdog for controlled testing |
-| `--container-host-tools` | on | Proxy guest `git` and `gh` to sandboxed host executables with host credentials |
+| `--container-host-tools` | on | Mirror the host command catalog as sandboxed host executables (host-first `git`/`gh`) |
 
 Every boolean has a negative form, for example
 `--no-container-full-git-config`. Repeated settings use the last value.
@@ -433,8 +462,8 @@ ordinary users should not need them:
 |---|---|
 | `--container-assets PATH` | Select another complete runtime asset directory |
 | `--container-bin PATH` | Select another Apple `container` executable |
-| `--container-host-broker PATH` | Select the advanced `run` host-command broker |
-| `--container-host-node PATH` | Select the host Node.js executable used by advanced `run` |
+| `--container-host-broker PATH` | Select the host-tool broker program |
+| `--container-host-node PATH` | Select the host Node.js executable that powers the host-tool broker |
 | `--container-host-gateway IPv4` | Override the inspected Apple network gateway |
 | `--container-openssl PATH` | Select the host OpenSSL executable used for CA validation |
 | `--container-security PATH` | Select the macOS Security executable used by `--container-extra-ca auto` |
@@ -621,10 +650,10 @@ codex-container run \
 ```
 
 `run` creates a per-launch auto-remove VM and uses Apple VirtioFS for the
-workspace and additional shares. It also starts the older Node.js host-command
-broker. Eligible host commands are snapshotted from host `PATH`; guest commands
-win normally, while host Git and gh are preferred. Tighten the command surface
-with:
+workspace and additional shares. It starts the same host-tool broker and
+command catalog as the default path; only the workspace transport and
+lifecycle differ. Guest commands win normally, while host Git and gh are
+preferred. Tighten the command surface per launch with:
 
 ```bash
 codex-container run --no-host-exec git --
@@ -634,8 +663,8 @@ codex-container run --host-first python3 --
 The host-command broker authenticates each request and applies a generated
 macOS filesystem sandbox to the process group. It can still run native code as
 the macOS user inside admitted paths, and allowed interpreters or shells may
-start children. Its pipe transport has no PTY. This mode depends on Apple's
-deprecated `sandbox-exec` interface and is intentionally not the default.
+start children. Its pipe transport has no PTY. This legacy lifecycle exists
+for linked worktrees and extra shares and is intentionally not the default.
 
 `--share-ro` and `--share-rw` may be repeated. They cannot overlap each other,
 private state, runtime assets, the workspace, or the real HOME as a whole. A
@@ -649,8 +678,9 @@ repositories harmless. By default an Agent can:
 
 - read and write the selected project root;
 - read and write its profile HOME;
-- run host `git` and `gh` inside a workspace-scoped macOS sandbox, with the
-  host Git configuration, credential helpers, and GitHub CLI login
+- run cataloged host commands inside a workspace-scoped macOS sandbox — with
+  the host Git configuration, credential helpers, and GitHub CLI login for
+  `git`/`gh`, and an isolated execution HOME for everything else
   (`--no-container-host-tools` disables this);
 - communicate with the network without a hostname allowlist;
 - affect other concurrent clients of the same profile through shared VM and

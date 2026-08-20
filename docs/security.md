@@ -40,7 +40,7 @@ Each client separately receives:
 - its own Agent process and arguments;
 - its own stdin/stdout and TTY decision;
 - its own host workspace broker and random token;
-- its own host git/gh broker and random token, unless
+- its own host-tool broker and random token, unless
   `--no-container-host-tools` is selected;
 - its own private guest mount namespace and SSHFS mount;
 - its own current working directory and exit status.
@@ -74,15 +74,16 @@ The Agent does not receive by default:
 - project roots used by other clients as ordinary mounts;
 - host SSH private-key files or the SSH-agent socket;
 - arbitrary host environment variables;
-- native host-command execution beyond the sandboxed host git/gh channel
+- native host-command execution beyond the sandboxed host-tool channel
   described below.
 
 Through that default channel, host `git` runs with the real Git configuration
 (including credential helpers, includes, and HTTP headers) and host `gh` runs
 with readable GitHub CLI configuration. This is a deliberate authority grant:
 an Agent-driven `git push` or `gh` call carries the operator's identity and
-credentials, confined to the workspace-scoped host sandbox.
-`--no-container-host-tools` removes the channel entirely.
+credentials, confined to the workspace-scoped host sandbox. Every other
+cataloged host command runs with an isolated execution HOME instead of the
+real one. `--no-container-host-tools` removes the channel entirely.
 
 The workspace is intentionally read-write. The Agent and code it executes can
 modify or delete tracked and untracked files, replace hooks, and write secrets
@@ -183,34 +184,48 @@ can still prevent the helper itself from running cleanup, so the containing
 important. A persistent VM should not be interpreted as a durable workspace
 mount.
 
-## Default host git and gh broker
+## Default host-tool broker
 
 Each singleton client may also start one host-tool broker: the same
-authenticated Node.js broker legacy `run` uses, but with a fixed manifest of
-exactly two commands. The launcher stages `first git` and `first gh` (each
-resolved to a canonical host executable inside an admitted tool root), one
-writable execution root — the canonical workspace — and a fresh 256-bit
-session token. The guest session helper creates per-session `git`/`gh` shims
-and credential files inside the client's private runtime directory; the token
+authenticated Node.js broker legacy `run` uses, loaded with the complete host
+command catalog. The launcher freezes the ordered host `PATH` directories and
+the deny/first policy into a catalog specification, declares one writable
+execution root — the canonical workspace — and stages a fresh 256-bit session
+token. The broker expands the specification into the validated manifest
+in-process: every executable is canonicalized inside an admitted tool root,
+Agent binaries, launcher commands, `container`, and `sudo` are always denied,
+and Agent-writable paths are excluded. The guest session helper retrieves the
+catalog from the authenticated broker and creates per-session shims and
+credential files inside the client's private runtime directory; the token
 travels by environment name, never in an argument vector, and the shims are
-invisible to other clients.
+invisible to other clients. Host-first names (`git`, `gh`, and explicit
+`--container-host-exec-first` additions) precede the guest PATH; every other
+name sits behind it and is used only when the guest image lacks the command.
 
-Every proxied process runs under a generated `deny default` `sandbox-exec`
-profile whose writable filesystem scope is the workspace root. On top of the
-shared read-only tool roots, `git` may read `~/.gitconfig`, XDG Git
-configuration, and SSH metadata (never private-key files), and `gh` may read
-`~/.config/gh`; both run with `HOME` set to the real home so host credential
-helpers and the GitHub CLI login behave exactly as in a host terminal. The
-broker authenticates every request, polls its launcher PID, and exits when the
-client ends, so the channel cannot outlive the terminal that created it.
+The command list is convenience surface, not the security boundary; the
+generated sandbox is. Every proxied process runs under a generated
+`deny default` `sandbox-exec` profile whose writable filesystem scope is the
+workspace root plus the isolated broker execution HOME. Only `git` and `gh`
+run with `HOME` set to the real home — so host credential helpers and the
+GitHub CLI login behave exactly as in a host terminal, with additional reads
+limited to `~/.gitconfig`, XDG Git configuration, SSH metadata (never
+private-key files), and `~/.config/gh`. Every other cataloged command runs
+with the isolated execution HOME and cannot read real-home dotfiles or stored
+credentials through the sandbox. The broker authenticates every request,
+polls its launcher PID, and exits when the client ends, so the channel cannot
+outlive the terminal that created it.
 
 This remains an explicit host-code-execution capability with the same caveats
-as legacy `run`: allowed interpreters reachable through Git hooks or
-credential helpers execute as the macOS user inside the declared scope, and
-`sandbox-exec` is a deprecated Apple interface. When the broker runtime is
-unavailable the default launch degrades to guest binaries with one warning; an
-explicit `--container-host-tools` fails closed instead, and
-`--no-container-host-tools` never creates the broker.
+as legacy `run`: cataloged interpreters and shells (and interpreters reachable
+through Git hooks or credential helpers) execute as the macOS user inside the
+declared scope, and `sandbox-exec` is a deprecated Apple interface. Broadening
+the catalog beyond git/gh did not change the boundary type — a two-command
+git channel already reached arbitrary host execution through aliases and
+hooks — but it does widen read access to the admitted tool roots and make the
+capability the everyday path; `--container-host-exec-deny` narrows it, and
+`--no-container-host-tools` never creates the broker. When the broker runtime
+is unavailable the default launch degrades to guest binaries with one
+warning; an explicit `--container-host-tools` fails closed instead.
 
 ## Identity and Linux privilege
 
@@ -275,7 +290,7 @@ Agent and anything it can execute.
 
 ## Static Git, GitHub, and SSH capabilities
 
-The host git/gh broker above is the default credential path and is per-client.
+The host-tool broker above is the default credential path and is per-client.
 The static capabilities below instead change what the guest environment itself
 receives; they matter for guest tools that embed Git and whenever
 `--no-container-host-tools` is selected.
@@ -316,17 +331,19 @@ compatibility commands, Apple `container`, and `sudo` are never exposed as host
 commands. Users can remove more names or prefer a selected host command through
 `run` options.
 
-This is broader than the default host git/gh channel, which stages exactly two
-commands and one writable workspace root:
+The command catalog and execution properties match the default host-tool
+channel; what `run` adds beyond the default's single writable workspace root
+is scope:
 
-- every eligible host command from `PATH` is cataloged, not only git and gh;
-- a native interpreter or shell runs as the macOS user;
-- an allowed process can start children within the sandbox;
-- host Git and gh can use selected real configuration and a live SSH agent;
-- read-write shares authorize modification or deletion;
-- the transport is pipe-only and has no controlling PTY;
-- deliberately detached descendants can escape a process-group lifetime
-  contract.
+- read-write shares authorize modification or deletion of additional trees;
+- a worktree's external Git common directory can be admitted read-write;
+- the workspace itself is a VirtioFS mount rather than per-client SFTP.
+
+As in the default channel, a native interpreter or shell runs as the macOS
+user, an allowed process can start children within the sandbox, host Git and
+gh can use selected real configuration and a live SSH agent, the transport is
+pipe-only with no controlling PTY, and deliberately detached descendants can
+escape a process-group lifetime contract.
 
 The host-command sandbox, token, and manifest narrow the capability but do not
 make native execution harmless. Omitting `run` avoids creating this broker.
