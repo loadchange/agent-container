@@ -4,7 +4,8 @@ set -euo pipefail
 # Source-tree bootstrap only. Installed releases place the prebuilt Rust binary
 # at this path, so normal launches do not invoke Cargo or this script.
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-launcher="$script_dir/target/release/agent-container-launcher"
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+launcher="$repo_root/target/release/agent-container-launcher"
 launcher_argv0=agent-container
 
 # The tracked compatibility commands are tiny source-tree shims. Installed
@@ -30,11 +31,11 @@ if [ ! -x "$launcher" ]; then
   launcher_stale=true
 else
   for source_file in \
-    "$script_dir/Cargo.toml" \
-    "$script_dir/Cargo.lock" \
-    "$script_dir/src/main.rs" \
-    "$script_dir/src/launcher.rs" \
-    "$script_dir/src/broker.rs"; do
+    "$repo_root/Cargo.toml" \
+    "$repo_root/Cargo.lock" \
+    "$repo_root/src/main.rs" \
+    "$repo_root/src/launcher.rs" \
+    "$repo_root/src/broker.rs"; do
     if [ "$source_file" -nt "$launcher" ]; then
       launcher_stale=true
       break
@@ -51,8 +52,8 @@ if [ "$launcher_stale" = true ]; then
     --locked \
     --offline \
     --release \
-    --target-dir "$script_dir/target" \
-    --manifest-path "$script_dir/Cargo.toml" \
+    --target-dir "$repo_root/target" \
+    --manifest-path "$repo_root/Cargo.toml" \
     >/dev/null
 fi
 

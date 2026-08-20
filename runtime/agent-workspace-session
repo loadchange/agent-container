@@ -144,6 +144,53 @@ unset AGENT_WORKSPACE_ENDPOINT AGENT_WORKSPACE_TOKEN
 [[ "$workspace_token" =~ ^[0-9a-f]{64}$ ]] \
   || fail 'AGENT_WORKSPACE_TOKEN must contain exactly 64 lowercase hexadecimal characters.'
 
+# The optional host git/gh channel arrives on the same private environment
+# path as the workspace transport. All three fields must agree; a partial
+# handoff is treated as corruption rather than silently ignored.
+host_exec_endpoint="${AGENT_WORKSPACE_HOST_EXEC_ENDPOINT:-}"
+host_exec_token="${AGENT_WORKSPACE_HOST_EXEC_TOKEN:-}"
+host_exec_commands="${AGENT_WORKSPACE_HOST_EXEC_COMMANDS:-}"
+unset AGENT_WORKSPACE_HOST_EXEC_ENDPOINT \
+  AGENT_WORKSPACE_HOST_EXEC_TOKEN \
+  AGENT_WORKSPACE_HOST_EXEC_COMMANDS
+host_exec_requested=false
+host_exec_command_list=()
+if [ -n "$host_exec_endpoint$host_exec_token$host_exec_commands" ]; then
+  host_exec_requested=true
+  case "$host_exec_endpoint" in
+    ''|*$'\n'*|*$'\r'*|*$'\t'*|*:*:*)
+      fail 'AGENT_WORKSPACE_HOST_EXEC_ENDPOINT must be one IPv4:port endpoint.'
+      ;;
+  esac
+  [ "${#host_exec_endpoint}" -le 21 ] \
+    || fail 'AGENT_WORKSPACE_HOST_EXEC_ENDPOINT is too long for IPv4:port.'
+  case "$host_exec_endpoint" in
+    [0-9]*.*.*.*:[1-9]*) ;;
+    *) fail 'AGENT_WORKSPACE_HOST_EXEC_ENDPOINT must be one IPv4:port endpoint.' ;;
+  esac
+  [[ "$host_exec_token" =~ ^[0-9a-f]{64}$ ]] \
+    || fail 'AGENT_WORKSPACE_HOST_EXEC_TOKEN must contain exactly 64 lowercase hexadecimal characters.'
+  case "$host_exec_commands" in
+    ''|,*|*,|*,,*)
+      fail 'AGENT_WORKSPACE_HOST_EXEC_COMMANDS must be a comma-separated command list.'
+      ;;
+  esac
+  IFS=, read -r -a host_exec_command_list <<EOF
+$host_exec_commands
+EOF
+  [ "${#host_exec_command_list[@]}" -le 16 ] \
+    || fail 'AGENT_WORKSPACE_HOST_EXEC_COMMANDS lists too many commands.'
+  for host_exec_command in "${host_exec_command_list[@]}"; do
+    case "$host_exec_command" in
+      ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._+-]*)
+        fail 'AGENT_WORKSPACE_HOST_EXEC_COMMANDS contains an unsafe command name.'
+        ;;
+    esac
+    [ "${#host_exec_command}" -le 64 ] \
+      || fail 'AGENT_WORKSPACE_HOST_EXEC_COMMANDS contains an oversized command name.'
+  done
+fi
+
 for required_path in \
   /dev/fuse \
   /etc/fuse.conf \
@@ -154,6 +201,7 @@ for required_path in \
   /usr/bin/setpriv \
   /usr/bin/setsid \
   /usr/bin/sshfs \
+  /usr/local/bin/agent-host-exec \
   /usr/local/bin/agent-workspace-connect; do
   [ -e "$required_path" ] || fail "required workspace component is absent: $required_path"
 done
@@ -469,6 +517,56 @@ esac
 [ "$(/usr/bin/stat -c '%u:%g:%a' -- "$session_runtime_dir")" \
     = "$runtime_uid:$runtime_gid:700" ] \
   || fail 'the private session runtime directory has unsafe ownership or mode.'
+
+# Host git/gh shims and their session credentials live inside the private
+# per-session runtime directory: the Agent owns and may read them, other
+# sessions never observe them, and normal session cleanup removes them.
+host_exec_state_dir=
+host_exec_shim_dir=
+if [ "$host_exec_requested" = true ]; then
+  host_exec_state_dir="$session_runtime_dir/host-exec"
+  /usr/bin/install -d -o "$runtime_uid" -g "$runtime_gid" -m 0700 \
+    -- "$host_exec_state_dir" \
+    || fail 'cannot create the host-exec session directory.'
+  (
+    umask 077
+    printf '%s\n' "$host_exec_endpoint" \
+      > "$host_exec_state_dir/host-exec-endpoint" \
+      && printf '%s\n' "$host_exec_token" \
+        > "$host_exec_state_dir/host-exec-token"
+  ) || fail 'cannot publish the host-exec session credentials.'
+  /usr/bin/chown "$runtime_uid:$runtime_gid" -- \
+    "$host_exec_state_dir/host-exec-endpoint" \
+    "$host_exec_state_dir/host-exec-token" \
+    || fail 'cannot assign the host-exec session credentials.'
+  host_exec_shim_dir="$session_runtime_dir/host-bin"
+  /usr/bin/install -d -o "$runtime_uid" -g "$runtime_gid" -m 0700 \
+    -- "$host_exec_shim_dir" \
+    || fail 'cannot create the host-exec shim directory.'
+  for host_exec_command in "${host_exec_command_list[@]}"; do
+    /bin/ln -s /usr/local/bin/agent-host-exec \
+      "$host_exec_shim_dir/$host_exec_command" \
+      || fail 'cannot create a host-exec command shim.'
+  done
+fi
+host_exec_endpoint=
+host_exec_token=
+host_exec_commands=
+unset host_exec_endpoint host_exec_token host_exec_commands
+
+agent_environment=(
+  HOME="$runtime_home"
+  USER="$runtime_user"
+  LOGNAME="$runtime_user"
+  XDG_RUNTIME_DIR="$session_runtime_dir"
+)
+if [ -n "$host_exec_shim_dir" ]; then
+  agent_environment+=(
+    PATH="$host_exec_shim_dir:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+    AGENT_HOST_EXEC_DIR="$host_exec_state_dir"
+  )
+fi
+
 session_control_dir=$(/usr/bin/mktemp -d \
   "$runtime_dir_parent/control-$runtime_uid-XXXXXXXX") \
   || fail 'cannot create the private session control directory.'
@@ -625,10 +723,7 @@ background_launching=true
     --clear-groups \
     --no-new-privs \
     /usr/bin/env \
-      HOME="$runtime_home" \
-      USER="$runtime_user" \
-      LOGNAME="$runtime_user" \
-      XDG_RUNTIME_DIR="$session_runtime_dir" \
+      "${agent_environment[@]}" \
       "$agent_executable" \
       "${agent_arguments[@]}" \
     <&0

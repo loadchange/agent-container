@@ -19,6 +19,8 @@ The normal path has these invariants:
 - each invocation starts a new Agent process through `container exec`;
 - every invocation keeps its own cwd, TTY or pipes, signals, and exit status;
 - only that invocation's current Git root is dynamically mounted;
+- guest `git` and `gh` default to sandboxed host executables through a
+  per-client host-tool broker (`--no-container-host-tools` opts out);
 - no real host HOME or predeclared multi-project root set is mounted;
 - clients of one profile share the VM and isolated profile HOME.
 
@@ -217,6 +219,34 @@ SFTP mount and is rejected before broker startup. The advanced `run` path can
 use separate Apple volume mounts for that case. Ordinary repositories and
 switching among unrelated roots require no configuration.
 
+## Host tool broker (git and gh)
+
+Alongside the workspace broker, each client starts one host-tool broker by
+default: the authenticated Node.js broker shared with legacy `run`, loaded
+with a fixed manifest of exactly `git` and `gh`. The launcher resolves each
+command to a canonical host executable (freezing the `/usr/bin` developer
+shims to the selected Xcode/CommandLineTools installation), declares the
+canonical workspace as the only writable execution root, stages a fresh
+256-bit token, and binds the broker to its own PID so the channel ends with
+the client.
+
+The endpoint, token, and staged command list travel to the guest as
+`AGENT_WORKSPACE_HOST_EXEC_*` values on the same private environment path as
+the workspace transport. The root session helper writes them into the client's
+private runtime directory, creates per-session `git`/`gh` shims ahead of the
+Agent `PATH`, and points the guest client at that directory through
+`AGENT_HOST_EXEC_DIR`. Proxied `git` and `gh` run on macOS with the real HOME,
+so pushes and GitHub calls use host credential helpers and logins while the
+generated sandbox confines writes to the workspace. Host `git` also operates
+on the real project directory, avoiding SFTP round-trips for metadata-heavy
+Git work.
+
+When the broker runtime is unavailable — most commonly a Mac without Node.js —
+the default launch warns once and continues with guest binaries; an explicit
+`--container-host-tools` fails closed before any native mutation, and
+`--no-container-host-tools` skips the channel. The capability is per-client
+and therefore not part of the singleton configuration fingerprint.
+
 ## Shadow HOME and static mounts
 
 For host `/Users/alice`, the persistent mapping is:
@@ -391,9 +421,10 @@ It creates an attached auto-remove VM, mounts the workspace and optional
 read-only/read-write shares through Apple volumes, and may expose selected
 native host commands through the Node.js host-exec broker. Command paths and
 tool roots are frozen into manifests; the guest uses shims to prefer guest
-binaries except for explicitly host-first commands such as Git. The broker
-authenticates requests and confines native process groups with a generated
-macOS sandbox.
+binaries except for explicitly host-first commands such as Git and gh. Unlike
+the default two-command host-tool channel, this broker catalogs every eligible
+host `PATH` command. It authenticates requests and confines native process
+groups with a generated macOS sandbox.
 
 This boundary is broader than the default workspace-only SFTP broker: it can
 execute native code as the macOS user and uses VirtioFS for user trees. It

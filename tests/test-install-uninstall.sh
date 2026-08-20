@@ -3,8 +3,19 @@ set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 fixture_path="$repo_root/tests/install-fixtures:/usr/bin:/bin"
+release_source_dir="$repo_root/dist"
 test_root=$(mktemp -d)
 trap 'rm -rf "$test_root"' EXIT
+
+# The release layout is produced by scripts/build-release.sh; the Mach-O
+# launcher is not tracked in git.
+[ -f "$release_source_dir/agent-container-darwin-arm64" ] \
+  && [ ! -L "$release_source_dir/agent-container-darwin-arm64" ] \
+  || {
+    echo "Missing $release_source_dir/agent-container-darwin-arm64." >&2
+    echo "Run scripts/build-release.sh first." >&2
+    exit 69
+  }
 
 ASSETS=(
   agent-container-darwin-arm64
@@ -70,6 +81,13 @@ sha256_stream() {
   fi
 }
 
+pack_release_tarball() {
+  local source_root="$1"
+  COPYFILE_DISABLE=1 tar -czf \
+    "$source_root/agent-container-darwin-arm64.tar.gz" \
+    -C "$source_root" "${ASSETS[@]}"
+}
+
 write_manifest() {
   local source_root="$1"
   local asset
@@ -78,6 +96,9 @@ write_manifest() {
     printf '%s  %s\n' "$(sha256_file "$source_root/$asset")" "$asset" \
       >> "$source_root/release-manifest.sha256"
   done
+  # Remote installs fetch one flat tarball; repack after every content or
+  # manifest mutation so the fixture keeps modeling the published release.
+  pack_release_tarball "$source_root"
 }
 
 make_release_source() {
@@ -85,7 +106,7 @@ make_release_source() {
   local asset
   mkdir -p "$source_root/profiles"
   for asset in "${ASSETS[@]}"; do
-    cp "$repo_root/$asset" "$source_root/$asset"
+    cp "$release_source_dir/$asset" "$source_root/$asset"
   done
   chmod 0755 \
     "$source_root/agent-container-darwin-arm64" \
@@ -365,6 +386,9 @@ mkdir -p "$manifest_home"
 make_release_source "$manifest_source"
 printf '%s\n' '# tampered after manifest publication' \
   >> "$manifest_source/entrypoint.sh"
+# The tarball is the transfer payload, so the tampered file must reach the
+# installer through a repacked archive to model a tampered published release.
+pack_release_tarball "$manifest_source"
 if run_install "$manifest_source" "$manifest_home" --profile grok \
   > "$test_root/manifest.out" 2> "$test_root/manifest.err"; then
   fail "installer accepted a manifest hash mismatch"

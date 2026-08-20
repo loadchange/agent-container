@@ -2,4 +2,9 @@
 .native-e2e/
 .benchmarks/
 target/
+dist/
 .DS_Store
+
+# Release launchers are built by scripts/build-release.sh and published
+# through GitHub Releases; they are never tracked in git.
+/agent-container-darwin-arm64

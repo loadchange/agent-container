@@ -26,7 +26,8 @@ arguments, TTY, cwd, and dynamic workspace.
 
 ## Schema version 2
 
-Profiles live at `profiles/<id>.json`. The launcher parses them as inert JSON
+Profiles live at `runtime/profiles/<id>.json` in the source tree and at
+`profiles/<id>.json` beside the installed runtime. The launcher parses them as inert JSON
 with macOS JavaScriptCore and requires one exact typed key set. The Codex file
 shows every field:
 
@@ -273,7 +274,7 @@ runtime behavior, not profile metadata.
 5. Validate JSON and core parsing:
 
    ```bash
-   plutil -convert json -o /dev/null profiles/<id>.json
+   plutil -convert json -o /dev/null runtime/profiles/<id>.json
    agent-container profiles
    ```
 

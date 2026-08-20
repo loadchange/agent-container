@@ -57,6 +57,7 @@ const BOOLEAN_OPTIONS: &[(&str, &str)] = &[
     ),
     ("allow-concurrent", "AGENT_CONTAINER_ALLOW_CONCURRENT"),
     ("disable-fd-watchdog", "AGENT_CONTAINER_DISABLE_FD_WATCHDOG"),
+    ("host-tools", "AGENT_CONTAINER_HOST_TOOLS"),
 ];
 
 const REMOVED_ENVIRONMENT: &[(&str, &str)] = &[
@@ -437,7 +438,7 @@ fn runtime_candidate(executable: &Path) -> io::Result<PathBuf> {
                 "the source launcher has no repository root",
             )
         })?;
-        return Ok(source_root.join(RUNTIME_NAME));
+        return Ok(source_root.join("runtime").join(RUNTIME_NAME));
     }
 
     Ok(directory.join(RUNTIME_NAME))
@@ -711,6 +712,7 @@ mod tests {
             ),
             ("allow-concurrent", "AGENT_CONTAINER_ALLOW_CONCURRENT"),
             ("disable-fd-watchdog", "AGENT_CONTAINER_DISABLE_FD_WATCHDOG"),
+            ("host-tools", "AGENT_CONTAINER_HOST_TOOLS"),
         ];
         assert_eq!(BOOLEAN_OPTIONS, expected);
     }
@@ -965,7 +967,7 @@ mod tests {
     fn runtime_is_bound_to_the_source_checkout_or_installed_release() {
         assert_eq!(
             runtime_candidate(Path::new("/repo/target/release/agent-container-launcher")).unwrap(),
-            PathBuf::from("/repo/agent-container-runtime")
+            PathBuf::from("/repo/runtime/agent-container-runtime")
         );
         assert_eq!(
             runtime_candidate(Path::new("/release/agent-container-darwin-arm64")).unwrap(),

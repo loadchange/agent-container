@@ -4,8 +4,8 @@ set -euo pipefail
 export LC_ALL=C
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-connect_script="$repo_root/agent-workspace-connect"
-session_script="$repo_root/agent-workspace-session"
+connect_script="$repo_root/runtime/agent-workspace-connect"
+session_script="$repo_root/runtime/agent-workspace-session"
 peer_source="$repo_root/tests/fixtures/workspace-bridge-peer.rs"
 test_root=$(mktemp -d /tmp/agent-workspace-bridge.XXXXXX)
 test_root=$(CDPATH= cd -- "$test_root" && pwd -P)
@@ -451,12 +451,12 @@ else
 fi
 
 next_test
-physical_launcher="$repo_root/agent-container-darwin-arm64"
+physical_launcher="$repo_root/dist/agent-container-darwin-arm64"
 if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
   skip "physical release launcher dispatches the private workspace broker" \
-    "requires the checked-in macOS arm64 release"
+    "requires the built macOS arm64 release in dist/"
 elif [ ! -x "$physical_launcher" ]; then
-  fail "checked-in physical release launcher is not executable"
+  fail "built physical release launcher is not executable; run scripts/build-release.sh"
 else
   physical_workspace=$(mktemp -d "$test_root/physical-workspace.XXXXXX")
   previous_broker_binary=${broker_binary:-}

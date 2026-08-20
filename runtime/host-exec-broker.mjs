@@ -610,25 +610,43 @@ function buildSandboxProfile(configuration) {
 
 function buildCommandSandboxProfile(configuration, command) {
   const baseProfile = buildSandboxProfile(configuration);
-  if (command.name !== 'git') return baseProfile;
-  const gitConfig = path.join(configuration.realHome, '.gitconfig');
-  const gitXdgConfig = path.join(configuration.realHome, '.config', 'git');
-  const sshMetadata = [
-    'config',
-    'known_hosts',
-    'known_hosts.old',
-    'allowed_signers',
-  ].map((name) => path.join(configuration.realHome, '.ssh', name));
-  return [
-    baseProfile,
-    sandboxLiteralRules('file-read* file-test-existence', [gitConfig, ...sshMetadata]),
-    sandboxPathRules('file-read* file-test-existence', [gitXdgConfig]),
-    sandboxAncestorRules([gitConfig, gitXdgConfig, ...sshMetadata]),
-  ].join('');
+  if (command.name === 'git') {
+    const gitConfig = path.join(configuration.realHome, '.gitconfig');
+    const gitXdgConfig = path.join(configuration.realHome, '.config', 'git');
+    const sshMetadata = [
+      'config',
+      'known_hosts',
+      'known_hosts.old',
+      'allowed_signers',
+    ].map((name) => path.join(configuration.realHome, '.ssh', name));
+    return [
+      baseProfile,
+      sandboxLiteralRules('file-read* file-test-existence', [gitConfig, ...sshMetadata]),
+      sandboxPathRules('file-read* file-test-existence', [gitXdgConfig]),
+      sandboxAncestorRules([gitConfig, gitXdgConfig, ...sshMetadata]),
+    ].join('');
+  }
+  if (command.name === 'gh') {
+    // The GitHub CLI reads its host list and, when insecure storage was
+    // selected, its token from ~/.config/gh. The directory stays read-only:
+    // update-state writes fail harmlessly and the broker never widens
+    // real-home write access for a guest-driven command.
+    const ghConfig = path.join(configuration.realHome, '.config', 'gh');
+    return [
+      baseProfile,
+      sandboxPathRules('file-read* file-test-existence', [ghConfig]),
+      sandboxAncestorRules([ghConfig]),
+    ].join('');
+  }
+  return baseProfile;
 }
 
 function buildChildEnvironment(configuration, command, forwardedEnvironment) {
-  const commandHome = command.name === 'git' ? configuration.realHome : configuration.execHome;
+  // Host git and gh operate with the operator's real identity and
+  // credentials; every other allowed command keeps the isolated home.
+  const commandHome = ['git', 'gh'].includes(command.name)
+    ? configuration.realHome
+    : configuration.execHome;
   const environment = {
     HOME: commandHome,
     PATH: process.env.PATH || '/usr/bin:/bin:/usr/sbin:/sbin',

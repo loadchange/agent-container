@@ -12,9 +12,7 @@ set -uo pipefail
 # mount. Command shims may invoke this file under a command basename (for
 # example `node`) or call it explicitly as `host-exec-client node ...`.
 
-readonly host_exec_dir=/run/agent-host
-readonly endpoint_file="$host_exec_dir/host-exec-endpoint"
-readonly token_file="$host_exec_dir/host-exec-token"
+readonly default_host_exec_dir=/run/agent-host
 readonly protocol_failure_status=125
 readonly max_response_line_chars=262144
 
@@ -27,6 +25,21 @@ for required_command in jq base64 dd tr chmod mkdir rmdir mktemp rm sleep; do
   command -v "$required_command" >/dev/null 2>&1 \
     || die "required guest command is unavailable: $required_command"
 done
+
+# Legacy run sessions publish their endpoint and token in the fixed read-only
+# staging mount. Singleton clients receive a private per-session directory
+# instead; the session helper names it for the Agent's own environment.
+host_exec_dir="${AGENT_HOST_EXEC_DIR:-$default_host_exec_dir}"
+case "$host_exec_dir" in
+  /*) ;;
+  *) die 'AGENT_HOST_EXEC_DIR must be an absolute path' ;;
+esac
+case "$host_exec_dir" in
+  *$'\n'*|*$'\r'*|*$'\t'*) die 'AGENT_HOST_EXEC_DIR contains control characters' ;;
+esac
+readonly host_exec_dir
+readonly endpoint_file="$host_exec_dir/host-exec-endpoint"
+readonly token_file="$host_exec_dir/host-exec-token"
 
 invoked_name=${0##*/}
 case "$invoked_name" in
