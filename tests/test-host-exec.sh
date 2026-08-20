@@ -8,8 +8,8 @@ set -euo pipefail
 # never copied or modified.
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-broker_script="$repo_root/host-exec-broker.mjs"
-client_script="$repo_root/host-exec-client"
+broker_script="$repo_root/runtime/host-exec-broker.mjs"
+client_script="$repo_root/runtime/host-exec-client"
 sandbox_bin=/usr/bin/sandbox-exec
 
 fail() {

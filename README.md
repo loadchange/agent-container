@@ -86,12 +86,26 @@ isolated workflow for mutually hostile projects.
 - Apple's `container` CLI installed (the launcher starts its per-user services
   automatically when needed)
 
-Install Apple's signed package, then verify and start its services:
+## Installing and updating Apple `container`
+
+`container` is available in [Homebrew core](https://formulae.brew.sh/formula/container)
+and requires the same Apple silicon Mac on macOS 26 or newer:
+
+```bash
+brew install container    # install
+brew upgrade container    # update to the latest release
+```
+
+Alternatively, download Apple's signed package (1.2.0 or newer) from the
+[`container` releases page](https://github.com/apple/container/releases) and
+install it manually.
+
+After installing or updating, verify the version and service state:
 
 ```bash
 container --version
-container system start
 container system status
+container system start
 ```
 
 You normally do not need to run `container system start` yourself. Every Claude,
@@ -99,8 +113,35 @@ Codex, or Grok launch checks the service, starts it once when it is stopped, and
 verifies that it became ready before touching images or singleton containers.
 
 `agent-container` does not install, upgrade, or reconfigure Apple's service.
+Updating Apple `container` does not require rebuilding profile images: each
+launch revalidates its recorded image recipe and rebuilds only when the recipe
+changes.
 
 ## Install agent-container
+
+### Homebrew (recommended)
+
+This repository is its own Homebrew tap:
+
+```bash
+brew tap loadchange/agent-container
+brew install agent-container
+```
+
+Updates follow normal Homebrew flow — the release pipeline refreshes the
+formula on every published release:
+
+```bash
+brew upgrade agent-container
+```
+
+The formula installs the prebuilt launcher and runtime assets under the
+Homebrew prefix; `agent-container`, `claude-container`, `codex-container`, and
+`grok-container` are linked into your PATH automatically. Apple's `container`
+CLI is not pulled in as a dependency (install it as shown above if it is not
+already present).
+
+### curl | bash
 
 Install or atomically upgrade all three profiles:
 
@@ -125,25 +166,34 @@ curl -fsSL "$installer_url" | bash -s -- --profile claude --profile codex
 curl -fsSL "$installer_url" | bash -s -- --all
 ```
 
-From a complete source checkout, the installer automatically uses the manifest
-and release assets beside `install.sh`:
-
-```bash
-./install.sh --all
-```
-
-`--base-url` remains available for an internal mirror or an explicit alternate
-checkout. It replaces the removed installer environment variable.
-
-The installer validates the complete release, publishes it below
-`~/.local/share/agent-container/releases/`, and atomically switches `current`.
-Re-running it with a different selection removes only commands and profile
-assets whose ownership it can prove. If a deselected profile still has a
+The installer downloads the latest
+[GitHub Release](https://github.com/loadchange/agent-container/releases)
+tarball and its SHA-256 manifest, validates every asset, publishes the release
+below `~/.local/share/agent-container/releases/`, and atomically switches
+`current`. Re-running it with a different selection removes only commands and
+profile assets whose ownership it can prove. If a deselected profile still has a
 managed singleton, stop that profile before changing the selection:
 
 ```bash
 agent-container singleton stop grok
 ```
+
+`--base-url` remains available for an internal mirror; it must serve
+`release-manifest.sha256` and the release tarball. It replaces the removed
+installer environment variable.
+
+### From source
+
+Build the reproducible release locally, then install from the staged `dist/`
+layout (the installer picks it up automatically):
+
+```bash
+scripts/build-release.sh
+./install.sh --all
+```
+
+The native launcher is never committed to git; it is built twice, stripped,
+ad-hoc signed, and byte-compared before it is staged.
 
 ## Built-in profiles
 
@@ -626,9 +676,19 @@ separately. See [docs/performance.md](docs/performance.md).
 
 ## Uninstall
 
+For a curl-installed or source-installed release:
+
 ```bash
 uninstaller_url='https://raw.githubusercontent.com/loadchange/agent-container/main/uninstall.sh'
 curl -fsSL "$uninstaller_url" | bash
+```
+
+For a Homebrew install, uninstall the formula first (it removes the same managed
+release state), then untap if you no longer want updates:
+
+```bash
+brew uninstall agent-container
+brew untap loadchange/agent-container
 ```
 
 The default removes managed commands, release assets, and only images whose
@@ -644,6 +704,22 @@ curl -fsSL "$uninstaller_url" | bash -s -- --purge
 `--purge` also removes logins, settings, sessions, caches, and other managed
 state. Uninstall fails closed if a singleton or legacy session is active or if
 path/image ownership cannot be proved.
+
+## Repository layout
+
+```text
+bin/        source-tree command shims (installed releases use direct symlinks)
+runtime/    release payload: runtime script, Containerfile, broker, guest helpers
+profiles/   per-agent build recipes (claude, codex, grok)
+src/        Rust launcher and workspace broker
+scripts/    reproducible release build, manifest and formula generation
+Formula/    Homebrew formula (this repository is its own tap)
+tests/      contract tests for the runtime, installer, broker, and workspace
+```
+
+The native launcher binary is never committed; `scripts/build-release.sh`
+builds it reproducibly into `dist/`, and the release workflow publishes it as a
+GitHub Release.
 
 ## More documentation
 

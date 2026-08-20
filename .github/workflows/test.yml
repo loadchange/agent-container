@@ -2,6 +2,8 @@ name: test
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
@@ -24,7 +26,7 @@ jobs:
           cargo test --locked --offline
           cargo clippy --locked --offline --all-targets -- -D warnings
 
-      - name: Reproduce the signed arm64 launcher
+      - name: Build the reproducible release
         shell: bash
         run: |
           set -euo pipefail
@@ -34,51 +36,27 @@ jobs:
             exit 1
           }
 
-          build_one="$RUNNER_TEMP/agent-container-release-one"
-          build_two="$RUNNER_TEMP/agent-container-release-two"
-          test ! -e "$build_one"
-          test ! -e "$build_two"
-
-          for target_dir in "$build_one" "$build_two"; do
-            CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$target_dir" \
-              cargo build \
-                --locked \
-                --offline \
-                --release \
-                --bin agent-container-launcher
-
-            artifact="$target_dir/release/agent-container-launcher"
-            /usr/bin/strip "$artifact"
-            /usr/bin/codesign --force --sign - "$artifact"
-
-            [ "$(/usr/bin/file -b "$artifact")" = \
-              "Mach-O 64-bit executable arm64" ]
-            /usr/bin/codesign --verify --strict "$artifact"
-            /usr/bin/codesign -dvv "$artifact" 2>&1 \
-              | grep -F 'Signature=adhoc' >/dev/null
-          done
-
-          cmp \
-            "$build_one/release/agent-container-launcher" \
-            "$build_two/release/agent-container-launcher"
-          cmp \
-            "$build_one/release/agent-container-launcher" \
-            agent-container-darwin-arm64
+          # Two isolated builds, each stripped and ad-hoc signed, must agree
+          # byte for byte. The native launcher is published through GitHub
+          # Releases; it is not tracked in git.
+          scripts/build-release.sh
 
       - name: Validate Bash syntax
         run: |
           /bin/bash -n \
-            agent-container \
-            agent-container-runtime \
-            agent-workspace-connect \
-            agent-workspace-session \
-            claude-container \
-            codex-container \
-            grok-container \
-            entrypoint.sh \
-            host-exec-client \
             install.sh \
             uninstall.sh \
+            bin/agent-container \
+            bin/claude-container \
+            bin/codex-container \
+            bin/grok-container \
+            runtime/agent-container-runtime \
+            runtime/agent-workspace-connect \
+            runtime/agent-workspace-session \
+            runtime/entrypoint.sh \
+            runtime/host-exec-client \
+            scripts/build-release.sh \
+            scripts/generate-manifest.sh \
             tests/test-agent-container.sh \
             tests/test-host-exec.sh \
             tests/test-install-uninstall.sh \
@@ -95,33 +73,47 @@ jobs:
             tests/install-fixtures/*
 
       - name: Validate host broker syntax
-        run: node --check host-exec-broker.mjs
+        run: node --check runtime/host-exec-broker.mjs
+
+      - name: Validate Homebrew formula syntax
+        run: ruby -c Formula/agent-container.rb
 
       - name: Validate profiles and executable modes
         run: |
-          ./agent-container profiles
-          test -x agent-container
-          test -x agent-container-runtime
-          test -x agent-container-darwin-arm64
-          test -x agent-workspace-connect
-          test -x agent-workspace-session
-          test -x claude-container
-          test -x codex-container
-          test -x grok-container
-          test -x entrypoint.sh
-          test -x host-exec-client
-          test -x install.sh
-          test -x uninstall.sh
-          test -x tests/test-agent-container.sh
-          test -x tests/test-host-exec.sh
-          test -x tests/test-install-uninstall.sh
-          test -x tests/test-workspace-bridge.sh
-          test -x tests/test-workspace-session-live.sh
+          dist/agent-container-darwin-arm64 profiles
+          for executable in \
+            install.sh \
+            uninstall.sh \
+            bin/agent-container \
+            bin/claude-container \
+            bin/codex-container \
+            bin/grok-container \
+            runtime/agent-container-runtime \
+            runtime/agent-workspace-connect \
+            runtime/agent-workspace-session \
+            runtime/entrypoint.sh \
+            runtime/host-exec-client \
+            scripts/build-release.sh \
+            scripts/generate-manifest.sh \
+            dist/agent-container-darwin-arm64 \
+            dist/agent-container-runtime \
+            dist/entrypoint.sh \
+            dist/host-exec-client \
+            dist/agent-workspace-connect \
+            dist/agent-workspace-session \
+            tests/test-agent-container.sh \
+            tests/test-host-exec.sh \
+            tests/test-install-uninstall.sh \
+            tests/test-workspace-bridge.sh \
+            tests/test-workspace-session-live.sh \
+            tests/install-fixtures/*; do
+            test -x "$executable"
+          done
           test -f tests/fixtures/workspace-bridge-peer.rs
           test -x tests/fixtures/workspace-session-test-agent
 
       - name: Verify release manifest
-        run: shasum -a 256 -c release-manifest.sha256
+        run: scripts/generate-manifest.sh --check
 
       - name: Run workspace bridge security tests
         run: tests/test-workspace-bridge.sh

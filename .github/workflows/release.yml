@@ -1,0 +1,121 @@
+name: release
+
+# Publishes a GitHub Release after the test workflow proves the exact same
+# commit on main. Chaining through workflow_run (instead of a plain push
+# trigger) means a broken main never produces a release, and the formula
+# refresh commit pushed with the repository GITHUB_TOKEN cannot re-trigger
+# workflows, so the loop is closed by construction.
+on:
+  workflow_run:
+    workflows: [test]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-26
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        !contains(github.event.workflow_run.head_commit.message, '[skip release]')
+      )
+    steps:
+      - name: Resolve the commit under test
+        id: commit
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.commit.outputs.sha }}
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.75.0
+
+      - name: Compute the release version
+        id: version
+        run: |
+          major_minor=$(sed -n 's/^version = "\([0-9][0-9]*\.[0-9][0-9]*\)\..*"/\1/p' Cargo.toml)
+          [ -n "$major_minor" ] || {
+            echo "Could not parse the major.minor version from Cargo.toml" >&2
+            exit 1
+          }
+          version="$major_minor.${{ github.run_number }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the reproducible release
+        run: scripts/build-release.sh --tarball
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          # A re-run keeps its run_number, so the tag is stable; republishing
+          # must overwrite assets instead of failing on the existing release.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              dist/agent-container-darwin-arm64 \
+              dist/agent-container-darwin-arm64.tar.gz \
+              dist/release-manifest.sha256 \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --target "$RELEASE_SHA" \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              dist/agent-container-darwin-arm64 \
+              dist/agent-container-darwin-arm64.tar.gz \
+              dist/release-manifest.sha256
+          fi
+
+      - name: Refresh the Homebrew formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tarball_sha256=$(shasum -a 256 \
+            dist/agent-container-darwin-arm64.tar.gz | awk '{print $1}')
+          scripts/generate-formula.sh \
+            "$RELEASE_VERSION" "$tarball_sha256" > Formula/agent-container.rb
+          ruby -c Formula/agent-container.rb
+
+          # The checkout is pinned to the tested commit (detached HEAD), and
+          # main may already have advanced past it, so the formula is updated
+          # through the contents API instead of a branch push. Updates pushed
+          # with GITHUB_TOKEN do not trigger new workflow runs.
+          formula_path="Formula/agent-container.rb"
+          existing_sha=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/contents/$formula_path?ref=main" \
+            --jq .sha 2>/dev/null || true)
+          encoded_formula=$(base64 < Formula/agent-container.rb | tr -d '\n')
+          if [ -n "$existing_sha" ]; then
+            gh api -X PUT \
+              "repos/${GITHUB_REPOSITORY}/contents/$formula_path" \
+              -f message="chore(release): refresh the Homebrew formula for $RELEASE_TAG [skip release]" \
+              -f content="$encoded_formula" \
+              -f sha="$existing_sha" >/dev/null
+          else
+            gh api -X PUT \
+              "repos/${GITHUB_REPOSITORY}/contents/$formula_path" \
+              -f message="chore(release): add the Homebrew formula for $RELEASE_TAG [skip release]" \
+              -f content="$encoded_formula" >/dev/null
+          fi

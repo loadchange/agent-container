@@ -23,10 +23,10 @@ case "$runtime_uid:$runtime_gid" in
 esac
 
 for required in \
-  "$repo_root/agent-container-darwin-arm64" \
+  "$repo_root/dist/agent-container-darwin-arm64" \
   "$repo_root/target/release/agent-container-launcher" \
-  "$repo_root/agent-workspace-connect" \
-  "$repo_root/agent-workspace-session" \
+  "$repo_root/runtime/agent-workspace-connect" \
+  "$repo_root/runtime/agent-workspace-session" \
   "$repo_root/tests/fixtures/workspace-session-test-agent"; do
   [ -f "$required" ] && [ ! -L "$required" ] \
     || { printf 'Unsafe live-test input: %s\n' "$required" >&2; exit 64; }
@@ -278,7 +278,7 @@ start_broker() {
 
   : > "$record"
   : > "$error"
-  "$repo_root/agent-container-darwin-arm64" \
+  "$repo_root/dist/agent-container-darwin-arm64" \
     __workspace-broker "$workspace" "$gateway" \
     > "$record" 2> "$error" &
   broker_pid=$!
@@ -455,9 +455,9 @@ read_tree_identity() {
   printf '%s:%s\n' "$pid" "$start_time"
 }
 
-container cp "$repo_root/agent-workspace-session" \
+container cp "$repo_root/runtime/agent-workspace-session" \
   "$container_name:/usr/local/bin/agent-workspace-session" >/dev/null
-container cp "$repo_root/agent-workspace-connect" \
+container cp "$repo_root/runtime/agent-workspace-connect" \
   "$container_name:/usr/local/bin/agent-workspace-connect" >/dev/null
 container cp "$repo_root/tests/fixtures/workspace-session-test-agent" \
   "$container_name:/usr/local/bin/workspace-session-test-agent" >/dev/null

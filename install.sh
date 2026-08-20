@@ -2,7 +2,8 @@
 set -euo pipefail
 
 readonly INSTALL_MARKER_TEXT="managed by agent-container installer v1"
-readonly DEFAULT_BASE_URL="https://raw.githubusercontent.com/loadchange/agent-container/main"
+readonly DEFAULT_BASE_URL="https://github.com/loadchange/agent-container/releases/latest/download"
+readonly RELEASE_TARBALL="agent-container-darwin-arm64.tar.gz"
 BASE_URL="$DEFAULT_BASE_URL"
 BASE_URL_EXPLICIT=false
 LOCAL_RELEASE_DIR=""
@@ -50,8 +51,10 @@ Options:
   --profile PROFILE   Install one profile (claude, codex, or grok).
                       May be repeated to install multiple profiles.
   --all               Install all profiles explicitly (the default).
-  --base-url URL      Download the release manifest and assets from URL.
-                      Intended for an internal mirror or source checkout.
+  --base-url URL      Download the release manifest and tarball from URL.
+                      The URL must serve release-manifest.sha256 and
+                      agent-container-darwin-arm64.tar.gz. Intended for an
+                      internal mirror.
   -h, --help          Show this help.
 
 Examples:
@@ -59,7 +62,11 @@ Examples:
   ./install.sh --all
   ./install.sh --profile grok
   ./install.sh --profile claude --profile codex
-  ./install.sh --profile claude --base-url "file://$PWD"
+  ./install.sh --profile claude --base-url "https://internal-mirror.example/agent-container"
+
+By default the installer downloads the latest GitHub Release. From a source
+checkout it automatically uses the dist/ layout produced by
+scripts/build-release.sh when it is present.
 
 The selected profiles are the desired managed set. Re-running with a different
 selection removes only unselected commands that this project can prove it
@@ -398,6 +405,10 @@ discover_local_release() {
     || return 1
   candidate_script="$candidate_dir/${candidate_script##*/}"
   [ -f "$candidate_script" ] && [ ! -L "$candidate_script" ] || return 1
+
+  # Source checkouts stage the complete flat release layout under dist/ with
+  # scripts/build-release.sh; the native launcher is not tracked in git.
+  candidate_dir="$candidate_dir/dist"
   [ -f "$candidate_dir/release-manifest.sha256" ] \
     && [ ! -L "$candidate_dir/release-manifest.sha256" ] \
     && [ -d "$candidate_dir/profiles" ] \
@@ -836,13 +847,33 @@ done < "$tmp_dir/release-manifest.sha256"
   || die "Release manifest is incomplete."
 
 mkdir -- "$tmp_dir/profiles"
+if [ -n "$LOCAL_RELEASE_DIR" ]; then
+  for ((asset_index = 0; asset_index < ${#ASSETS[@]}; asset_index++)); do
+    asset=${ASSETS[$asset_index]}
+    download_release_file "$asset" "$tmp_dir/$asset"
+    [ -s "$tmp_dir/$asset" ] || die "Local release asset is empty: $asset"
+  done
+else
+  # GitHub Release assets are flat, so the per-file release layout ships
+  # inside one tarball. Extract only the expected members by name: a
+  # malicious or corrupted archive can neither traverse outside the staging
+  # directory nor introduce unexpected files, and every extracted member is
+  # re-checked below as a regular, non-symlink file against the manifest.
+  download_release_file "$RELEASE_TARBALL" "$tmp_dir/$RELEASE_TARBALL"
+  [ -s "$tmp_dir/$RELEASE_TARBALL" ] \
+    || die "The downloaded release tarball is empty."
+  if ! tar -xzf "$tmp_dir/$RELEASE_TARBALL" -C "$tmp_dir" "${ASSETS[@]}"; then
+    die "The release tarball is incomplete or could not be extracted."
+  fi
+fi
 for ((asset_index = 0; asset_index < ${#ASSETS[@]}; asset_index++)); do
   asset=${ASSETS[$asset_index]}
-  download_release_file "$asset" "$tmp_dir/$asset"
-  [ -s "$tmp_dir/$asset" ] || die "Downloaded asset is empty: $asset"
+  [ -f "$tmp_dir/$asset" ] && [ ! -L "$tmp_dir/$asset" ] \
+    || die "Release asset is missing or unsafe: $asset"
+  [ -s "$tmp_dir/$asset" ] || die "Release asset is empty: $asset"
   actual_hash=$(sha256_file "$tmp_dir/$asset")
   [ "$actual_hash" = "${manifest_hashes[$asset_index]}" ] \
-    || die "Downloaded asset does not match release manifest: $asset"
+    || die "Release asset does not match release manifest: $asset"
 done
 
 # curl creates downloads without execute permissions. Set the launcher's final
@@ -1202,6 +1233,8 @@ if command -v container >/dev/null 2>&1; then
   echo "Apple container services will be started automatically when needed:"
   echo "  ${SELECTED_PROFILES[0]}-container"
 else
-  echo "Apple container is not installed. Get version 1.2.0 or newer from:"
+  echo "Apple container is not installed. Install version 1.2.0 or newer with:"
+  echo "  brew install container"
+  echo "or download the signed package from:"
   echo "  https://github.com/apple/container/releases"
 fi
