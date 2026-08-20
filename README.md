@@ -61,12 +61,14 @@ or a configured root list. For each invocation, the launcher:
 1. resolves the current Git top-level directory, or the current directory when
    outside Git;
 2. starts a one-connection Rust workspace broker on macOS;
-3. starts `container exec` in a private guest mount namespace;
-4. mounts that one host project at the same absolute path through SSHFS and raw
+3. starts a per-client host-tool broker so guest `git` and `gh` default to
+   sandboxed host executables with the host identity and credentials;
+4. starts `container exec` in a private guest mount namespace;
+5. mounts that one host project at the same absolute path through SSHFS and raw
    SFTP;
-5. changes to the caller's original cwd and starts a fresh Agent process as the
+6. changes to the caller's original cwd and starts a fresh Agent process as the
    host numeric UID/GID;
-6. unmounts the workspace and exits the broker when that Agent process ends.
+7. unmounts the workspace and exits both brokers when that Agent process ends.
 
 This makes project switching dynamic. No root registration, root environment
 variable, or singleton restart is needed when moving between ordinary Git
@@ -208,7 +210,8 @@ resolves a floating publisher channel to one exact version before deciding
 whether an image is reusable. Claude and Grok install one native ELF; Codex
 retains its complete standalone tree because its executable depends on adjacent
 helpers and resources. Node.js and npm are not installed in the normal Agent
-image.
+image; a host Node.js installation powers the default host git/gh broker, and
+its absence only degrades that channel to the guest binaries.
 
 The first invocation may build the image and create the profile singleton. A
 version probe is a convenient prebuild:
@@ -329,6 +332,39 @@ selected project. SSHFS caching is intentionally short, but remote/FUSE
 semantics are not identical to a native APFS directory. File-watch tools should
 be tested and may need polling or a restart after host-side edits.
 
+## Host git and gh
+
+By default, `git` and `gh` inside a singleton client resolve to per-session
+shims that run the corresponding **host** executables through an authenticated
+host-tool broker. Host `git` and `gh` therefore operate with the operator's
+real Git configuration, credential helpers, and GitHub CLI login, so
+`git push` and `gh pr create` work exactly as they do in a host terminal.
+Every other command still runs in the guest, and the guest `git`/`gh`
+binaries remain available as fallbacks.
+
+The channel is deliberately narrow:
+
+- the manifest contains exactly the two commands; the broker rejects anything
+  else;
+- each proxied process runs under a generated macOS `sandbox-exec` profile
+  whose only writable tree is the current workspace root;
+- `git` may additionally read `~/.gitconfig`, XDG Git configuration, and SSH
+  metadata (never private-key files); `gh` may additionally read
+  `~/.config/gh`;
+- the broker lives only as long as its client and authenticates every request
+  with a per-client 256-bit token that never enters an argument vector;
+- host `git` operates on the real project directory, so large Git operations
+  avoid SFTP round-trips entirely.
+
+The broker uses the host Node.js runtime. When Node.js (or another
+prerequisite) is unavailable, the default launch prints one warning and falls
+back to the guest binaries; passing `--container-host-tools` explicitly makes
+the same condition fail closed instead. `--no-container-host-tools` disables
+the channel and silences the warning. A host `gh` login stored only in the
+macOS Keychain may not be readable under the sandbox; use
+`gh auth login --insecure-storage`, `GH_TOKEN` forwarding, or the guest `gh`
+login in that case.
+
 ## Configuration: `--container-*`
 
 Normal use requires no configuration. Public launcher settings are command-line
@@ -376,6 +412,7 @@ Boolean options use `--container-<name>` and `--no-container-<name>`.
 | `--container-accept-virtiofs-risk` | off | Continue past selected Apple VirtioFS risk checks |
 | `--container-allow-concurrent` | off | Permit overlapping legacy `run` VMs; also requires risk acceptance |
 | `--container-disable-fd-watchdog` | off | Disable the legacy `run` live file/vnode watchdog for controlled testing |
+| `--container-host-tools` | on | Proxy guest `git` and `gh` to sandboxed host executables with host credentials |
 
 Every boolean has a negative form, for example
 `--no-container-full-git-config`. Repeated settings use the last value.
@@ -437,6 +474,12 @@ loader, launcher-managed, malformed, or unset names are rejected. Forwarding a
 name still exposes its complete value to the Agent and anything it can run.
 
 ## Git, SSH, and GitHub capabilities
+
+Host `git` and `gh` proxying (see above) is the default identity and
+credential path: pushes, fetches, and GitHub operations run on the host with
+the host configuration. The static capabilities below instead change what the
+**guest** environment itself receives, for tools that shell out to Git inside
+the VM or when `--no-container-host-tools` is selected.
 
 Guest Git receives a staged configuration containing only host `user.name` and
 `user.email` by default. Broader capabilities are explicit:
@@ -574,7 +617,8 @@ codex-container run \
 `run` creates a per-launch auto-remove VM and uses Apple VirtioFS for the
 workspace and additional shares. It also starts the older Node.js host-command
 broker. Eligible host commands are snapshotted from host `PATH`; guest commands
-win normally, while host Git is preferred. Tighten the command surface with:
+win normally, while host Git and gh are preferred. Tighten the command surface
+with:
 
 ```bash
 codex-container run --no-host-exec git --
@@ -599,6 +643,9 @@ repositories harmless. By default an Agent can:
 
 - read and write the selected project root;
 - read and write its profile HOME;
+- run host `git` and `gh` inside a workspace-scoped macOS sandbox, with the
+  host Git configuration, credential helpers, and GitHub CLI login
+  (`--no-container-host-tools` disables this);
 - communicate with the network without a hostname allowlist;
 - affect other concurrent clients of the same profile through shared VM and
   HOME state.

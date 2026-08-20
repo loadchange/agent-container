@@ -40,6 +40,8 @@ Each client separately receives:
 - its own Agent process and arguments;
 - its own stdin/stdout and TTY decision;
 - its own host workspace broker and random token;
+- its own host git/gh broker and random token, unless
+  `--no-container-host-tools` is selected;
 - its own private guest mount namespace and SSHFS mount;
 - its own current working directory and exit status.
 
@@ -71,10 +73,16 @@ The Agent does not receive by default:
 - another profile's HOME;
 - project roots used by other clients as ordinary mounts;
 - host SSH private-key files or the SSH-agent socket;
-- host GitHub CLI configuration;
-- full host Git configuration, credential helpers, includes, or HTTP headers;
 - arbitrary host environment variables;
-- native host-command execution.
+- native host-command execution beyond the sandboxed host git/gh channel
+  described below.
+
+Through that default channel, host `git` runs with the real Git configuration
+(including credential helpers, includes, and HTTP headers) and host `gh` runs
+with readable GitHub CLI configuration. This is a deliberate authority grant:
+an Agent-driven `git push` or `gh` call carries the operator's identity and
+credentials, confined to the workspace-scoped host sandbox.
+`--no-container-host-tools` removes the channel entirely.
 
 The workspace is intentionally read-write. The Agent and code it executes can
 modify or delete tracked and untracked files, replace hooks, and write secrets
@@ -175,6 +183,35 @@ can still prevent the helper itself from running cleanup, so the containing
 important. A persistent VM should not be interpreted as a durable workspace
 mount.
 
+## Default host git and gh broker
+
+Each singleton client may also start one host-tool broker: the same
+authenticated Node.js broker legacy `run` uses, but with a fixed manifest of
+exactly two commands. The launcher stages `first git` and `first gh` (each
+resolved to a canonical host executable inside an admitted tool root), one
+writable execution root — the canonical workspace — and a fresh 256-bit
+session token. The guest session helper creates per-session `git`/`gh` shims
+and credential files inside the client's private runtime directory; the token
+travels by environment name, never in an argument vector, and the shims are
+invisible to other clients.
+
+Every proxied process runs under a generated `deny default` `sandbox-exec`
+profile whose writable filesystem scope is the workspace root. On top of the
+shared read-only tool roots, `git` may read `~/.gitconfig`, XDG Git
+configuration, and SSH metadata (never private-key files), and `gh` may read
+`~/.config/gh`; both run with `HOME` set to the real home so host credential
+helpers and the GitHub CLI login behave exactly as in a host terminal. The
+broker authenticates every request, polls its launcher PID, and exits when the
+client ends, so the channel cannot outlive the terminal that created it.
+
+This remains an explicit host-code-execution capability with the same caveats
+as legacy `run`: allowed interpreters reachable through Git hooks or
+credential helpers execute as the macOS user inside the declared scope, and
+`sandbox-exec` is a deprecated Apple interface. When the broker runtime is
+unavailable the default launch degrades to guest binaries with one warning; an
+explicit `--container-host-tools` fails closed instead, and
+`--no-container-host-tools` never creates the broker.
+
 ## Identity and Linux privilege
 
 Apple volume mounts have no UID/GID translation. The runtime creates or adjusts
@@ -238,8 +275,13 @@ Agent and anything it can execute.
 
 ## Static Git, GitHub, and SSH capabilities
 
-The default Git file contains only host `user.name` and `user.email`. The
-following leading launcher flags expand authority:
+The host git/gh broker above is the default credential path and is per-client.
+The static capabilities below instead change what the guest environment itself
+receives; they matter for guest tools that embed Git and whenever
+`--no-container-host-tools` is selected.
+
+The default staged guest Git file contains only host `user.name` and
+`user.email`. The following leading launcher flags expand authority:
 
 | Capability | Exposure |
 |---|---|
@@ -274,11 +316,13 @@ compatibility commands, Apple `container`, and `sudo` are never exposed as host
 commands. Users can remove more names or prefer a selected host command through
 `run` options.
 
-This is not equivalent to the default Micro-VM-only command boundary:
+This is broader than the default host git/gh channel, which stages exactly two
+commands and one writable workspace root:
 
+- every eligible host command from `PATH` is cataloged, not only git and gh;
 - a native interpreter or shell runs as the macOS user;
 - an allowed process can start children within the sandbox;
-- host Git can use selected real Git configuration and a live SSH agent;
+- host Git and gh can use selected real configuration and a live SSH agent;
 - read-write shares authorize modification or deletion;
 - the transport is pipe-only and has no controlling PTY;
 - deliberately detached descendants can escape a process-group lifetime

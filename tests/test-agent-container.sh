@@ -235,6 +235,7 @@ reset_case_environment() {
     AGENT_CONTAINER_HOST_BROKER_BIN \
     AGENT_CONTAINER_HOST_GATEWAY \
     AGENT_CONTAINER_HOST_NODE_BIN \
+    AGENT_CONTAINER_HOST_TOOLS \
     AGENT_CONTAINER_HTTP_PROXY \
     AGENT_CONTAINER_IMAGE \
     AGENT_CONTAINER_HTTPS_PROXY \
@@ -305,6 +306,10 @@ reset_case_environment() {
     TEST_RUNNER_PATH \
     2>/dev/null || true
   unset "${test_forward_env_names[@]}" 2>/dev/null || true
+  # Suite default: the singleton host git/gh channel stays off so existing
+  # cases keep proving the guest-only contract. Dedicated host-tool cases
+  # opt back in; an empty value exercises the built-in default.
+  AGENT_CONTAINER_HOST_TOOLS=false
 }
 
 new_case() {
@@ -468,6 +473,13 @@ launch_exec() {
     || launcher_options+=(--container-accept-virtiofs-risk)
   [ "${AGENT_CONTAINER_ALLOW_CONCURRENT:-false}" != true ] \
     || launcher_options+=(--container-allow-concurrent)
+  if [ -n "${AGENT_CONTAINER_HOST_TOOLS:-}" ]; then
+    if [ "$AGENT_CONTAINER_HOST_TOOLS" = true ]; then
+      launcher_options+=(--container-host-tools)
+    else
+      launcher_options+=(--no-container-host-tools)
+    fi
+  fi
 
   runner_env=(
     "HOME=$case_home"
@@ -887,6 +899,102 @@ assert_no_line "$case_log" "ARG=$legacy_share:$legacy_share:ro"
 pass "runtime words remain ordinary Agent arguments without an explicit run subcommand"
 
 tests_run=$((tests_run + 1))
+new_case singleton_host_tools_default_staging
+TEST_SINGLETON_LAUNCH=true
+singleton_host_tools_bin="$case_dir/host-tools-bin"
+mkdir "$singleton_host_tools_bin"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$singleton_host_tools_bin/gh"
+chmod 0755 "$singleton_host_tools_bin/gh"
+TEST_RUNNER_PATH="$singleton_host_tools_bin:$fixture_dir:/usr/bin:/bin"
+singleton_capture_broker="$case_dir/capture-host-broker"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'session_dir='
+  printf '%s\n' 'previous='
+  printf '%s\n' 'for argument in "$@"; do'
+  printf '%s\n' '  [ "$previous" != --session-dir ] || session_dir=$argument'
+  printf '%s\n' '  previous=$argument'
+  printf '%s\n' 'done'
+  printf '%s\n' '[ -n "$session_dir" ] || exit 66'
+  printf 'cp -R "$session_dir" %q\n' "$case_dir/captured-session"
+  printf 'exec %q "$@"\n' "$fixture_dir/host-exec-broker"
+} > "$singleton_capture_broker"
+chmod 0755 "$singleton_capture_broker"
+AGENT_CONTAINER_HOST_BROKER_BIN="$singleton_capture_broker"
+# An empty value skips the launcher flag entirely, so this case proves the
+# built-in host-tools default rather than an explicit opt-in.
+AGENT_CONTAINER_HOST_TOOLS=
+run_program "$repo_root/bin/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_ENDPOINT'
+assert_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_TOKEN'
+assert_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_COMMANDS'
+awk -F '\t' '
+  $1 == "first" && $2 == "git" && $3 ~ /^\// { matches += 1 }
+  END { exit matches == 1 ? 0 : 1 }
+' "$case_dir/captured-session/host-commands.tsv" \
+  || fail "the singleton client did not stage exactly one absolute host-first Git command"
+assert_line "$case_dir/captured-session/host-commands.tsv" \
+  "$(printf 'first\tgh\t%s' "$singleton_host_tools_bin/gh")"
+assert_line "$case_dir/captured-session/host-tool-roots.txt" \
+  "$singleton_host_tools_bin"
+assert_line "$case_dir/captured-session/host-roots.tsv" \
+  "$(printf 'rw\t%s' "$case_workspace")"
+awk -F '\t' '
+  $1 == "rw" { writable += 1 }
+  $1 == "ro" { readable += 1 }
+  END { exit (writable == 1 && readable == 0) ? 0 : 1 }
+' "$case_dir/captured-session/host-roots.tsv" \
+  || fail "the singleton client staged more than the one writable workspace root"
+grep -Eq '^[0-9a-f]{64}$' \
+  "$case_dir/captured-session/host-exec-token" \
+  || fail "the singleton client did not stage one 256-bit host-exec token"
+singleton_staged_token=$(sed -n '1p' \
+  "$case_dir/captured-session/host-exec-token")
+assert_secret_absent "$case_log" "$singleton_staged_token" host-exec-token
+assert_line "$case_dir/captured-session/mode" 'singleton-client'
+assert_not_contains "$case_dir/err" 'Host git/gh proxying is disabled'
+pass "singleton clients stage host-first git/gh and hand the channel over by name only"
+
+tests_run=$((tests_run + 1))
+new_case singleton_host_tools_disabled
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_HOST_TOOLS=false
+run_program "$repo_root/bin/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_ENDPOINT'
+assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_TOKEN'
+assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_COMMANDS'
+assert_not_contains "$case_dir/err" 'Host git/gh proxying'
+pass "--no-container-host-tools launches without a host git/gh channel or warning"
+
+tests_run=$((tests_run + 1))
+new_case singleton_host_tools_strict_failure
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_HOST_TOOLS=true
+AGENT_CONTAINER_HOST_NODE_BIN=/nonexistent-agent-container-node
+if run_program "$repo_root/bin/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "explicit --container-host-tools with a missing broker runtime should fail"
+fi
+assert_contains "$case_dir/err" 'no-container-host-tools'
+assert_no_line "$case_log" 'ARG=create'
+pass "an explicit host-tools opt-in fails closed before any native mutation"
+
+tests_run=$((tests_run + 1))
+new_case singleton_host_tools_graceful_fallback
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_HOST_TOOLS=
+AGENT_CONTAINER_HOST_NODE_BIN=/nonexistent-agent-container-node
+run_program "$repo_root/bin/grok-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_contains "$case_dir/err" 'Host git/gh proxying is disabled'
+assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_HOST_EXEC_ENDPOINT'
+assert_line "$case_log" 'ARG=/usr/local/bin/agent-workspace-session'
+pass "the default host-tools channel degrades to guest git/gh with one warning"
+
+tests_run=$((tests_run + 1))
 new_case generic_run_read_only_share
 AGENT_CONTAINER_ENABLE_EXPERIMENTAL=true
 AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
@@ -912,6 +1020,13 @@ awk -F '\t' '
       "$case_dir/captured-host-stage/host-commands.tsv" >&2
     fail "run mode did not stage exactly one absolute host-first Git command"
   }
+if command -v gh >/dev/null 2>&1; then
+  awk -F '\t' '
+    $1 == "first" && $2 == "gh" && $3 ~ /^\// { matches += 1 }
+    END { exit matches == 1 ? 0 : 1 }
+  ' "$case_dir/captured-host-stage/host-commands.tsv" \
+    || fail "run mode did not stage the available host gh as host-first"
+fi
 assert_contains "$repo_root/runtime/entrypoint.sh" \
   'runtime_path="$host_first_dir:$runtime_path:$host_fallback_dir"'
 assert_contains "$repo_root/runtime/entrypoint.sh" 'PATH="$runtime_path"'

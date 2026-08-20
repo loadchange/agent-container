@@ -1211,7 +1211,7 @@ singleton_control_action=""
 extra_share_inputs=()
 extra_share_input_modes=()
 host_exec_denied=()
-host_exec_first=(git)
+host_exec_first=(git gh)
 
 requested_profile="${1:-}"
 case "$requested_profile" in
@@ -1335,6 +1335,24 @@ if [ -n "${AGENT_CONTAINER_FORWARD_API_KEY+x}" ]; then
     false) profile_credential_forward_mode=false ;;
     *)
       die "--container-forward-api-key must be true or false."
+      ;;
+  esac
+fi
+
+# Host git and gh proxying is the default for normal singleton clients so
+# repository pushes and GitHub operations use the operator's host identity and
+# credentials. The default degrades to the guest binaries with a warning when
+# the host broker runtime is unavailable; an explicit --container-host-tools
+# instead fails closed, and --no-container-host-tools disables the channel.
+host_tools_mode=true
+host_tools_explicit=false
+if [ -n "${AGENT_CONTAINER_HOST_TOOLS+x}" ]; then
+  host_tools_explicit=true
+  case "$AGENT_CONTAINER_HOST_TOOLS" in
+    true) host_tools_mode=true ;;
+    false) host_tools_mode=false ;;
+    *)
+      die "--container-host-tools must be true or false."
       ;;
   esac
 fi
@@ -2534,6 +2552,11 @@ run_singleton_client() {
 
   resolve_singleton_host_gateway
   resolve_workspace_launcher
+  if [ "$host_tools_mode" = true ]; then
+    # Start this client's host git/gh broker before any liveness descriptor
+    # exists so the broker never inherits the workspace-owner pipe.
+    start_singleton_host_tools_broker
+  fi
 
   broker_record="$host_stage_dir/workspace-broker.record"
   broker_log="$host_stage_dir/workspace-broker.log"
@@ -2695,13 +2718,27 @@ run_singleton_client() {
     done
   fi
 
-  # The persistent VM references only profile-scoped staging. Remove this
-  # launcher's live registration before releasing the lifecycle mutex so other
-  # clients can attach concurrently while this container exec remains active.
+  if [ "$singleton_host_tools_active" = true ]; then
+    # Like the workspace channel, only the exact names enter the Apple CLI
+    # argument vector; the endpoint and token values travel through the
+    # inherited environment to the guest session helper.
+    export AGENT_WORKSPACE_HOST_EXEC_ENDPOINT="$host_exec_endpoint"
+    export AGENT_WORKSPACE_HOST_EXEC_TOKEN="$host_exec_token"
+    export AGENT_WORKSPACE_HOST_EXEC_COMMANDS="$singleton_host_exec_commands"
+    singleton_exec_args+=(
+      --env AGENT_WORKSPACE_HOST_EXEC_ENDPOINT
+      --env AGENT_WORKSPACE_HOST_EXEC_TOKEN
+      --env AGENT_WORKSPACE_HOST_EXEC_COMMANDS
+    )
+  fi
+
+  # The persistent VM references only profile-scoped static staging. This
+  # client's registration and host-tool broker session stay under its own
+  # sessions/session-<pid> directory: the singleton-client mode marker lets
+  # concurrent clients skip it while this launcher is alive, and EXIT cleanup
+  # removes it together with the brokers.
   [ -d "$host_stage_dir" ] && [ ! -L "$host_stage_dir" ] \
     || die "Singleton client staging became unsafe before attach."
-  rm -rf -- "$host_stage_dir" \
-    || die "Unable to remove singleton client staging before attach."
 
   # Install client traps before releasing the lifecycle mutex. Signals were
   # intentionally ignored throughout the preceding native critical section;
@@ -2736,6 +2773,7 @@ run_singleton_client() {
   fi
   wait "$workspace_broker_pid" 2>/dev/null || true
   workspace_broker_pid=""
+  stop_host_broker
   trap - INT TERM HUP
   exit "$run_status"
 }
@@ -2820,7 +2858,21 @@ for session_dir in "$sessions_root"/session-*; do
   registered_profile=$(read_single_line "$session_dir/profile" || true)
   valid_profile_id "$registered_profile" \
     || die "Agent session registration has an invalid profile: $session_dir"
+  registered_mode=""
+  if [ -e "$session_dir/mode" ] || [ -L "$session_dir/mode" ]; then
+    registered_mode=$(read_single_line "$session_dir/mode" || true)
+    [ "$registered_mode" = singleton-client ] \
+      || die "Agent session registration has an invalid mode: $session_dir"
+  fi
   if kill -0 "$registered_pid" 2>/dev/null; then
+    if [ "$registered_mode" = singleton-client ]; then
+      # Live singleton clients share their profile VM and hold per-client
+      # broker staging; they do not conflict with another singleton client.
+      if [ "$singleton_requested" = true ]; then
+        continue
+      fi
+      die "A '$registered_profile' singleton client is active (PID $registered_pid); stop it before using legacy run mode."
+    fi
     if [ "$singleton_requested" = true ]; then
       die "A legacy Agent session is registering or running; stop it before starting the persistent '$profile_id' singleton."
     elif [ "$concurrent_sessions" != true ]; then
@@ -2893,33 +2945,446 @@ fi
 mkdir "$host_stage_dir"
 printf '%s\n' "$$" > "$host_stage_dir/pid"
 printf '%s\n' "$profile_id" > "$host_stage_dir/profile"
+if [ "$singleton_requested" = true ]; then
+  # Reconciliation and uninstall must be able to distinguish a live singleton
+  # client's per-exec staging from a legacy attached run session.
+  printf '%s\n' singleton-client > "$host_stage_dir/mode"
+fi
 
 host_node_bin=""
 host_broker_bin=""
-if [ "$run_mode" = true ]; then
-  host_path_is_agent_writable() {
-    local candidate_path=$1
-    local writable_index=0
-    if path_contains "$mount_root" "$candidate_path" \
-      || path_contains "$state_root" "$candidate_path"; then
+host_exec_runtime_error=""
+host_exec_endpoint=""
+host_exec_token=""
+
+host_path_is_agent_writable() {
+  local candidate_path=$1
+  local writable_index=0
+  if path_contains "$mount_root" "$candidate_path" \
+    || path_contains "$state_root" "$candidate_path"; then
+    return 0
+  fi
+  if [ -n "$common_git_dir" ] \
+    && path_contains "$common_git_dir" "$candidate_path"; then
+    return 0
+  fi
+  while [ "$writable_index" -lt "${#extra_share_paths[@]}" ]; do
+    if [ "${extra_share_modes[$writable_index]}" = rw ] \
+      && path_contains \
+        "${extra_share_paths[$writable_index]}" \
+        "$candidate_path"; then
       return 0
     fi
-    if [ -n "$common_git_dir" ] \
-      && path_contains "$common_git_dir" "$candidate_path"; then
-      return 0
+    writable_index=$((writable_index + 1))
+  done
+  return 1
+}
+
+# Every host broker path shares one resolution of the launcher's PATH and one
+# selected Xcode/CommandLineTools installation.
+IFS=: read -r -a host_path_entries <<EOF
+${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
+EOF
+
+host_developer_resolved=false
+host_developer_path=""
+host_developer_root=""
+resolve_host_developer_root() {
+  [ "$host_developer_resolved" = false ] || return 0
+  host_developer_resolved=true
+
+  # Stock macOS developer commands are /usr/bin shims. Freeze common shims
+  # (including Git and Python) to the selected Xcode/CommandLineTools
+  # executables and admit their containing runtime tree read-only; this avoids
+  # xcrun trying to create ambient host cache files inside the sandbox.
+  if [ -x /usr/bin/xcode-select ]; then
+    host_developer_path=$(/usr/bin/xcode-select -p 2>/dev/null || true)
+  fi
+  case "$host_developer_path" in
+    /*)
+      host_developer_path=$(resolve_absolute_dir "$host_developer_path" || true)
+      ;;
+    *) host_developer_path="" ;;
+  esac
+  case "$host_developer_path" in
+    */Contents/Developer)
+      host_developer_root=${host_developer_path%/Contents/Developer}
+      ;;
+    *) host_developer_root="$host_developer_path" ;;
+  esac
+  case "$host_developer_root" in
+    /|*:*|*$'\n'*|*$'\r'*|*$'\t'*) host_developer_root="" ;;
+  esac
+  if [ -n "$host_developer_root" ] \
+    && path_contains "$host_developer_root" "$host_home_dir"; then
+    host_developer_root=""
+  fi
+}
+
+# Resolve the host-exec broker program and, when no explicit broker override
+# is selected, the native host Node.js executable. Failures publish one
+# message in host_exec_runtime_error: legacy run treats every failure as
+# fatal, while the default singleton host-tool channel may degrade.
+resolve_host_exec_broker_runtime() {
+  local host_node_command
+
+  host_exec_runtime_error=""
+  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
+    case "$AGENT_CONTAINER_HOST_BROKER_BIN" in
+      /*) ;;
+      *)
+        host_exec_runtime_error="--container-host-broker must be an absolute path."
+        return 1
+        ;;
+    esac
+    host_broker_bin=$(
+      /bin/realpath "$AGENT_CONTAINER_HOST_BROKER_BIN" 2>/dev/null || true
+    )
+    if [ ! -f "$host_broker_bin" ] || [ ! -x "$host_broker_bin" ]; then
+      host_exec_runtime_error="--container-host-broker is not executable: $host_broker_bin"
+      return 1
     fi
-    while [ "$writable_index" -lt "${#extra_share_paths[@]}" ]; do
-      if [ "${extra_share_modes[$writable_index]}" = rw ] \
-        && path_contains \
-          "${extra_share_paths[$writable_index]}" \
-          "$candidate_path"; then
-        return 0
-      fi
-      writable_index=$((writable_index + 1))
-    done
+    if host_path_is_agent_writable "$host_broker_bin"; then
+      host_exec_runtime_error="Refusing to execute the host broker from an Agent-writable root: $host_broker_bin"
+      return 1
+    fi
+    return 0
+  fi
+
+  host_node_command="${AGENT_CONTAINER_HOST_NODE_BIN:-$(command -v node || true)}"
+  case "$host_node_command" in
+    /*) ;;
+    *)
+      host_exec_runtime_error="a host Node.js executable is required for the host-exec broker."
+      return 1
+      ;;
+  esac
+  host_node_command=$(
+    /bin/realpath "$host_node_command" 2>/dev/null || true
+  )
+  if [ ! -f "$host_node_command" ] || [ ! -x "$host_node_command" ]; then
+    host_exec_runtime_error="Host Node.js is not executable: $host_node_command"
+    return 1
+  fi
+  if host_path_is_agent_writable "$host_node_command"; then
+    host_exec_runtime_error="Refusing to execute host Node.js from an Agent-writable root: $host_node_command"
+    return 1
+  fi
+  # Resolve version-manager shims while the user's normal shell environment
+  # is still present; the broker later starts from an intentionally clean env.
+  host_node_bin=$(
+    "$host_node_command" -p 'process.execPath' 2>/dev/null || true
+  )
+  case "$host_node_bin" in
+    /*) ;;
+    *)
+      host_exec_runtime_error="Host Node.js could not resolve its native executable."
+      return 1
+      ;;
+  esac
+  host_node_bin=$(/bin/realpath "$host_node_bin" 2>/dev/null || true)
+  if [ ! -f "$host_node_bin" ] || [ ! -x "$host_node_bin" ]; then
+    host_exec_runtime_error="Resolved host Node.js is not executable: $host_node_bin"
+    return 1
+  fi
+  if host_path_is_agent_writable "$host_node_bin"; then
+    host_exec_runtime_error="Refusing a resolved host Node.js inside an Agent-writable root: $host_node_bin"
+    return 1
+  fi
+  host_broker_bin="$asset_dir/host-exec-broker.mjs"
+}
+
+build_host_broker_launch_environment() {
+  local host_broker_path broker_path_index developer_path_inserted
+  local broker_path_entry developer_bin_dir
+
+  resolve_host_developer_root
+  host_broker_path=""
+  broker_path_index=0
+  developer_path_inserted=false
+  while [ "$broker_path_index" -lt "${#host_path_entries[@]}" ]; do
+    broker_path_entry=${host_path_entries[$broker_path_index]}
+    broker_path_index=$((broker_path_index + 1))
+    case "$broker_path_entry" in
+      /*) ;;
+      *) continue ;;
+    esac
+    [ -d "$broker_path_entry" ] || continue
+    broker_path_entry=$(resolve_absolute_dir "$broker_path_entry" || true)
+    case "$broker_path_entry" in
+      ''|*:*|*$'\n'*|*$'\r'*|*$'\t'*) continue ;;
+    esac
+    if [ "$broker_path_entry" = /usr/bin ] \
+      && [ "$developer_path_inserted" = false ] \
+      && [ -n "$host_developer_root" ]; then
+      for developer_bin_dir in \
+        "$host_developer_path/usr/bin" \
+        "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin"; do
+        [ -d "$developer_bin_dir" ] || continue
+        if [ -n "$host_broker_path" ]; then
+          host_broker_path="$host_broker_path:$developer_bin_dir"
+        else
+          host_broker_path="$developer_bin_dir"
+        fi
+      done
+      developer_path_inserted=true
+    fi
+    if [ -n "$host_broker_path" ]; then
+      host_broker_path="$host_broker_path:$broker_path_entry"
+    else
+      host_broker_path="$broker_path_entry"
+    fi
+  done
+  [ -n "$host_broker_path" ] \
+    || host_broker_path=/usr/bin:/bin:/usr/sbin:/sbin
+  broker_env=(
+    "PATH=$host_broker_path"
+    "HOME=$host_home_dir"
+  )
+  [ -n "${LANG:-}" ] && broker_env+=("LANG=$LANG")
+  [ -n "${LC_ALL:-}" ] && broker_env+=("LC_ALL=$LC_ALL")
+  [ -n "${LC_CTYPE:-}" ] && broker_env+=("LC_CTYPE=$LC_CTYPE")
+  [ -n "${LC_MESSAGES:-}" ] && broker_env+=("LC_MESSAGES=$LC_MESSAGES")
+  [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
+  [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
+  [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
+  if [ "$forward_ssh_agent" = true ] \
+    && [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    broker_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+  fi
+  return 0
+}
+
+# Start the authenticated host-exec broker for this client's staged session
+# and validate the endpoint it publishes. The caller must already hold the
+# resolved gateway, broker program, and staged manifests.
+start_host_exec_broker() {
+  local broker_ready_attempt host_exec_port
+  local -a broker_args
+
+  build_host_broker_launch_environment
+  rm -f "$host_stage_dir/host-exec-endpoint"
+  broker_args=(
+    --session-dir "$host_stage_dir"
+    --bind-address "$host_gateway"
+    --launcher-pid "$$"
+    --real-home "$host_home_dir"
+    --exec-home "$profile_host_exec_home"
+    --sandbox-bin /usr/bin/sandbox-exec
+  )
+  # The broker must not inherit the lifecycle-lock descriptor: it outlives the
+  # critical section and would otherwise serialize every later transaction.
+  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
+    (
+      trap - INT TERM HUP
+      exec 9<&-
+      exec env -i "${broker_env[@]}" \
+        "$host_broker_bin" "${broker_args[@]}"
+    ) > "$host_stage_dir/host-exec-broker.log" 2>&1 &
+  else
+    (
+      trap - INT TERM HUP
+      exec 9<&-
+      exec env -i "${broker_env[@]}" \
+        "$host_node_bin" "$host_broker_bin" "${broker_args[@]}"
+    ) > "$host_stage_dir/host-exec-broker.log" 2>&1 &
+  fi
+  host_broker_pid=$!
+
+  broker_ready_attempt=0
+  while [ ! -f "$host_stage_dir/host-exec-endpoint" ] \
+    && session_job_is_active "$host_broker_pid" \
+    && [ "$broker_ready_attempt" -lt 100 ]; do
+    sleep 0.05
+    broker_ready_attempt=$((broker_ready_attempt + 1))
+  done
+  host_exec_endpoint=$(read_single_line "$host_stage_dir/host-exec-endpoint" || true)
+  host_exec_port=""
+  case "$host_exec_endpoint" in
+    "$host_gateway":*) host_exec_port=${host_exec_endpoint#"$host_gateway:"} ;;
+  esac
+  case "$host_exec_port" in
+    ''|0|0*|*[!0-9]*) host_exec_port="" ;;
+  esac
+  if [ -z "$host_exec_port" ] \
+    || [ "${#host_exec_port}" -gt 5 ] \
+    || [ "$host_exec_port" -gt 65535 ] 2>/dev/null; then
+    stop_host_broker
+    host_exec_runtime_error="The host-exec broker did not publish a valid session endpoint."
+    return 1
+  fi
+  chmod 0600 "$host_stage_dir/host-exec-endpoint" \
+    "$host_stage_dir/host-exec-broker.log"
+}
+
+# The default host git/gh channel stages a fixed two-command manifest whose
+# only writable execution root is the selected workspace. It never catalogs
+# the wider PATH surface that legacy run exposes.
+singleton_host_tools_active=false
+singleton_host_exec_commands=""
+resolved_tool_executable=""
+resolved_tool_root=""
+
+fail_singleton_host_tools() {
+  local reason="$1"
+  singleton_host_tools_active=false
+  if [ "$host_tools_explicit" = true ] && [ "$host_tools_mode" = true ]; then
+    die "$reason Pass --no-container-host-tools to launch with guest git/gh only."
+  fi
+  warn "$reason Host git/gh proxying is disabled for this client; the guest binaries will be used. Pass --no-container-host-tools to silence this warning."
+  return 0
+}
+
+# Returns 1 when the host simply does not provide the command (a quiet guest
+# fallback) and 2 when a present command was rejected as unsafe (warned).
+resolve_singleton_host_tool() {
+  local tool_name="$1"
+  local tool_command tool_dir developer_candidate
+
+  resolved_tool_executable=""
+  resolved_tool_root=""
+  tool_command=$(command -v -- "$tool_name" 2>/dev/null || true)
+  case "$tool_command" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  resolved_tool_executable=$(/bin/realpath "$tool_command" 2>/dev/null || true)
+  [ -f "$resolved_tool_executable" ] && [ -x "$resolved_tool_executable" ] \
+    || return 2
+
+  # Freeze the /usr/bin developer shim to the selected Xcode/CommandLineTools
+  # executable exactly as legacy run does, so the sandbox never needs mutable
+  # xcrun cache behavior.
+  if [ "$resolved_tool_executable" = "/usr/bin/$tool_name" ]; then
+    resolve_host_developer_root
+    if [ -n "$host_developer_root" ]; then
+      for developer_candidate in \
+        "$host_developer_path/usr/bin/$tool_name" \
+        "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin/$tool_name"; do
+        if [ -f "$developer_candidate" ] && [ -x "$developer_candidate" ]; then
+          resolved_tool_executable=$(
+            /bin/realpath "$developer_candidate" 2>/dev/null || true
+          )
+          break
+        fi
+      done
+      [ -f "$resolved_tool_executable" ] && [ -x "$resolved_tool_executable" ] \
+        || return 2
+    fi
+  fi
+
+  case "$resolved_tool_executable" in
+    *$'\n'*|*$'\r'*|*$'\t'*) return 2 ;;
+  esac
+  if host_path_is_agent_writable "$resolved_tool_executable"; then
+    return 2
+  fi
+
+  tool_dir=$(dirname -- "$resolved_tool_executable")
+  resolved_tool_root="$tool_dir"
+  case "$tool_dir/" in
+    "$host_home_dir/.nvm/"*) resolved_tool_root="$host_home_dir/.nvm" ;;
+    "$host_home_dir/.pyenv/"*) resolved_tool_root="$host_home_dir/.pyenv" ;;
+    /opt/homebrew/*) resolved_tool_root=/opt/homebrew ;;
+    /usr/local/*) resolved_tool_root=/usr/local ;;
+  esac
+  if [ -n "$host_developer_root" ] \
+    && path_contains "$host_developer_root" "$resolved_tool_executable"; then
+    resolved_tool_root="$host_developer_root"
+  fi
+  case "$resolved_tool_root" in
+    ''|/|*:*|*$'\n'*|*$'\r'*|*$'\t'*) return 2 ;;
+  esac
+}
+
+stage_singleton_host_tools() {
+  local tool_name tool_resolution commands_tmp tool_roots_tmp roots_tmp
+  local staged_any
+
+  singleton_host_exec_commands=""
+  commands_tmp=$(mktemp "$host_stage_dir/.host-commands.XXXXXX") || return 1
+  tool_roots_tmp=$(mktemp "$host_stage_dir/.host-tool-roots.XXXXXX") || {
+    rm -f "$commands_tmp"
     return 1
   }
+  staged_any=false
+  for tool_name in git gh; do
+    tool_resolution=0
+    resolve_singleton_host_tool "$tool_name" || tool_resolution=$?
+    if [ "$tool_resolution" -eq 1 ]; then
+      # The host simply does not provide this command; the guest binary is
+      # the quiet, expected fallback.
+      continue
+    fi
+    if [ "$tool_resolution" -ne 0 ]; then
+      warn "Host $tool_name was rejected as unsafe for proxying; the guest $tool_name will be used."
+      continue
+    fi
+    printf 'first\t%s\t%s\n' \
+      "$tool_name" "$resolved_tool_executable" >> "$commands_tmp"
+    printf '%s\n' "$resolved_tool_root" >> "$tool_roots_tmp"
+    if [ -n "$singleton_host_exec_commands" ]; then
+      singleton_host_exec_commands="$singleton_host_exec_commands,$tool_name"
+    else
+      singleton_host_exec_commands="$tool_name"
+    fi
+    staged_any=true
+  done
+  if [ "$staged_any" != true ]; then
+    rm -f "$commands_tmp" "$tool_roots_tmp"
+    return 1
+  fi
+  mv "$commands_tmp" "$host_stage_dir/host-commands.tsv"
+  sort -u "$tool_roots_tmp" > "$host_stage_dir/host-tool-roots.txt"
+  rm -f "$tool_roots_tmp"
 
+  roots_tmp=$(mktemp "$host_stage_dir/.host-roots.XXXXXX") || return 1
+  # Dynamic singleton sharing already rejects worktrees whose Git common
+  # directory lies outside the workspace root, so one writable root suffices.
+  printf 'rw\t%s\n' "$mount_root" >> "$roots_tmp"
+  mv "$roots_tmp" "$host_stage_dir/host-roots.tsv"
+  chmod 0600 \
+    "$host_stage_dir/host-commands.tsv" \
+    "$host_stage_dir/host-tool-roots.txt" \
+    "$host_stage_dir/host-roots.tsv"
+
+  host_exec_token=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null \
+    | od -An -tx1 | tr -d ' \n')
+  [ "${#host_exec_token}" -eq 64 ] || return 1
+  case "$host_exec_token" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+  atomic_write_line "$host_stage_dir/host-exec-token" "$host_exec_token"
+}
+
+start_singleton_host_tools_broker() {
+  singleton_host_tools_active=false
+  singleton_host_exec_commands=""
+  if ! resolve_host_exec_broker_runtime; then
+    fail_singleton_host_tools "Host git/gh proxying is unavailable: $host_exec_runtime_error"
+    return 0
+  fi
+  if ! stage_singleton_host_tools; then
+    fail_singleton_host_tools "Neither a host git nor a host gh executable could be safely staged."
+    return 0
+  fi
+  if ! start_host_exec_broker; then
+    fail_singleton_host_tools "Host git/gh proxying is unavailable: $host_exec_runtime_error"
+    return 0
+  fi
+  singleton_host_tools_active=true
+}
+
+if [ "$singleton_requested" = true ] \
+  && [ "$host_tools_explicit" = true ] \
+  && [ "$host_tools_mode" = true ]; then
+  # An explicit opt-in fails closed before any native image or container
+  # mutation when the broker runtime cannot exist at all.
+  resolve_host_exec_broker_runtime \
+    || die "Host git/gh proxying is unavailable: $host_exec_runtime_error Pass --no-container-host-tools to launch with guest git/gh only."
+fi
+
+if [ "$run_mode" = true ]; then
   # Agent binaries and launcher internals must remain in the verified guest.
   # A user blacklist is additive to this small mandatory set.
   host_exec_denied+=(
@@ -2934,47 +3399,7 @@ if [ "$run_mode" = true ]; then
     sudo
   )
 
-  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
-    case "$AGENT_CONTAINER_HOST_BROKER_BIN" in
-      /*) ;;
-      *) die "--container-host-broker must be an absolute path." ;;
-    esac
-    host_broker_bin=$(
-      /bin/realpath "$AGENT_CONTAINER_HOST_BROKER_BIN" 2>/dev/null || true
-    )
-    [ -f "$host_broker_bin" ] && [ -x "$host_broker_bin" ] \
-      || die "--container-host-broker is not executable: $host_broker_bin"
-    ! host_path_is_agent_writable "$host_broker_bin" \
-      || die "Refusing to execute the host broker from an Agent-writable root: $host_broker_bin"
-  else
-    host_node_command="${AGENT_CONTAINER_HOST_NODE_BIN:-$(command -v node || true)}"
-    case "$host_node_command" in
-      /*) ;;
-      *) die "agent-container run requires a host Node.js executable for the host-exec broker." ;;
-    esac
-    host_node_command=$(
-      /bin/realpath "$host_node_command" 2>/dev/null || true
-    )
-    [ -f "$host_node_command" ] && [ -x "$host_node_command" ] \
-      || die "Host Node.js is not executable: $host_node_command"
-    ! host_path_is_agent_writable "$host_node_command" \
-      || die "Refusing to execute host Node.js from an Agent-writable root: $host_node_command"
-    # Resolve version-manager shims while the user's normal shell environment
-    # is still present; the broker later starts from an intentionally clean env.
-    host_node_bin=$(
-      "$host_node_command" -p 'process.execPath' 2>/dev/null || true
-    )
-    case "$host_node_bin" in
-      /*) ;;
-      *) die "Host Node.js could not resolve its native executable." ;;
-    esac
-    host_node_bin=$(/bin/realpath "$host_node_bin" 2>/dev/null || true)
-    [ -f "$host_node_bin" ] && [ -x "$host_node_bin" ] \
-      || die "Resolved host Node.js is not executable: $host_node_bin"
-    ! host_path_is_agent_writable "$host_node_bin" \
-      || die "Refusing a resolved host Node.js inside an Agent-writable root: $host_node_bin"
-    host_broker_bin="$asset_dir/host-exec-broker.mjs"
-  fi
+  resolve_host_exec_broker_runtime || die "$host_exec_runtime_error"
 
   host_commands_tmp=$(mktemp "$host_stage_dir/.host-commands.XXXXXX") \
     || die "Unable to create the host command manifest."
@@ -3003,40 +3428,10 @@ if [ "$run_mode" = true ]; then
       || printf '%s\n' "$host_node_runtime_root" >> "$host_tool_roots_tmp"
   fi
 
-  # Stock macOS developer commands are /usr/bin shims. Freeze common shims
-  # (including Git and Python) to the selected Xcode/CommandLineTools
-  # executables and admit their containing runtime tree read-only; this avoids
-  # xcrun trying to create ambient host cache files inside the sandbox.
-  host_developer_path=""
-  host_developer_root=""
-  if [ -x /usr/bin/xcode-select ]; then
-    host_developer_path=$(/usr/bin/xcode-select -p 2>/dev/null || true)
-  fi
-  case "$host_developer_path" in
-    /*)
-      host_developer_path=$(resolve_absolute_dir "$host_developer_path" || true)
-      ;;
-    *) host_developer_path="" ;;
-  esac
-  case "$host_developer_path" in
-    */Contents/Developer)
-      host_developer_root=${host_developer_path%/Contents/Developer}
-      ;;
-    *) host_developer_root="$host_developer_path" ;;
-  esac
-  case "$host_developer_root" in
-    /|*:*|*$'\n'*|*$'\r'*|*$'\t'*) host_developer_root="" ;;
-  esac
-  if [ -n "$host_developer_root" ] \
-    && path_contains "$host_developer_root" "$host_home_dir"; then
-    host_developer_root=""
-  fi
+  resolve_host_developer_root
   [ -z "$host_developer_root" ] \
     || printf '%s\n' "$host_developer_root" >> "$host_tool_roots_tmp"
 
-  IFS=: read -r -a host_path_entries <<EOF
-${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
-EOF
   for host_path_entry in "${host_path_entries[@]}"; do
     [ -n "$host_path_entry" ] || continue
     case "$host_path_entry" in
@@ -3803,102 +4198,7 @@ JXA
     die "Unsafe host-exec gateway address: $host_gateway"
   fi
 
-  rm -f "$host_stage_dir/host-exec-endpoint"
-  broker_args=(
-    --session-dir "$host_stage_dir"
-    --bind-address "$host_gateway"
-    --launcher-pid "$$"
-    --real-home "$host_home_dir"
-    --exec-home "$profile_host_exec_home"
-    --sandbox-bin /usr/bin/sandbox-exec
-  )
-  host_broker_path=""
-  broker_path_index=0
-  developer_path_inserted=false
-  while [ "$broker_path_index" -lt "${#host_path_entries[@]}" ]; do
-    broker_path_entry=${host_path_entries[$broker_path_index]}
-    broker_path_index=$((broker_path_index + 1))
-    case "$broker_path_entry" in
-      /*) ;;
-      *) continue ;;
-    esac
-    [ -d "$broker_path_entry" ] || continue
-    broker_path_entry=$(resolve_absolute_dir "$broker_path_entry" || true)
-    case "$broker_path_entry" in
-      ''|*:*|*$'\n'*|*$'\r'*|*$'\t'*) continue ;;
-    esac
-    if [ "$broker_path_entry" = /usr/bin ] \
-      && [ "$developer_path_inserted" = false ] \
-      && [ -n "$host_developer_root" ]; then
-      for developer_bin_dir in \
-        "$host_developer_path/usr/bin" \
-        "$host_developer_path/Toolchains/XcodeDefault.xctoolchain/usr/bin"; do
-        [ -d "$developer_bin_dir" ] || continue
-        if [ -n "$host_broker_path" ]; then
-          host_broker_path="$host_broker_path:$developer_bin_dir"
-        else
-          host_broker_path="$developer_bin_dir"
-        fi
-      done
-      developer_path_inserted=true
-    fi
-    if [ -n "$host_broker_path" ]; then
-      host_broker_path="$host_broker_path:$broker_path_entry"
-    else
-      host_broker_path="$broker_path_entry"
-    fi
-  done
-  [ -n "$host_broker_path" ] \
-    || host_broker_path=/usr/bin:/bin:/usr/sbin:/sbin
-  broker_env=(
-    "PATH=$host_broker_path"
-    "HOME=$host_home_dir"
-  )
-  [ -n "${LANG:-}" ] && broker_env+=("LANG=$LANG")
-  [ -n "${LC_ALL:-}" ] && broker_env+=("LC_ALL=$LC_ALL")
-  [ -n "${LC_CTYPE:-}" ] && broker_env+=("LC_CTYPE=$LC_CTYPE")
-  [ -n "${LC_MESSAGES:-}" ] && broker_env+=("LC_MESSAGES=$LC_MESSAGES")
-  [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
-  [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
-  [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
-  if [ "$forward_ssh_agent" = true ] \
-    && [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
-    broker_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
-  fi
-  if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
-    env -i "${broker_env[@]}" \
-      "$host_broker_bin" "${broker_args[@]}" \
-      > "$host_stage_dir/host-exec-broker.log" 2>&1 &
-  else
-    env -i "${broker_env[@]}" \
-      "$host_node_bin" "$host_broker_bin" "${broker_args[@]}" \
-      > "$host_stage_dir/host-exec-broker.log" 2>&1 &
-  fi
-  host_broker_pid=$!
-
-  broker_ready_attempt=0
-  while [ ! -f "$host_stage_dir/host-exec-endpoint" ] \
-    && session_job_is_active "$host_broker_pid" \
-    && [ "$broker_ready_attempt" -lt 100 ]; do
-    sleep 0.05
-    broker_ready_attempt=$((broker_ready_attempt + 1))
-  done
-  host_exec_endpoint=$(read_single_line "$host_stage_dir/host-exec-endpoint" || true)
-  host_exec_port=""
-  case "$host_exec_endpoint" in
-    "$host_gateway":*) host_exec_port=${host_exec_endpoint#"$host_gateway:"} ;;
-  esac
-  case "$host_exec_port" in
-    ''|0|0*|*[!0-9]*) host_exec_port="" ;;
-  esac
-  if [ -z "$host_exec_port" ] \
-    || [ "${#host_exec_port}" -gt 5 ] \
-    || [ "$host_exec_port" -gt 65535 ] 2>/dev/null; then
-    stop_host_broker
-    die "The host-exec broker did not publish a valid session endpoint."
-  fi
-  chmod 0600 "$host_stage_dir/host-exec-endpoint" \
-    "$host_stage_dir/host-exec-broker.log"
+  start_host_exec_broker || die "$host_exec_runtime_error"
 fi
 
 if [ "$singleton_requested" = true ]; then

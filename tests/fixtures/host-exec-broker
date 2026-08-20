@@ -2,6 +2,7 @@
 set -euo pipefail
 
 session_dir=""
+bind_address="192.168.64.1"
 broker_arguments=("$@")
 
 while [ "$#" -gt 0 ]; do
@@ -11,7 +12,12 @@ while [ "$#" -gt 0 ]; do
       session_dir="$2"
       shift 2
       ;;
-    --bind-address|--launcher-pid|--real-home|--exec-home|--sandbox-bin)
+    --bind-address)
+      [ "$#" -ge 2 ] || exit 64
+      bind_address="$2"
+      shift 2
+      ;;
+    --launcher-pid|--real-home|--exec-home|--sandbox-bin)
       [ "$#" -ge 2 ] || exit 64
       shift 2
       ;;
@@ -27,11 +33,11 @@ for argument in "${broker_arguments[@]}"; do
 done
 endpoint_tmp="$session_dir/.host-exec-endpoint.$$"
 case "$session_dir" in
-  *broker_endpoint_zero*) endpoint='192.168.64.1:0' ;;
-  *broker_endpoint_overflow*) endpoint='192.168.64.1:65536' ;;
-  *broker_endpoint_suffix*) endpoint='192.168.64.1:54321junk' ;;
-  *broker_endpoint_huge*) endpoint='192.168.64.1:999999999999999999999' ;;
-  *) endpoint='192.168.64.1:54321' ;;
+  *broker_endpoint_zero*) endpoint="$bind_address:0" ;;
+  *broker_endpoint_overflow*) endpoint="$bind_address:65536" ;;
+  *broker_endpoint_suffix*) endpoint="$bind_address:54321junk" ;;
+  *broker_endpoint_huge*) endpoint="$bind_address:999999999999999999999" ;;
+  *) endpoint="$bind_address:54321" ;;
 esac
 printf '%s\n' "$endpoint" > "$endpoint_tmp"
 mv -f "$endpoint_tmp" "$session_dir/host-exec-endpoint"

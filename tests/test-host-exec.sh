@@ -139,20 +139,36 @@ esac
 
 token=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 wrong_token=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
-printf 'first\tnode\t%s\nfirst\tgit\t%s\nfallback\tpython3\t%s\n' \
+gh_tool_root="$test_root/gh-tool-bin"
+mkdir -m 0700 "$gh_tool_root"
+{
+  printf '%s\n' '#!/bin/sh'
+  printf '%s\n' 'if [ "${1:-}" = read-gitconfig ]; then'
+  printf '%s\n' '  exec cat "$HOME/.gitconfig"'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'printf "%s\n" "$HOME"'
+  printf '%s\n' 'exec cat "$HOME/.config/gh/hosts.yml"'
+} > "$gh_tool_root/gh"
+chmod 0755 "$gh_tool_root/gh"
+printf 'first\tnode\t%s\nfirst\tgit\t%s\nfirst\tgh\t%s\nfallback\tpython3\t%s\n' \
   "$node_executable" \
   "$git_executable" \
+  "$gh_tool_root/gh" \
   "$python_executable" \
   > "$session_dir/host-commands.tsv"
 printf 'rw\t%s\nro\t%s\n' "$workspace" "$read_only_root" \
   > "$session_dir/host-roots.tsv"
-printf '%s\n%s\n' "$node_tool_root" "$developer_tool_root" \
+printf '%s\n%s\n%s\n' \
+  "$node_tool_root" "$developer_tool_root" "$gh_tool_root" \
   > "$session_dir/host-tool-roots.txt"
 printf '%s\n' "$token" > "$session_dir/host-exec-token"
 printf '%s\n' \
   '[agentContainer]' \
   '  testMarker = isolated-real-home' \
   > "$broker_real_home/.gitconfig"
+mkdir -m 0700 "$broker_real_home/.config"
+mkdir -m 0700 "$broker_real_home/.config/gh"
+printf '%s\n' 'gh-hosts-marker' > "$broker_real_home/.config/gh/hosts.yml"
 mkdir -m 0700 "$broker_real_home/.ssh"
 printf '%s\n' 'test-private-key-must-remain-denied' \
   > "$broker_real_home/.ssh/id_ed25519"
@@ -194,17 +210,15 @@ case "$endpoint" in
 esac
 pass 'broker starts and atomically publishes an IPv4 endpoint'
 
-# Evaluate the real client with only its fixed guest staging directory changed
-# in memory. HOST_EXEC_TEST_DIR is rejected by the client environment filter and
-# therefore cannot leak into the spawned host command.
-client_source=$(
-  sed \
-    's|^readonly host_exec_dir=/run/agent-host$|readonly host_exec_dir=${HOST_EXEC_TEST_DIR:?}|' \
-    "$client_script"
-)
+# The client honors AGENT_HOST_EXEC_DIR natively for singleton sessions, so
+# the suite selects its staged session directory through the same production
+# path instead of patching the source. The AGENT_ prefix is rejected by the
+# client environment filter and therefore cannot leak into the spawned host
+# command.
+client_source=$(cat -- "$client_script")
 case "$client_source" in
-  *'readonly host_exec_dir=${HOST_EXEC_TEST_DIR:?}'*) ;;
-  *) fail 'could not prepare the in-memory host-only client source' ;;
+  *'AGENT_HOST_EXEC_DIR:-$default_host_exec_dir'*) ;;
+  *) fail 'the host-exec client no longer honors AGENT_HOST_EXEC_DIR' ;;
 esac
 
 client_stdout="$test_root/client.stdout"
@@ -214,7 +228,7 @@ printf 'pipe-data' \
   | (
       CDPATH= cd -- "$workspace" \
         && OPENAI_API_KEY=must-not-forward \
-          HOST_EXEC_TEST_DIR="$session_dir" \
+          AGENT_HOST_EXEC_DIR="$session_dir" \
           /bin/bash -c "$client_source" host-exec node -e '
             let input = "";
             process.stdin.on("data", (chunk) => { input += chunk; });
@@ -246,7 +260,7 @@ signal_total_bytes=262144
 mkfifo "$signal_fifo" || fail 'could not create the signal concurrency FIFO'
 (
   CDPATH= cd -- "$workspace" || exit 1
-  export HOST_EXEC_TEST_DIR="$session_dir"
+  export AGENT_HOST_EXEC_DIR="$session_dir"
   exec /bin/bash -c "$client_source" host-exec node -e '
     const fs = require("node:fs");
     const readyPath = process.argv[1];
@@ -322,7 +336,7 @@ printf 'restrictive-umask-data' \
   | (
       CDPATH= cd -- "$workspace" \
         && umask 0777 \
-        && HOST_EXEC_TEST_DIR="$session_dir" \
+        && AGENT_HOST_EXEC_DIR="$session_dir" \
           /bin/bash -c "$client_source" host-exec node -e '
             let input = "";
             process.stdin.on("data", (chunk) => { input += chunk; });
@@ -344,7 +358,7 @@ blocked_fifo="$test_root/blocked-input.fifo"
 mkfifo "$blocked_fifo" || fail 'could not create the blocked-cleanup FIFO'
 (
   CDPATH= cd -- "$workspace" || exit 1
-  export HOST_EXEC_TEST_DIR="$session_dir"
+  export AGENT_HOST_EXEC_DIR="$session_dir"
   exec /bin/bash -c "$client_source" host-exec node -e 'process.exit(0)'
 ) < "$blocked_fifo" > "$client_stdout" 2> "$client_stderr" &
 signal_client_pid=$!
@@ -389,7 +403,7 @@ pass 'client bounds cleanup when the host exits before caller stdin closes'
 # behavior. Empty non-TTY stdin makes `node` exit without entering a REPL.
 set +e
 ( CDPATH= cd -- "$workspace" \
-    && HOST_EXEC_TEST_DIR="$session_dir" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
       /bin/bash -c "$client_source" node ) \
   < /dev/null > "$client_stdout" 2> "$client_stderr"
 zero_argv_status=$?
@@ -402,7 +416,7 @@ pass 'command basename invocation supports zero argv under macOS Bash'
 
 set +e
 ( CDPATH= cd -- "$workspace" \
-    && HOST_EXEC_TEST_DIR="$session_dir" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
       /bin/bash -c "$client_source" host-exec \
         git config --global --get agentContainer.testMarker ) \
   < /dev/null > "$client_stdout" 2> "$client_stderr"
@@ -416,7 +430,7 @@ pass 'host Git reads the broker-selected real HOME configuration'
 
 set +e
 ( CDPATH= cd -- "$workspace" \
-    && HOST_EXEC_TEST_DIR="$session_dir" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
       /bin/bash -c "$client_source" host-exec \
         git hash-object "$broker_real_home/.ssh/id_ed25519" ) \
   < /dev/null > "$client_stdout" 2> "$client_stderr"
@@ -427,7 +441,7 @@ set -e
 pass 'host Git cannot read an SSH private key outside admitted metadata paths'
 
 ( CDPATH= cd -- "$workspace" \
-    && HOST_EXEC_TEST_DIR="$session_dir" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
       /bin/bash -c "$client_source" host-exec \
         python3 -c 'import os; print(os.environ["HOME"])' ) \
   < /dev/null > "$client_stdout" 2> "$client_stderr"
@@ -435,10 +449,32 @@ pass 'host Git cannot read an SSH private key outside admitted metadata paths'
   || fail "host Python did not receive the isolated execution HOME: $(sed -n '1,3p' "$client_stderr")"
 pass 'stock host Python runs from the selected developer runtime with isolated HOME'
 
+( CDPATH= cd -- "$workspace" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
+      /bin/bash -c "$client_source" host-exec gh ) \
+  < /dev/null > "$client_stdout" 2> "$client_stderr" \
+  || fail "host gh returned unexpectedly: $(sed -n '1,3p' "$client_stderr")"
+[ "$(sed -n '1p' "$client_stdout")" = "$broker_real_home" ] \
+  || fail "host gh did not receive the real HOME: $(sed -n '1,3p' "$client_stderr")"
+[ "$(sed -n '2p' "$client_stdout")" = 'gh-hosts-marker' ] \
+  || fail "host gh could not read its real-home configuration: $(sed -n '1,3p' "$client_stderr")"
+pass 'host gh runs with the real HOME and reads ~/.config/gh'
+
+set +e
+( CDPATH= cd -- "$workspace" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
+      /bin/bash -c "$client_source" host-exec gh read-gitconfig ) \
+  < /dev/null > "$client_stdout" 2> "$client_stderr"
+gh_gitconfig_status=$?
+set -e
+[ "$gh_gitconfig_status" -ne 0 ] && [ ! -s "$client_stdout" ] \
+  || fail 'host gh unexpectedly read Git configuration outside its scope'
+pass 'host gh cannot read real-home files outside ~/.config/gh'
+
 printf '%s\n' "$wrong_token" > "$session_dir/host-exec-token"
 set +e
 ( CDPATH= cd -- "$workspace" \
-    && HOST_EXEC_TEST_DIR="$session_dir" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
       /bin/bash -c "$client_source" host-exec node --version ) \
   < /dev/null > "$client_stdout" 2> "$client_stderr"
 bad_token_status=$?
@@ -600,7 +636,7 @@ pass 'fatal authentication rejects connection reuse and releases half-open slots
 
 set +e
 ( CDPATH= cd -- "$workspace" \
-    && HOST_EXEC_TEST_DIR="$session_dir" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
       /bin/bash -c "$client_source" host-exec not-authorized --version ) \
   < /dev/null > "$client_stdout" 2> "$client_stderr"
 unauthorized_status=$?
@@ -616,7 +652,7 @@ pass 'command absent from the session manifest is rejected'
 set +e
 (
   CDPATH= cd -- "$read_only_root" \
-    && HOST_EXEC_TEST_DIR="$session_dir" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
       /bin/bash -c "$client_source" host-exec node -e '
         const fs = require("node:fs");
         try {
@@ -639,7 +675,7 @@ set -e
 pass 'sandbox-exec denies writes beneath a declared read-only root'
 
 ( CDPATH= cd -- "$workspace" \
-    && HOST_EXEC_TEST_DIR="$session_dir" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
       /bin/bash -c "$client_source" host-exec node -e '
         const fs = require("node:fs");
         try {
