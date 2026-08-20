@@ -730,16 +730,20 @@ uninstaller_url='https://raw.githubusercontent.com/loadchange/agent-container/ma
 curl -fsSL "$uninstaller_url" | bash
 ```
 
-For a Homebrew install, uninstall the formula first (it removes the same managed
-release state), then untap if you no longer want updates:
+For a Homebrew install, uninstall the formula first. That removes only the
+Homebrew `libexec` payload and command symlinks. Then run the uninstaller to
+remove managed release state, images, and `~/.local` commands the formula does
+not own:
 
 ```bash
 brew uninstall agent-container
 brew untap loadchange/agent-container
+curl -fsSL "$uninstaller_url" | bash
 ```
 
-The default removes managed commands, release assets, and only images whose
-recorded provenance still matches. It preserves profile HOME directories.
+The default uninstaller removes managed commands, release assets, and only
+images whose recorded provenance still matches. It preserves profile HOME
+directories.
 For a source checkout, `./uninstall.sh` remains available. If Apple CLI
 discovery needs an override, pass `--container-bin /absolute/path/to/container`
 to that script (or after `bash -s --` in the curl form).

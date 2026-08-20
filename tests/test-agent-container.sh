@@ -322,7 +322,7 @@ new_case() {
   case_curl_log="$case_dir/curl.log"
   case_security_log="$case_dir/security.log"
   case_openssl_log="$case_dir/openssl.log"
-  case_asset_dir="$repo_root"
+  case_asset_dir="$repo_root/runtime"
   mkdir -p "$case_home" "$case_workspace"
   : > "$case_log"
   : > "$case_curl_log"
@@ -1995,7 +1995,7 @@ if ! (
     /usr/bin/python3 "$repo_root/tests/pty-run.py" --pipe-stdin \
       /bin/bash "$repo_root/bin/agent-container" \
         --container-bin "$fixture_dir/container" \
-        --container-assets "$repo_root" \
+        --container-assets "$repo_root/runtime" \
         --container-host-gateway 127.0.0.1 \
         --container-openssl "$fixture_dir/openssl" \
         --container-security "$fixture_dir/security" \
@@ -3231,7 +3231,7 @@ if ! (
     /usr/bin/python3 "$repo_root/tests/pty-run.py" \
       /bin/bash "$repo_root/bin/agent-container" \
         --container-bin "$fixture_dir/container" \
-        --container-assets "$repo_root" \
+        --container-assets "$repo_root/runtime" \
         --container-host-gateway 127.0.0.1 \
         --container-openssl "$fixture_dir/openssl" \
         --container-security "$fixture_dir/security" \
