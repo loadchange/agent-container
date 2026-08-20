@@ -131,7 +131,7 @@ RUN set -eu; \
     case "${AGENT_PROFILE}" in \
       claude) \
         [ "${AGENT_COMMAND}" = claude ]; \
-        [ "${AGENT_INSTALLER_URL}" = https://claude.ai/install.sh ]; \
+        [ "${AGENT_INSTALLER_URL}" = https://downloads.claude.ai/claude-code-releases/bootstrap.sh ]; \
         [ "${AGENT_INSTALLER_SHELL}" = bash ]; \
         [ -z "${AGENT_INSTALLER_VERSION_ENV}${AGENT_INSTALLER_BIN_DIR_ENV}${AGENT_INSTALLER_HOME_ENV}${AGENT_INSTALLER_NONINTERACTIVE_ENV}" ]; \
         ;; \

@@ -867,7 +867,7 @@ for wrapper_profile in \
   wrapper=${wrapper_profile%% *}
   profile=${wrapper_profile#* }
   : > "$case_log"
-  if ! run_program "$repo_root/$wrapper" -- "two words" "" '*' \
+  if ! run_program "$repo_root/bin/$wrapper" -- "two words" "" '*' \
     >"$case_dir/$profile.out" 2>"$case_dir/$profile.err"; then
     sed -n '1,120p' "$case_dir/$profile.err" >&2
     fail "$wrapper failed before its argument boundary could be checked"
@@ -1222,10 +1222,13 @@ assert_line "$case_curl_log" "PROXY_SET=true"
 assert_line "$case_curl_log" "PROXY="
 assert_line "$case_curl_log" "NOPROXY_SET=true"
 assert_line "$case_curl_log" "NOPROXY=localhost,127.0.0.1"
+assert_line "$case_security_log" \
+  "ARG=https://downloads.claude.ai/claude-code-releases/bootstrap.sh"
+assert_no_line "$case_security_log" "ARG=https://claude.ai/install.sh"
 assert_native_installer_build_args \
   "$case_log" \
   claude \
-  https://claude.ai/install.sh \
+  https://downloads.claude.ai/claude-code-releases/bootstrap.sh \
   bash \
   '' \
   '' \
@@ -3168,7 +3171,7 @@ if run_program "$repo_root/bin/claude-container" --version \
   fail "auto should reject a not-yet-valid installer-chain CA"
 fi
 assert_contains "$case_dir/err" \
-  "could not verify and export the TLS trust anchor for https://claude.ai/install.sh"
+  "could not verify and export the TLS trust anchor for https://downloads.claude.ai/claude-code-releases/bootstrap.sh"
 assert_line "$case_openssl_log" "ARG=-startdate"
 assert_no_line "$case_security_log" \
   "ARG=https://downloads.claude.ai/claude-code-releases/latest"
