@@ -22,7 +22,8 @@ pass() {
   printf 'ok %s - %s\n' "$tests_passed" "$*"
 }
 
-for required in node jq base64 dd tr sed find mkfifo xcode-select xcrun; do
+for required in node jq base64 dd tr sed find mkfifo xcode-select xcrun \
+  ssh-agent ssh-add ssh-keygen; do
   command -v "$required" >/dev/null 2>&1 \
     || fail "required host command is unavailable: $required"
 done
@@ -37,10 +38,14 @@ test_root=''
 broker_pid=''
 signal_client_pid=''
 signal_producer_pid=''
+test_agent_pid=''
 tests_passed=0
 cleanup() {
   cleanup_status=$?
   trap - EXIT INT TERM HUP
+  if [ -n "$test_agent_pid" ]; then
+    kill "$test_agent_pid" 2>/dev/null || true
+  fi
   for transient_pid in "$signal_client_pid" "$signal_producer_pid"; do
     if [ -n "$transient_pid" ] && kill -0 "$transient_pid" 2>/dev/null; then
       kill -TERM "$transient_pid" 2>/dev/null || true
@@ -187,10 +192,30 @@ chmod 0600 \
   "$session_dir/host-tool-roots.txt" \
   "$session_dir/host-exec-token"
 
+# A dedicated throwaway agent proves the launcher-controlled SSH_AUTH_SOCK
+# reaches sandboxed identity commands without touching the developer's real
+# agent. The socket and key never enter any manifest; only the broker
+# environment carries the path.
+test_agent_output=$(/usr/bin/ssh-agent -s) \
+  || fail 'could not start the dedicated test SSH agent'
+test_agent_sock=$(printf '%s\n' "$test_agent_output" \
+  | sed -n 's/^SSH_AUTH_SOCK=\([^;]*\);.*/\1/p')
+test_agent_pid=$(printf '%s\n' "$test_agent_output" \
+  | sed -n 's/^SSH_AGENT_PID=\([^;]*\);.*/\1/p')
+[ -S "$test_agent_sock" ] && [ -n "$test_agent_pid" ] \
+  || fail 'the dedicated test SSH agent did not publish a live socket'
+ssh-keygen -q -t ed25519 -N '' -C agent-container-host-exec-test \
+  -f "$test_root/test-identity" \
+  || fail 'could not generate the throwaway test identity'
+SSH_AUTH_SOCK="$test_agent_sock" ssh-add -q "$test_root/test-identity" \
+  2>/dev/null \
+  || fail 'could not load the throwaway identity into the test agent'
+
 broker_stdout="$test_root/broker.stdout"
 broker_stderr="$test_root/broker.stderr"
 controlled_path="$node_bin_dir:/usr/bin:/bin:/usr/sbin:/sbin"
 PATH="$controlled_path" \
+  SSH_AUTH_SOCK="$test_agent_sock" \
   node "$broker_script" \
     --session-dir "$session_dir" \
     --bind-address 127.0.0.1 \
@@ -479,6 +504,32 @@ set -e
   || fail 'host gh unexpectedly read Git configuration outside its scope'
 pass 'host gh cannot read real-home files outside ~/.config/gh'
 
+# Identity commands receive the launcher-controlled agent socket and can
+# request signatures from inside the sandbox; the private key file itself
+# stays outside every admitted path.
+set +e
+( CDPATH= cd -- "$workspace" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
+      /bin/bash -c "$client_source" host-exec \
+        git -c 'alias.agent-probe=!/usr/bin/ssh-add -l' agent-probe ) \
+  < /dev/null > "$client_stdout" 2> "$client_stderr"
+agent_probe_status=$?
+set -e
+[ "$agent_probe_status" -eq 0 ] \
+  || fail "sandboxed host git could not reach the SSH agent: $(sed -n '1,3p' "$client_stderr")"
+grep -Fq 'agent-container-host-exec-test' "$client_stdout" \
+  || fail "the agent probe did not list the test identity: $(sed -n '1,3p' "$client_stdout")"
+pass 'sandboxed host git reaches the forwarded SSH agent for signing authority'
+
+( CDPATH= cd -- "$workspace" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
+      /bin/bash -c "$client_source" host-exec \
+        python3 -c 'import os; print(os.environ.get("SSH_AUTH_SOCK", "absent"))' ) \
+  < /dev/null > "$client_stdout" 2> "$client_stderr"
+[ "$(sed -n '1p' "$client_stdout")" = 'absent' ] \
+  || fail "a generic fallback command received the SSH agent socket: $(sed -n '1,3p' "$client_stdout")"
+pass 'generic cataloged commands never receive the SSH agent socket'
+
 printf '%s\n' "$wrong_token" > "$session_dir/host-exec-token"
 set +e
 ( CDPATH= cd -- "$workspace" \
@@ -743,6 +794,7 @@ chmod 0600 \
   "$catalog_session_dir/host-exec-token"
 
 PATH="$controlled_path" \
+  SSH_AUTH_SOCK='' \
   node "$broker_script" \
     --session-dir "$catalog_session_dir" \
     --bind-address 127.0.0.1 \

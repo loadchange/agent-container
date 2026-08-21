@@ -215,6 +215,21 @@ credentials through the sandbox. The broker authenticates every request,
 polls its launcher PID, and exits when the client ends, so the channel cannot
 outlive the terminal that created it.
 
+When the launching terminal exports a live `SSH_AUTH_SOCK`, the broker
+environment carries that one socket path and supplies it to exactly the
+identity commands above, so sandboxed host `git` authenticates to SSH remotes
+through the operator's agent: signatures only, never key bytes, and key files
+stay unreadable. Generic cataloged commands keep an agent-free environment.
+While a client runs, guest-driven `git` therefore holds the same remote
+authentication authority as the operator's own terminal — an agent is a
+signing oracle, and a hostile workload could push or fetch anywhere that
+authority reaches. `--no-container-host-ssh-agent` withholds the socket from
+the broker; an explicit `--container-host-ssh-agent` fails closed when no
+live agent socket exists. The socket path crosses into neither the guest nor
+the singleton configuration fingerprint through this per-client path;
+mounting the socket into the VM itself remains the separate static
+`--container-forward-ssh-agent` capability below.
+
 This remains an explicit host-code-execution capability with the same caveats
 as legacy `run`: cataloged interpreters and shells (and interpreters reachable
 through Git hooks or credential helpers) execute as the macOS user inside the

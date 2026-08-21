@@ -1363,6 +1363,28 @@ if [ -n "${AGENT_CONTAINER_HOST_TOOLS+x}" ]; then
   esac
 fi
 
+# Host-first git/gh reach SSH remotes through the operator's live SSH agent:
+# the launcher hands SSH_AUTH_SOCK to the per-client host-exec broker, whose
+# sandboxed identity commands request signatures over that socket. Private key
+# files remain unreadable and the socket never enters the guest, so this stays
+# per-client broker state outside the singleton configuration fingerprint
+# (unlike --container-forward-ssh-agent, which mounts the socket into the VM).
+# The default silently degrades when no live agent socket exists; an explicit
+# --container-host-ssh-agent fails closed instead, and
+# --no-container-host-ssh-agent keeps the agent away from host commands.
+host_ssh_agent_mode=true
+host_ssh_agent_explicit=false
+if [ -n "${AGENT_CONTAINER_HOST_SSH_AGENT+x}" ]; then
+  host_ssh_agent_explicit=true
+  case "$AGENT_CONTAINER_HOST_SSH_AGENT" in
+    true) host_ssh_agent_mode=true ;;
+    false) host_ssh_agent_mode=false ;;
+    *)
+      die "--container-host-ssh-agent must be true or false."
+      ;;
+  esac
+fi
+
 # Both launch modes share one host-tool policy vocabulary. The launcher list
 # options extend run mode's --no-host-exec/--host-first to ordinary singleton
 # clients; deny always wins over first.
@@ -3189,9 +3211,18 @@ build_host_broker_launch_environment() {
   [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
   [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
   [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
-  if [ "$forward_ssh_agent" = true ] \
-    && [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
-    broker_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+  # The broker forwards this socket only to the host-first identity commands
+  # (git/gh); generic cataloged commands keep an agent-free environment. This
+  # is a per-client broker capability and never part of the singleton
+  # configuration fingerprint.
+  host_broker_ssh_agent_active=false
+  if [ "$host_ssh_agent_mode" = true ]; then
+    if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+      broker_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+      host_broker_ssh_agent_active=true
+    elif [ "$host_ssh_agent_explicit" = true ]; then
+      die "--container-host-ssh-agent requires SSH_AUTH_SOCK to name a live agent socket."
+    fi
   fi
   return 0
 }
@@ -3200,10 +3231,41 @@ build_host_broker_launch_environment() {
 # and validate the endpoint it publishes. The caller must already hold the
 # resolved gateway, broker program, and staged manifests.
 start_host_exec_broker() {
-  local broker_ready_attempt host_exec_port
+  local broker_ready_attempt host_exec_port ssh_agent_probe_attempt
+  local ssh_agent_probe_pid ssh_agent_probe_status
   local -a broker_args
 
   build_host_broker_launch_environment
+  # A live socket with no usable identity still fails SSH-remote git later
+  # with an opaque "Permission denied (publickey)". Surface the actionable
+  # cause once per client; HTTPS remotes are unaffected either way.
+  if [ "$host_broker_ssh_agent_active" = true ] && [ -x /usr/bin/ssh-add ]; then
+    ssh_agent_probe_status=0
+    SSH_AUTH_SOCK="$SSH_AUTH_SOCK" /usr/bin/ssh-add -l >/dev/null 2>&1 &
+    ssh_agent_probe_pid=$!
+    ssh_agent_probe_attempt=0
+    while kill -0 "$ssh_agent_probe_pid" 2>/dev/null \
+      && [ "$ssh_agent_probe_attempt" -lt 100 ]; do
+      sleep 0.02
+      ssh_agent_probe_attempt=$((ssh_agent_probe_attempt + 1))
+    done
+    if kill -0 "$ssh_agent_probe_pid" 2>/dev/null; then
+      kill -TERM "$ssh_agent_probe_pid" 2>/dev/null || true
+      wait "$ssh_agent_probe_pid" 2>/dev/null || true
+      ssh_agent_probe_status=124
+    else
+      wait "$ssh_agent_probe_pid" || ssh_agent_probe_status=$?
+    fi
+    case "$ssh_agent_probe_status" in
+      0) ;;
+      1)
+        warn "The host SSH agent holds no identities; host git will fail against SSH remotes until 'ssh-add' loads a key."
+        ;;
+      *)
+        warn "The host SSH agent socket did not answer; host git cannot authenticate to SSH remotes this session."
+        ;;
+    esac
+  fi
   rm -f "$host_stage_dir/host-exec-endpoint"
   broker_args=(
     --session-dir "$host_stage_dir"

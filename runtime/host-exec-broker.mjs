@@ -1022,8 +1022,12 @@ function buildChildEnvironment(configuration, command, forwardedEnvironment) {
     if (typeof value === 'string' && !value.includes('\0')) environment[name] = value;
   }
   // Authentication socket authority comes only from the launcher's controlled
-  // broker environment, never from a guest request.
-  if (typeof process.env.SSH_AUTH_SOCK === 'string'
+  // broker environment, never from a guest request, and reaches exactly the
+  // identity commands that already run with the real HOME. Generic cataloged
+  // commands keep an agent-free environment so a guest-driven interpreter
+  // cannot borrow the operator's signing authority.
+  if (commandHome === configuration.realHome
+    && typeof process.env.SSH_AUTH_SOCK === 'string'
     && path.isAbsolute(process.env.SSH_AUTH_SOCK)
     && !hasUnsafePathCharacters(process.env.SSH_AUTH_SOCK)) {
     environment.SSH_AUTH_SOCK = process.env.SSH_AUTH_SOCK;

@@ -389,6 +389,17 @@ entirely. Each proxied invocation still crosses the broker channel
 live on macOS, not in the guest, and interactive TTY programs (REPLs,
 `npm login`) are not forwarded yet.
 
+SSH remotes work through the operator's live SSH agent: when the launching
+terminal exports `SSH_AUTH_SOCK`, the broker hands that socket to host-first
+`git`/`gh` so `git fetch`, `pull`, and `push` over SSH authenticate exactly as
+in a host terminal — signatures only; private-key files stay unreadable under
+the sandbox and the socket never enters the guest. If the agent holds no
+identities the launch prints one warning, because SSH-remote git would fail
+with `Permission denied (publickey)` until `ssh-add` loads a key.
+`--no-container-host-ssh-agent` keeps the agent away from host commands, and
+an explicit `--container-host-ssh-agent` fails closed when no live agent
+socket exists.
+
 The broker uses the host Node.js runtime. When Node.js (or another
 prerequisite) is unavailable, the default launch prints one warning and falls
 back to the guest binaries; passing `--container-host-tools` explicitly makes
@@ -442,12 +453,13 @@ Boolean options use `--container-<name>` and `--no-container-<name>`.
 | `--container-full-git-config` | off | Expose the full selected host Git configuration instead of only identity |
 | `--container-mount-gh` | off | Mount host GitHub CLI configuration read-only |
 | `--container-forward-api-key` | off | Forward only the active profile's exported `apiKeyEnv` |
-| `--container-forward-ssh-agent` | off | Forward the live SSH-agent socket; never mounts private keys |
+| `--container-forward-ssh-agent` | off | Mount the live SSH-agent socket into the guest VM; never mounts private keys |
 | `--container-mount-ssh-config` | off | Copy selected SSH metadata into a read-only staged mount |
 | `--container-accept-virtiofs-risk` | off | Continue past selected Apple VirtioFS risk checks |
 | `--container-allow-concurrent` | off | Permit overlapping legacy `run` VMs; also requires risk acceptance |
 | `--container-disable-fd-watchdog` | off | Disable the legacy `run` live file/vnode watchdog for controlled testing |
 | `--container-host-tools` | on | Mirror the host command catalog as sandboxed host executables (host-first `git`/`gh`) |
+| `--container-host-ssh-agent` | on | Hand the terminal's live `SSH_AUTH_SOCK` to host-first `git`/`gh` for SSH remotes; never enters the guest |
 
 Every boolean has a negative form, for example
 `--no-container-full-git-config`. Repeated settings use the last value.
@@ -512,9 +524,10 @@ name still exposes its complete value to the Agent and anything it can run.
 
 Host `git` and `gh` proxying (see above) is the default identity and
 credential path: pushes, fetches, and GitHub operations run on the host with
-the host configuration. The static capabilities below instead change what the
-**guest** environment itself receives, for tools that shell out to Git inside
-the VM or when `--no-container-host-tools` is selected.
+the host configuration, and SSH remotes authenticate through the terminal's
+live SSH agent by default. The static capabilities below instead change what
+the **guest** environment itself receives, for tools that shell out to Git
+inside the VM or when `--no-container-host-tools` is selected.
 
 Guest Git receives a staged configuration containing only host `user.name` and
 `user.email` by default. Broader capabilities are explicit:
@@ -526,7 +539,7 @@ codex-container --container-full-git-config
 # Includes readable GitHub CLI tokens when present.
 codex-container --container-mount-gh
 
-# Gives signing/authentication authority to the live agent socket.
+# Mounts the live agent socket into the guest VM for guest-native ssh/git.
 codex-container --container-forward-ssh-agent
 
 # Copies config, known_hosts, known_hosts.old, and allowed_signers only.
@@ -679,9 +692,10 @@ repositories harmless. By default an Agent can:
 - read and write the selected project root;
 - read and write its profile HOME;
 - run cataloged host commands inside a workspace-scoped macOS sandbox — with
-  the host Git configuration, credential helpers, and GitHub CLI login for
-  `git`/`gh`, and an isolated execution HOME for everything else
-  (`--no-container-host-tools` disables this);
+  the host Git configuration, credential helpers, GitHub CLI login, and the
+  terminal's live SSH agent for `git`/`gh`, and an isolated agent-free
+  execution HOME for everything else (`--no-container-host-tools` disables
+  the channel; `--no-container-host-ssh-agent` withholds the agent);
 - communicate with the network without a hostname allowlist;
 - affect other concurrent clients of the same profile through shared VM and
   HOME state.
