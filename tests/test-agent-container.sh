@@ -237,6 +237,7 @@ reset_case_environment() {
     AGENT_CONTAINER_HOST_EXEC_FIRST \
     AGENT_CONTAINER_HOST_GATEWAY \
     AGENT_CONTAINER_HOST_NODE_BIN \
+    AGENT_CONTAINER_HOST_SSH_AGENT \
     AGENT_CONTAINER_HOST_TOOLS \
     AGENT_CONTAINER_HTTP_PROXY \
     AGENT_CONTAINER_IMAGE \
@@ -475,6 +476,17 @@ launch_exec() {
     || launcher_options+=(--container-full-git-config)
   [ "${AGENT_CONTAINER_MOUNT_GH:-false}" != true ] \
     || launcher_options+=(--container-mount-gh)
+  if [ -n "${AGENT_CONTAINER_HOST_SSH_AGENT+x}" ]; then
+    case "$AGENT_CONTAINER_HOST_SSH_AGENT" in
+      true) launcher_options+=(--container-host-ssh-agent) ;;
+      false) launcher_options+=(--no-container-host-ssh-agent) ;;
+      *)
+        launcher_options+=(
+          "--container-host-ssh-agent=$AGENT_CONTAINER_HOST_SSH_AGENT"
+        )
+        ;;
+    esac
+  fi
   [ "${AGENT_CONTAINER_FORWARD_SSH_AGENT:-false}" != true ] \
     || launcher_options+=(--container-forward-ssh-agent)
   [ "${AGENT_CONTAINER_MOUNT_SSH_CONFIG:-false}" != true ] \
@@ -2291,7 +2303,7 @@ fi
 pass "Git, GH, and SSH metadata capabilities remain explicit and ephemeral"
 
 tests_run=$((tests_run + 1))
-new_case legacy_broker_ssh_agent_is_explicit
+new_case host_broker_ssh_agent_policy
 capture_broker="$case_dir/capture-host-broker"
 {
   printf '%s\n' '#!/bin/bash'
@@ -2308,13 +2320,17 @@ SSH_AUTH_SOCK="$case_dir/live-ssh-agent.sock"
 /usr/bin/python3 - "$SSH_AUTH_SOCK" <<'PY' &
 import socket
 import sys
+import time
 
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 listener.bind(sys.argv[1])
 listener.listen()
 while True:
     connection, _ = listener.accept()
-    connection.close()
+    # Model a live socket whose listener accepts but never answers. The
+    # launcher's identity probe must time out, terminate, and reap ssh-add.
+    while True:
+        time.sleep(1)
 PY
 background_pid=$!
 socket_attempt=0
@@ -2327,21 +2343,38 @@ done
 AGENT_CONTAINER_HOST_BROKER_BIN="$capture_broker"
 run_program "$repo_root/bin/agent-container" run codex -- --version \
   >"$case_dir/default.out" 2>"$case_dir/default.err"
-assert_line "$capture_broker.env" "SSH_AUTH_SOCK_UNSET"
+assert_line "$capture_broker.env" "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+assert_contains "$case_dir/default.err" \
+  "The host SSH agent socket did not answer"
 assert_no_line "$case_log" "ARG=--ssh"
 
 : > "$case_log"
-AGENT_CONTAINER_FORWARD_SSH_AGENT=true
+AGENT_CONTAINER_HOST_SSH_AGENT=false
+run_program "$repo_root/bin/agent-container" run codex -- --version \
+  >"$case_dir/disabled.out" 2>"$case_dir/disabled.err"
+assert_line "$capture_broker.env" "SSH_AUTH_SOCK_UNSET"
+assert_not_contains "$case_dir/disabled.err" \
+  "The host SSH agent socket did not answer"
+assert_no_line "$case_log" "ARG=--ssh"
+
+AGENT_CONTAINER_HOST_SSH_AGENT=true
 run_program "$repo_root/bin/agent-container" run codex -- --version \
   >"$case_dir/explicit.out" 2>"$case_dir/explicit.err"
 assert_line "$capture_broker.env" "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
-assert_line "$case_log" "ARG=--ssh"
+
 kill -TERM "$background_pid"
 set +e
 wait "$background_pid"
 set -e
 background_pid=""
-pass "legacy broker receives SSH_AUTH_SOCK only through the explicit launcher option"
+rm -f "$SSH_AUTH_SOCK"
+if run_program "$repo_root/bin/agent-container" run codex -- --version \
+  >"$case_dir/missing.out" 2>"$case_dir/missing.err"; then
+  fail "explicit host SSH-agent mode should reject a missing socket"
+fi
+assert_contains "$case_dir/missing.err" \
+  "--container-host-ssh-agent requires SSH_AUTH_SOCK to name a live agent socket"
+pass "host broker SSH-agent policy covers default, disabled, and explicit modes"
 
 tests_run=$((tests_run + 1))
 new_case lifecycle_gate

@@ -3231,7 +3231,8 @@ build_host_broker_launch_environment() {
 # and validate the endpoint it publishes. The caller must already hold the
 # resolved gateway, broker program, and staged manifests.
 start_host_exec_broker() {
-  local broker_ready_attempt host_exec_port ssh_agent_probe_status
+  local broker_ready_attempt host_exec_port ssh_agent_probe_attempt
+  local ssh_agent_probe_pid ssh_agent_probe_status
   local -a broker_args
 
   build_host_broker_launch_environment
@@ -3240,8 +3241,21 @@ start_host_exec_broker() {
   # cause once per client; HTTPS remotes are unaffected either way.
   if [ "$host_broker_ssh_agent_active" = true ] && [ -x /usr/bin/ssh-add ]; then
     ssh_agent_probe_status=0
-    SSH_AUTH_SOCK="$SSH_AUTH_SOCK" /usr/bin/ssh-add -l >/dev/null 2>&1 \
-      || ssh_agent_probe_status=$?
+    SSH_AUTH_SOCK="$SSH_AUTH_SOCK" /usr/bin/ssh-add -l >/dev/null 2>&1 &
+    ssh_agent_probe_pid=$!
+    ssh_agent_probe_attempt=0
+    while kill -0 "$ssh_agent_probe_pid" 2>/dev/null \
+      && [ "$ssh_agent_probe_attempt" -lt 100 ]; do
+      sleep 0.02
+      ssh_agent_probe_attempt=$((ssh_agent_probe_attempt + 1))
+    done
+    if kill -0 "$ssh_agent_probe_pid" 2>/dev/null; then
+      kill -TERM "$ssh_agent_probe_pid" 2>/dev/null || true
+      wait "$ssh_agent_probe_pid" 2>/dev/null || true
+      ssh_agent_probe_status=124
+    else
+      wait "$ssh_agent_probe_pid" || ssh_agent_probe_status=$?
+    fi
     case "$ssh_agent_probe_status" in
       0) ;;
       1)
