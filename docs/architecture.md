@@ -248,7 +248,13 @@ verified guest image does not provide that name. `AGENT_HOST_EXEC_DIR` points
 the guest client at the per-session credentials.
 
 Proxied `git` and `gh` run on macOS with the real HOME, so pushes and GitHub
-calls use host credential helpers and logins; every other proxied command
+calls use host credential helpers and logins. When the launching terminal
+exports a live `SSH_AUTH_SOCK`, the broker forwards that socket to exactly
+those identity commands, so host `git` also reaches SSH remotes through the
+operator's agent — signatures only, with key files still unreadable under the
+sandbox (`--no-container-host-ssh-agent` opts out; an explicit
+`--container-host-ssh-agent` fails closed without a live agent). Every other
+proxied command
 receives the isolated broker execution HOME, keeping host dotfiles and stored
 credentials out of generic tools while their caches persist per profile. The
 generated sandbox confines writes to the workspace and that execution HOME.

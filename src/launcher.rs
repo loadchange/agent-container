@@ -60,6 +60,7 @@ const BOOLEAN_OPTIONS: &[(&str, &str)] = &[
     ("allow-concurrent", "AGENT_CONTAINER_ALLOW_CONCURRENT"),
     ("disable-fd-watchdog", "AGENT_CONTAINER_DISABLE_FD_WATCHDOG"),
     ("host-tools", "AGENT_CONTAINER_HOST_TOOLS"),
+    ("host-ssh-agent", "AGENT_CONTAINER_HOST_SSH_AGENT"),
 ];
 
 const REMOVED_ENVIRONMENT: &[(&str, &str)] = &[
@@ -717,6 +718,7 @@ mod tests {
             ("allow-concurrent", "AGENT_CONTAINER_ALLOW_CONCURRENT"),
             ("disable-fd-watchdog", "AGENT_CONTAINER_DISABLE_FD_WATCHDOG"),
             ("host-tools", "AGENT_CONTAINER_HOST_TOOLS"),
+            ("host-ssh-agent", "AGENT_CONTAINER_HOST_SSH_AGENT"),
         ];
         assert_eq!(BOOLEAN_OPTIONS, expected);
     }
