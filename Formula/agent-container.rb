@@ -4,9 +4,9 @@
 class AgentContainer < Formula
   desc "Run Claude Code, Codex CLI, and Grok CLI in Apple container Micro-VMs"
   homepage "https://github.com/loadchange/agent-container"
-  version "0.1.5"
-  sha256 "d9ce52e6270957bb2a194e9be3272bfa45ea9b0cb4697941d0c01c9413b19c8d"
-  url "https://github.com/loadchange/agent-container/releases/download/v0.1.5/agent-container-darwin-arm64.tar.gz"
+  version "0.1.6"
+  sha256 "b4b45018fcd3f6ba5e456cfe8dedb0d10404df51e981d7f8262443392b76bc6d"
+  url "https://github.com/loadchange/agent-container/releases/download/v0.1.6/agent-container-darwin-arm64.tar.gz"
 
   depends_on arch: :arm64
   depends_on macos: :tahoe
