@@ -117,6 +117,8 @@ install -m 0644 "$repo_root/runtime/Containerfile" \
   "$dist_dir/Containerfile"
 install -m 0644 "$repo_root/runtime/Containerfile.dockerignore" \
   "$dist_dir/Containerfile.dockerignore"
+install -m 0755 "$repo_root/runtime/image-setup.sh" \
+  "$dist_dir/image-setup.sh"
 install -m 0644 "$repo_root/runtime/host-exec-broker.mjs" \
   "$dist_dir/host-exec-broker.mjs"
 for profile_id in claude codex grok; do
@@ -132,11 +134,14 @@ done
 # download, so a broken release never reaches dist/.
 bash -n \
   "$dist_dir/agent-container-runtime" \
+  "$dist_dir/image-setup.sh" \
   "$dist_dir/entrypoint.sh" \
   "$dist_dir/host-exec-client" \
   "$dist_dir/agent-workspace-connect" \
   "$dist_dir/agent-workspace-session" \
   || die "A staged shell asset failed syntax validation."
+/bin/sh -n "$dist_dir/image-setup.sh" \
+  || die "The staged POSIX image setup asset failed syntax validation."
 
 if [ "$pack_tarball" = true ]; then
   tarball="$dist_dir/agent-container-darwin-arm64.tar.gz"
@@ -145,6 +150,7 @@ if [ "$pack_tarball" = true ]; then
     agent-container-runtime \
     Containerfile \
     Containerfile.dockerignore \
+    image-setup.sh \
     entrypoint.sh \
     host-exec-client \
     host-exec-broker.mjs \

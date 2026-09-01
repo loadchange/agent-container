@@ -52,6 +52,7 @@ jobs:
             bin/codex-container \
             bin/grok-container \
             runtime/agent-container-runtime \
+            runtime/image-setup.sh \
             runtime/agent-workspace-connect \
             runtime/agent-workspace-session \
             runtime/entrypoint.sh \
@@ -73,6 +74,9 @@ jobs:
             tests/fixtures/uname \
             tests/install-fixtures/*
 
+      - name: Validate POSIX image setup syntax
+        run: /bin/sh -n runtime/image-setup.sh
+
       - name: Validate host broker syntax
         run: node --check runtime/host-exec-broker.mjs
 
@@ -90,6 +94,7 @@ jobs:
             bin/codex-container \
             bin/grok-container \
             runtime/agent-container-runtime \
+            runtime/image-setup.sh \
             runtime/agent-workspace-connect \
             runtime/agent-workspace-session \
             runtime/entrypoint.sh \
@@ -98,6 +103,7 @@ jobs:
             scripts/generate-manifest.sh \
             dist/agent-container-darwin-arm64 \
             dist/agent-container-runtime \
+            dist/image-setup.sh \
             dist/entrypoint.sh \
             dist/host-exec-client \
             dist/agent-workspace-connect \

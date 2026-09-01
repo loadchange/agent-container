@@ -224,14 +224,19 @@ done
   || fail 'the cgroup v2 process-containment boundary is unavailable.'
 
 mountpoint_created=false
-if [ ! -e "$workspace_root" ]; then
-  mountpoint_created=true
-fi
 # The host launcher intentionally uses a private umask.  Do not inherit it for
 # guest-only path placeholders: the unprivileged Agent must be able to traverse
 # every missing ancestor to reach the SSHFS mount, while directory listings of
 # those placeholders remain unavailable.
-(umask 0066; /usr/bin/mkdir -p -- "$workspace_root")
+# Create missing ancestors first, then claim only the final mountpoint with one
+# atomic mkdir.  If another session wins that mkdir race, its directory is
+# treated as pre-existing and this helper will never remove it during cleanup.
+workspace_parent=$(/usr/bin/dirname -- "$workspace_root") \
+  || fail 'cannot resolve the ROOT parent directory.'
+(umask 0066; /usr/bin/mkdir -p -- "$workspace_parent")
+if (umask 0066; /usr/bin/mkdir -- "$workspace_root") 2>/dev/null; then
+  mountpoint_created=true
+fi
 [ -d "$workspace_root" ] && [ ! -L "$workspace_root" ] \
   || fail 'ROOT is not a safe directory mountpoint.'
 [ "$(/usr/bin/realpath -e -- "$workspace_root")" = "$workspace_root" ] \
@@ -239,9 +244,24 @@ fi
 if /usr/bin/mountpoint -q -- "$workspace_root"; then
   fail 'ROOT is already a mountpoint in this session namespace.'
 fi
-if [ -n "$(/usr/bin/find "$workspace_root" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
-  fail 'ROOT mountpoint is not empty.'
-fi
+# Ordinary shadow-HOME content below ROOT is safe to cover: this process is
+# already in a private mount namespace, and unmounting SSHFS reveals the
+# untouched underlying tree.  An existing child mount is rejected so teardown
+# and restoration never depend on inherited, temporarily hidden guest mount
+# topology.  Mountinfo escapes backslashes and spaces in target fields as \134
+# and \040 respectively.
+[ -r /proc/self/mountinfo ] \
+  || fail 'the private mount table is unavailable.'
+workspace_root_mountinfo=${workspace_root//\\/\\134}
+workspace_root_mountinfo=${workspace_root_mountinfo// /\\040}
+while IFS=' ' read -r \
+  mount_id parent_id mount_device mount_source mount_target mount_rest; do
+  case "$mount_target" in
+    "$workspace_root_mountinfo"/*)
+      fail 'ROOT contains an existing nested mount in this session namespace.'
+      ;;
+  esac
+done < /proc/self/mountinfo
 
 sshfs_pid=
 agent_pid=
@@ -629,6 +649,9 @@ agent_environment=(
   USER="$runtime_user"
   LOGNAME="$runtime_user"
   XDG_RUNTIME_DIR="$session_runtime_dir"
+  PNPM_CONFIG_STORE_DIR=/var/lib/agent-container/pnpm/store
+  PNPM_CONFIG_CACHE_DIR=/var/lib/agent-container/pnpm/cache
+  PNPM_CONFIG_STATE_DIR=/var/lib/agent-container/pnpm/state
 )
 if [ -n "$host_exec_first_dir" ]; then
   agent_environment+=(
@@ -666,6 +689,11 @@ esac
   || fail 'the private Agent cgroup was unexpectedly populated.'
 
 background_launching=true
+# FUSE3 allows an ordinary nonempty mountpoint to be covered by default.  Its
+# parser rejects the obsolete FUSE2-only `nonempty` option, so underlay safety
+# comes from the private namespace and nested-mount checks above, not a mount
+# flag.  Cleanup reveals the untouched underlay and never removes one that
+# existed before this session.
 env \
   AGENT_WORKSPACE_ENDPOINT="$workspace_endpoint" \
   AGENT_WORKSPACE_TOKEN="$workspace_token" \

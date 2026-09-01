@@ -20,6 +20,7 @@ const VALUE_OPTIONS: &[(&str, &str)] = &[
     ("build-memory", "AGENT_CONTAINER_BUILD_MEMORY"),
     ("version", "AGENT_CONTAINER_VERSION"),
     ("base-image", "AGENT_CONTAINER_BASE_IMAGE"),
+    ("debian-mirror", "AGENT_CONTAINER_DEBIAN_MIRROR"),
     ("http-proxy", "AGENT_CONTAINER_HTTP_PROXY"),
     ("https-proxy", "AGENT_CONTAINER_HTTPS_PROXY"),
     ("all-proxy", "AGENT_CONTAINER_ALL_PROXY"),
@@ -29,6 +30,7 @@ const VALUE_OPTIONS: &[(&str, &str)] = &[
     ("dns2", "AGENT_CONTAINER_DNS2"),
     ("timezone", "AGENT_CONTAINER_TZ"),
     ("forward-env", "AGENT_CONTAINER_FORWARD_ENV"),
+    ("workspace-root", "AGENT_CONTAINER_WORKSPACE_ROOT"),
     ("max-files", "AGENT_CONTAINER_MAX_FILES"),
     ("fd-stop-percent", "AGENT_CONTAINER_FD_STOP_PERCENT"),
     ("assets", "AGENT_CONTAINER_ASSET_DIR"),
@@ -146,6 +148,14 @@ const DANGEROUS_AMBIENT_ENVIRONMENT: &[&str] = &[
     "XDG_CONFIG_HOME",
     "SSH_ASKPASS",
     "SSH_ASKPASS_REQUIRE",
+    // Guest package-manager storage is fixed by the verified image/runtime and
+    // must not inherit host paths or re-enable Corepack downloads.
+    "COREPACK_HOME",
+    "COREPACK_ENABLE_NETWORK",
+    "COREPACK_DEFAULT_TO_LATEST",
+    "PNPM_CONFIG_STORE_DIR",
+    "PNPM_CONFIG_CACHE_DIR",
+    "PNPM_CONFIG_STATE_DIR",
 ];
 
 const DANGEROUS_AMBIENT_PREFIXES: &[&[u8]] = &[
@@ -634,6 +644,7 @@ mod tests {
                 "--container-cpus=8",
                 "--container-extra-ca",
                 "/tmp/root.pem",
+                "--container-workspace-root=/Users/alice/github",
                 "--container-forward-ssh-agent",
                 "--container-forward-api-key",
                 "--no-container-disable-fd-watchdog",
@@ -649,6 +660,10 @@ mod tests {
         assert_eq!(
             environment_value(&result, "AGENT_CONTAINER_EXTRA_CA_CERTS"),
             Some(OsStr::new("/tmp/root.pem"))
+        );
+        assert_eq!(
+            environment_value(&result, "AGENT_CONTAINER_WORKSPACE_ROOT"),
+            Some(OsStr::new("/Users/alice/github"))
         );
         assert_eq!(
             environment_value(&result, "AGENT_CONTAINER_FORWARD_API_KEY"),
@@ -674,6 +689,7 @@ mod tests {
             ("build-memory", "AGENT_CONTAINER_BUILD_MEMORY"),
             ("version", "AGENT_CONTAINER_VERSION"),
             ("base-image", "AGENT_CONTAINER_BASE_IMAGE"),
+            ("debian-mirror", "AGENT_CONTAINER_DEBIAN_MIRROR"),
             ("http-proxy", "AGENT_CONTAINER_HTTP_PROXY"),
             ("https-proxy", "AGENT_CONTAINER_HTTPS_PROXY"),
             ("all-proxy", "AGENT_CONTAINER_ALL_PROXY"),
@@ -683,6 +699,7 @@ mod tests {
             ("dns2", "AGENT_CONTAINER_DNS2"),
             ("timezone", "AGENT_CONTAINER_TZ"),
             ("forward-env", "AGENT_CONTAINER_FORWARD_ENV"),
+            ("workspace-root", "AGENT_CONTAINER_WORKSPACE_ROOT"),
             ("max-files", "AGENT_CONTAINER_MAX_FILES"),
             ("fd-stop-percent", "AGENT_CONTAINER_FD_STOP_PERCENT"),
             ("assets", "AGENT_CONTAINER_ASSET_DIR"),

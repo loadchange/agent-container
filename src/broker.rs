@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -193,8 +193,20 @@ pub fn run(arguments: &[OsString]) -> Result<(), String> {
 }
 
 fn canonical_root(input: &Path) -> Result<PathBuf, String> {
+    if !input.is_absolute() {
+        return Err(format!(
+            "workspace root must be an absolute path: {:?}",
+            input
+        ));
+    }
     let canonical = fs::canonicalize(input)
         .map_err(|error| format!("could not canonicalize workspace root {:?}: {error}", input))?;
+    if canonical.as_os_str().as_bytes() != input.as_os_str().as_bytes() {
+        return Err(format!(
+            "workspace root must already be canonical: {:?}",
+            input
+        ));
+    }
     let metadata = fs::metadata(&canonical)
         .map_err(|error| format!("could not inspect workspace root {:?}: {error}", canonical))?;
     if !metadata.is_dir() {
@@ -540,8 +552,6 @@ mod tests {
 
     #[test]
     fn workspace_definition_preserves_non_utf8_paths() {
-        use std::os::unix::ffi::OsStrExt;
-
         let path = Path::new(OsStr::from_bytes(b"/tmp/workspace-\xff"));
         assert_eq!(
             workspace_definition(path).as_bytes(),
@@ -560,9 +570,53 @@ mod tests {
     }
 
     #[test]
+    fn canonical_root_rejects_relative_input() {
+        let error = canonical_root(Path::new(".")).unwrap_err();
+        assert!(error.contains("must be an absolute path"));
+    }
+
+    #[test]
+    fn canonical_root_rejects_symlink_input() {
+        use std::os::unix::fs::symlink;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "agent-container-broker-symlink-test-{}-{}",
+            std::process::id(),
+            random_token().unwrap()
+        ));
+        fs::create_dir(&test_root).unwrap();
+        let test_root = fs::canonicalize(&test_root).unwrap();
+        let target = test_root.join("target");
+        let link = test_root.join("link");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = canonical_root(&link).unwrap_err();
+        assert!(error.contains("must already be canonical"));
+
+        fs::remove_file(link).unwrap();
+        fs::remove_dir(target).unwrap();
+        fs::remove_dir(test_root).unwrap();
+    }
+
+    #[test]
+    fn canonical_root_accepts_a_canonical_absolute_directory() {
+        let test_root = std::env::temp_dir().join(format!(
+            "agent-container-broker-canonical-test-{}-{}",
+            std::process::id(),
+            random_token().unwrap()
+        ));
+        fs::create_dir(&test_root).unwrap();
+        let test_root = fs::canonicalize(&test_root).unwrap();
+
+        assert_eq!(canonical_root(&test_root).unwrap(), test_root);
+
+        fs::remove_dir(test_root).unwrap();
+    }
+
+    #[test]
     fn canonical_root_rejects_the_filesystem_root() {
         assert!(canonical_root(Path::new("/")).is_err());
-        assert!(canonical_root(Path::new(".")).is_ok());
     }
 
     #[test]

@@ -22,6 +22,7 @@ ASSETS=(
   agent-container-runtime
   Containerfile
   Containerfile.dockerignore
+  image-setup.sh
   entrypoint.sh
   host-exec-client
   host-exec-broker.mjs
@@ -111,6 +112,7 @@ make_release_source() {
   chmod 0755 \
     "$source_root/agent-container-darwin-arm64" \
     "$source_root/agent-container-runtime" \
+    "$source_root/image-setup.sh" \
     "$source_root/entrypoint.sh" \
     "$source_root/host-exec-client" \
     "$source_root/agent-workspace-connect" \
@@ -471,7 +473,7 @@ for command_name in claude-container codex-container; do
 done
 for asset in \
   agent-container-darwin-arm64 agent-container-runtime \
-  Containerfile Containerfile.dockerignore entrypoint.sh host-exec-client \
+  Containerfile Containerfile.dockerignore image-setup.sh entrypoint.sh host-exec-client \
   host-exec-broker.mjs agent-workspace-connect agent-workspace-session \
   profiles/grok.json; do
   [ -f "$selective_grok_release/$asset" ] \

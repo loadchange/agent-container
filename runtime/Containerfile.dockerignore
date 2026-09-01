@@ -1,5 +1,6 @@
 **
 !entrypoint.sh
+!image-setup.sh
 !host-exec-client
 !agent-workspace-connect
 !agent-workspace-session

@@ -18,12 +18,15 @@ The normal path has these invariants:
 - the container remains running until an explicit `singleton stop`;
 - each invocation starts a new Agent process through `container exec`;
 - every invocation keeps its own cwd, TTY or pipes, signals, and exit status;
-- only that invocation's current Git root is dynamically mounted;
+- only that invocation's current Git root is dynamically mounted by default;
+  `--container-workspace-root` may explicitly select one containing root for a
+  default-singleton client;
 - the guest PATH mirrors the host command catalog through a per-client
   host-tool broker: `git` and `gh` default to host-first sandboxed host
   executables, and commands the guest image does not provide fall back to
   sandboxed host executables (`--no-container-host-tools` opts out);
-- no real host HOME or predeclared multi-project root set is mounted;
+- no real host HOME or automatically inferred multi-project root set is
+  mounted;
 - clients of one profile share the VM and isolated profile HOME.
 
 The stable native name is `agent-<profile>-<uid>-singleton`. The container's
@@ -125,15 +128,31 @@ Pre-mounting project A and project B would require knowing every future path,
 would expand the VM's authority, and would reproduce the large-tree VirtioFS
 risk that the persistent design is intended to avoid.
 
-The normal path instead transports one canonical project root for one exec.
+The normal path instead transports one canonical workspace root for one exec.
 Inside Git, that root is the repository top level; outside Git, it is the
 physical current directory. The original cwd must resolve beneath that root.
+
+For a sibling-checkout or linked-dependency layout, the operator can pass
+`--container-workspace-root PATH` on a default singleton invocation. The
+canonical selected directory replaces the inferred root for that client and
+must contain both the original cwd and the detected Git root. The option input
+must itself be an absolute existing directory.
+It becomes the single root used by the SFTP broker, guest SSHFS mount, and
+host-tool execution sandbox. It is not stored as a static container mount and
+does not change another client attached to the same singleton.
+
+The launcher rejects filesystem root, the complete real HOME, and any selected
+root that overlaps private Agent state. It never selects a common parent from
+package metadata or follows arbitrary symlinks to enlarge the root. This keeps
+the default authority at one repository and makes every expansion an explicit
+per-client decision.
 
 ### Host broker
 
 For every client, the Rust launcher:
 
-1. canonicalizes an existing directory and rejects `/`;
+1. canonicalizes the inferred or explicitly selected existing directory and
+   rejects `/`, the complete HOME, and overlap with private state;
 2. verifies `/usr/bin/sandbox-exec` and `/usr/libexec/sftp-server` as fixed
    non-symlink system executables;
 3. generates 32 bytes from `/dev/urandom` and encodes a 64-character lowercase
@@ -163,7 +182,7 @@ data is fail-closed. It stops pre-connection acceptance or calls
 the singleton or another client's broker.
 
 The SFTP child receives a default-deny sandbox profile. It can execute the fixed
-system SFTP binary, read and write below the canonical workspace, traverse only
+system SFTP binary, read and write below the effective workspace, traverse only
 the ancestors needed to reach it, and use standard system runtime files. An
 explicit network deny prevents the child from creating another network
 channel. The unsandboxed Rust parent owns only endpoint acceptance and byte
@@ -181,9 +200,19 @@ creating a mountpoint. It validates that:
 - the requested root and cwd are canonical absolute paths;
 - neither overlaps protected guest system trees;
 - the cwd is below the root and does not traverse a workspace symlink;
-- the mountpoint is empty and not already mounted;
+- neither the root itself nor any path below it is already mounted;
 - `/dev/fuse`, SSHFS, `fusermount3`, and the fixed transport helper are present;
 - the resulting filesystem type is FUSE/SSHFS.
+
+An ordinary existing directory may contain files. Because the namespace is
+private, SSHFS temporarily covers that underlay only for this client; unmounting
+reveals the same content unchanged. Existing nested mounts are rejected before
+SSHFS starts so teardown and restoration do not inherit hidden guest mount
+topology. FUSE3 permits this ordinary nonempty overlay by default; the helper
+must not pass the removed FUSE2 `nonempty` option. The helper claims a missing
+final mountpoint with an atomic `mkdir`; cleanup removes it only after that
+successful claim and uses `rmdir`, so a nonempty or pre-existing directory is
+never deleted.
 
 The guest transport prefixes the one authentication frame and then runs
 `socat -t 1 STDIO TCP4-CONNECT:...` as the raw bidirectional SFTP relay. Local
@@ -213,13 +242,24 @@ Private namespaces prevent accidental mount sharing, but the clients still
 share one kernel, Linux identity, process table, and profile HOME. They are not
 a hard boundary for mutually hostile same-profile workloads.
 
-### Git limitation
+### Explicit containing roots
 
-The default transport currently carries one root. A linked worktree whose Git
-common directory is outside the worktree root cannot be represented as one
-SFTP mount and is rejected before broker startup. The advanced `run` path can
-use separate Apple volume mounts for that case. Ordinary repositories and
-switching among unrelated roots require no configuration.
+The default transport carries one inferred Git root. A repository such as
+`sample-app` whose package metadata links into a sibling `shared-harness`
+checkout can instead select their narrowest common ancestor:
+
+```bash
+cd /Users/alice/work/sample-app
+claude-container \
+  --container-workspace-root /Users/alice/work
+```
+
+This remains one SFTP mount. It authorizes the complete selected ancestor, not
+an allowlist containing only the two named repositories. Symlink targets and
+relative package links work only when their resolved paths remain inside that
+root; outside targets remain denied by the host sandbox. Layouts that cannot
+fit beneath one acceptable root still require reviewed legacy `run` shares.
+Ordinary repositories and switching among unrelated roots require no option.
 
 ## Host tool broker
 
@@ -228,7 +268,7 @@ default: the authenticated Node.js broker shared with legacy `run`. Both
 launch modes use one catalog implementation. The launcher freezes the ordered
 host `PATH` directories, the deny/first policy, and the resolved Node.js and
 Xcode/CommandLineTools executables into a catalog specification
-(`host-catalog.json`), declares the canonical workspace as the only writable
+(`host-catalog.json`), declares the effective workspace as the only writable
 execution root, stages a fresh 256-bit token, and binds the broker to its own
 PID so the channel ends with the client. The broker expands the specification
 into the validated command manifest in-process — canonicalizing every
@@ -257,7 +297,10 @@ sandbox (`--no-container-host-ssh-agent` opts out; an explicit
 proxied command
 receives the isolated broker execution HOME, keeping host dotfiles and stored
 credentials out of generic tools while their caches persist per profile. The
-generated sandbox confines writes to the workspace and that execution HOME.
+generated sandbox confines writes to the effective workspace and that
+execution HOME. An explicit `--container-workspace-root` therefore expands the
+host-exec authority in exactly the same way as the SFTP authority; the two
+brokers cannot disagree about the client root.
 Host tools operate on the real project directory, avoiding SFTP round-trips
 for metadata- and I/O-heavy work entirely; the per-invocation broker channel
 adds roughly 0.2 s of startup latency, has no PTY, and leaves host-side
@@ -277,7 +320,7 @@ For host `/Users/alice`, the persistent mapping is:
 host managed state                                      guest
 ~/.agent-container/profiles/codex/home/        <->      /Users/alice  (rw)
 profile singleton static staging               <->      /run/agent-host (ro)
-per-exec host Git root                          <->      same path through SSHFS
+per-exec effective workspace root               <->      same path through SSHFS
 ```
 
 The real `/Users/alice` directory is not mounted. The path-compatible shadow
@@ -298,8 +341,17 @@ URL rewrites.
 
 The shared image starts from a digest-pinned Debian Bookworm slim arm64 base.
 It contains common Linux tools, SSHFS/FUSE helpers, the generic entrypoint, and
-one exact native Agent release. It does not install Node.js or npm for normal
-operation.
+one exact native Agent release. It also pins the Node.js 22.20.0 archive and
+pnpm 11.7.0, includes Node's npm/Corepack, and verifies Debian Python 3.11 or
+newer at build time. These guest binaries precede fallback host-tool shims,
+keeping JavaScript package builds and clean-PATH subprocesses inside one Linux
+execution plane. The prepared pnpm payload and Corepack last-known-good record
+live in a shared read-only image directory. Runtime Corepack network resolution
+is disabled, so changing profile HOME cannot trigger a second pnpm download or
+grow the VirtioFS-backed shadow HOME. pnpm's rebuildable store, cache, and state
+are instead rooted at `/var/lib/agent-container/pnpm` on the singleton's
+writable guest layer; deleting/recreating a singleton may rebuild them, while
+Agent identity and settings remain in the persistent shadow HOME.
 
 Every built-in profile selects a publisher channel. On launch, the host reduces
 that channel response to one safe exact version. The image recipe fingerprint
@@ -380,6 +432,24 @@ different CPU, memory, network, CA, image, or static capability policy. The
 operator stops that profile and lets the next invocation create the new
 configuration.
 
+`--container-workspace-root` is different: it is a per-client authorization,
+not persistent VM configuration. The selected root is validated for each
+default-singleton invocation and handed to both transient brokers. It neither
+requires a singleton restart nor expands the root of another attached client.
+
+Host-only path canonicalization, private-state overlap checks, and per-tree
+VirtioFS entry budgets complete before stopped Apple services are started. A
+stopped service also receives the full cold file/vnode projection before
+startup. If services are already running, native discovery first distinguishes
+a warm singleton (zero new Apple-volume entries) from a cold creation; under
+the same lifecycle lock, proven dead VMs are reclaimed and capacity is sampled
+again before durable registration. The pre-service estimate reserves
+deterministic nonzero floors for launcher-generated legacy/singleton staging
+and optional SSH/hosts content. Each existing Apple-volume source is frozen by
+canonical path, expected type, and macOS `st_dev:st_ino`; every cold path
+repeats the tree count, object-identity check, and host-capacity sample after
+image work, immediately before native creation.
+
 ## State and lifecycle
 
 The managed state root is:
@@ -446,6 +516,10 @@ default path; the guest builds its shims from the broker-generated manifest at
 container start instead of a catalog request. Guest binaries are preferred
 except for explicitly host-first commands such as Git and gh.
 
+`--container-workspace-root` is rejected here. Legacy `run` broadens authority
+only through its explicit `--share-ro` and `--share-rw` interface, whose Apple
+volume and lifecycle properties differ from the singleton SFTP channel.
+
 This boundary differs from the default path in transport, not in command
 surface: it uses VirtioFS for user trees and per-launch container lifecycle.
 It exists for linked worktrees and extra shares, and requires stopping that
@@ -468,7 +542,13 @@ of reaching provider APIs and other network destinations.
 
 - [`container#1097`](https://github.com/apple/container/issues/1097): VirtioFS
   lookups can retain host file descriptors. Dynamic SFTP avoids a persistent
-  VirtioFS project mount, but shadow HOME and static opt-ins still need guards.
+  VirtioFS project mount, including when a singleton client explicitly selects
+  a larger `--container-workspace-root`; shadow HOME and static opt-ins still
+  need guards. Cold creation freezes both the canonical path and macOS
+  filesystem-object identity (`st_dev:st_ino`) of each existing Apple volume
+  source, then verifies both and counts generated staging again immediately
+  before create. The pre-service estimate assigns deterministic nonzero floors
+  to planned legacy/singleton staging and optional SSH/hosts content.
 - [`container#165`](https://github.com/apple/container/issues/165): Apple bind
   mounts have no UID/GID translation. The runtime matches numeric identity.
 - [`container#141`](https://github.com/apple/container/issues/141): VirtioFS

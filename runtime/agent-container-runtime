@@ -139,6 +139,30 @@ sha256_tree() {
   ) | sha256_stream
 }
 
+sha256_ssh_metadata() {
+  local root="$1"
+  local metadata_hash metadata_path metadata_name
+
+  [ -d "$root" ] && [ ! -L "$root" ] \
+    || die "Cannot fingerprint unsafe SSH metadata staging: $root"
+  {
+    for metadata_name in \
+      config known_hosts known_hosts.old allowed_signers; do
+      metadata_path="$root/$metadata_name"
+      printf 'name=%s\n' "$metadata_name"
+      if [ -f "$metadata_path" ] && [ ! -L "$metadata_path" ]; then
+        metadata_hash=$(sha256_file "$metadata_path") \
+          || die "Unable to fingerprint SSH metadata file: $metadata_path"
+        printf 'sha256=%s\n' "$metadata_hash"
+      elif [ -e "$metadata_path" ] || [ -L "$metadata_path" ]; then
+        die "Cannot fingerprint unsafe SSH metadata file: $metadata_path"
+      else
+        printf '%s\n' absent
+      fi
+    done
+  } | sha256_stream
+}
+
 bounded_file_count() {
   local root="$1"
   local limit="$2"
@@ -167,11 +191,11 @@ bounded_file_count() {
   if [ -s "$error_file" ]; then
     first_error=$(sed -n '1p' "$error_file")
     rm -f "$error_file"
-    die "Unable to safely scan workspace '$root': $first_error"
+    die "Unable to safely scan filesystem tree '$root': $first_error"
   fi
   rm -f "$error_file"
   case "$count" in
-    ''|*[!0-9]*) die "Workspace safety scan returned an invalid file count." ;;
+    ''|*[!0-9]*) die "Filesystem safety scan returned an invalid entry count." ;;
   esac
   printf '%s\n' "$count"
 }
@@ -890,6 +914,7 @@ Container launcher options (must precede the profile or Agent arguments):
   --container-build-memory SIZE   image-build memory
   --container-version VERSION     latest or an exact native CLI version
   --container-base-image IMAGE    pinned base image reference
+  --container-debian-mirror URL   HTTP Debian main-repository mirror for builds
   --container-http-proxy URL      HTTP proxy
   --container-https-proxy URL     HTTPS proxy
   --container-all-proxy URL       all-protocol proxy
@@ -899,7 +924,8 @@ Container launcher options (must precede the profile or Agent arguments):
   --container-dns2 ADDRESS        secondary DNS server
   --container-timezone ZONE       guest timezone
   --container-forward-env NAMES   exact exported names, comma-separated
-  --container-max-files N         legacy VirtioFS file budget
+  --container-workspace-root PATH explicit singleton SFTP/host-tool scope
+  --container-max-files N         VirtioFS entry budget
   --container-fd-stop-percent N   legacy file-descriptor stop threshold
   --container-assets PATH         release asset directory
   --container-bin PATH            Apple container CLI override
@@ -962,6 +988,9 @@ validate_profile_env_name() {
       return 1
       ;;
     HOST_UID|HOST_GID|HOST_HOME|XDG_RUNTIME_DIR|IS_SANDBOX|BASE_IMAGE|DEFAULT_BASE_IMAGE)
+      return 1
+      ;;
+    COREPACK_HOME|COREPACK_ENABLE_NETWORK|COREPACK_DEFAULT_TO_LATEST|PNPM_CONFIG_STORE_DIR|PNPM_CONFIG_CACHE_DIR|PNPM_CONFIG_STATE_DIR)
       return 1
       ;;
     HOME|USER|LOGNAME|SHELL|PATH|PWD|OLDPWD|SHLVL|_|GIT_CONFIG_GLOBAL|TERM|COLORTERM|TZ|SSH_AUTH_SOCK)
@@ -1175,6 +1204,7 @@ script_dir=$(resolve_absolute_dir "$(dirname -- "$0")")
 asset_dir="${AGENT_CONTAINER_ASSET_DIR:-$script_dir}"
 if [ ! -f "$asset_dir/Containerfile" ] \
   || [ ! -f "$asset_dir/Containerfile.dockerignore" ] \
+  || [ ! -f "$asset_dir/image-setup.sh" ] \
   || [ ! -f "$asset_dir/entrypoint.sh" ] \
   || [ ! -f "$asset_dir/host-exec-client" ] \
   || [ ! -f "$asset_dir/host-exec-broker.mjs" ] \
@@ -1190,6 +1220,9 @@ asset_dir=$(resolve_absolute_dir "$asset_dir") \
 [ -f "$asset_dir/Containerfile.dockerignore" ] \
   && [ ! -L "$asset_dir/Containerfile.dockerignore" ] \
   || die "Containerfile.dockerignore not found. Re-run install.sh or pass --container-assets PATH."
+[ -f "$asset_dir/image-setup.sh" ] && [ ! -L "$asset_dir/image-setup.sh" ] \
+  && [ -x "$asset_dir/image-setup.sh" ] \
+  || die "image-setup.sh not found. Re-run install.sh or pass --container-assets PATH."
 [ -f "$asset_dir/entrypoint.sh" ] && [ ! -L "$asset_dir/entrypoint.sh" ] \
   || die "entrypoint.sh not found. Re-run install.sh or pass --container-assets PATH."
 [ -f "$asset_dir/host-exec-client" ] && [ ! -L "$asset_dir/host-exec-client" ] \
@@ -1344,9 +1377,10 @@ fi
 
 # Host tool proxying is the default for normal singleton clients: the guest
 # PATH mirrors the complete host command catalog, so commands the verified
-# guest image does not provide (node, npm, uv, cargo, ...) transparently run
-# as sandboxed host executables against the same workspace path, and git/gh
-# run host-first with the operator's identity and credentials. The default
+# guest image does not provide (uv, cargo, ...) transparently run as sandboxed
+# host executables against the same workspace path. Native Node/npm/pnpm and
+# Python remain inside the guest, while git/gh run host-first with the
+# operator's identity and credentials. The default
 # degrades to the guest binaries with a warning when the host broker runtime
 # is unavailable; an explicit --container-host-tools instead fails closed,
 # and --no-container-host-tools disables the channel.
@@ -1491,14 +1525,42 @@ container_version=$(printf '%s\n' "$container_version_output" \
 version_at_least "$container_version" "$MIN_CONTAINER_VERSION" \
   || die "Apple container $MIN_CONTAINER_VERSION or newer is required (found $container_version)."
 
-if ! "$container_bin" system status >/dev/null 2>&1; then
+ensure_container_services() {
+  local known_state="${1:-unknown}"
+  local readiness_attempt start_log
+
+  case "$known_state" in
+    running) return 0 ;;
+    stopped) ;;
+    unknown)
+      "$container_bin" system status >/dev/null 2>&1 && return 0
+      ;;
+    *) die "Internal error: invalid Apple service readiness state." ;;
+  esac
+
   printf '%s\n' \
     "Apple container services are not running; starting them now..." >&2
-  "$container_bin" system start \
-    || die "Unable to start Apple container services with: $container_bin system start"
-  "$container_bin" system status >/dev/null 2>&1 \
-    || die "Apple container services did not become ready after: $container_bin system start"
-fi
+  start_log=$(mktemp "${TMPDIR:-/tmp}/agent-container-system-start.XXXXXX") \
+    || die "Unable to allocate diagnostics for Apple container service startup."
+  if ! "$container_bin" system start >"$start_log" 2>&1; then
+    sed -n '1,120p' "$start_log" >&2
+    rm -f "$start_log"
+    die "Unable to start Apple container services with: $container_bin system start"
+  fi
+  readiness_attempt=0
+  while [ "$readiness_attempt" -lt 20 ]; do
+    "$container_bin" system status >/dev/null 2>&1 && {
+      rm -f "$start_log"
+      return 0
+    }
+    readiness_attempt=$((readiness_attempt + 1))
+    [ "$readiness_attempt" -lt 20 ] || break
+    /bin/sleep 0.25
+  done
+  sed -n '1,120p' "$start_log" >&2
+  rm -f "$start_log"
+  die "Apple container services did not become ready within 5 seconds after: $container_bin system start"
+}
 
 # Return every project-labeled container plus any container occupying this
 # launcher's reserved name pattern. The latter is reported even without our
@@ -1676,34 +1738,111 @@ validate_singleton_native_record() {
     || die "Container '$native_id' has an invalid singleton configuration fingerprint."
 }
 
-clear_singleton_state_files() {
-  local singleton_state_root="$1"
-  local singleton_stage_root="$singleton_state_root/guest-stage"
-  local singleton_ssh_stage="$singleton_stage_root/ssh"
+verify_singleton_recreation_root_identity() {
+  local current_root_identity resolved_root
 
-  [ -e "$singleton_state_root" ] || [ -L "$singleton_state_root" ] || return 0
-  validate_managed_directory "$singleton_state_root"
-  validate_managed_directory "$singleton_stage_root"
-  validate_managed_directory "$singleton_ssh_stage"
-  if [ -d "$singleton_stage_root" ]; then
-    rm -f "$singleton_stage_root/gitconfig"
-    if [ -d "$singleton_ssh_stage" ]; then
-      rm -f \
-        "$singleton_ssh_stage/config" \
-        "$singleton_ssh_stage/known_hosts" \
-        "$singleton_ssh_stage/known_hosts.old" \
-        "$singleton_ssh_stage/allowed_signers"
-      rmdir "$singleton_ssh_stage" 2>/dev/null || true
-    fi
-    rmdir "$singleton_stage_root" 2>/dev/null || true
+  [ -n "${singleton_recreation_root_identity:-}" ] \
+    || die "Singleton state root identity was not frozen before controlled recreation."
+  [ -d "$singleton_root" ] && [ ! -L "$singleton_root" ] \
+    || die "Singleton state root changed after controlled native deletion: $singleton_root"
+  resolved_root=$(resolve_absolute_dir "$singleton_root" || true)
+  [ "$resolved_root" = "$singleton_root" ] \
+    || die "Singleton state root changed canonical identity after controlled native deletion: $singleton_root"
+  current_root_identity=$(virtiofs_source_identity "$singleton_root")
+  [ "$current_root_identity" = "$singleton_recreation_root_identity" ] \
+    || die "Singleton state root changed filesystem identity after controlled native deletion: $singleton_root"
+}
+
+verify_singleton_recreation_sources() {
+  local preserve_ssh_identity="$1"
+  local preserve_hosts_identity="$2"
+
+  verify_singleton_recreation_root_identity
+
+  verify_frozen_virtiofs_source_identity \
+    directory "persistent '$profile_id' singleton staging" \
+    "$singleton_guest_stage"
+  if [ "$preserve_ssh_identity" = true ]; then
+    verify_frozen_virtiofs_source_identity \
+      directory "separately mounted SSH metadata staging" \
+      "$singleton_guest_stage/ssh"
   fi
+  if [ "$preserve_hosts_identity" = true ]; then
+    verify_frozen_virtiofs_source_identity \
+      file "separately mounted container hosts file" \
+      "$singleton_guest_stage/container-hosts"
+  fi
+}
+
+clear_singleton_state_records() {
+  local singleton_state_root="$1"
+
+  [ -e "$singleton_state_root" ] || [ -L "$singleton_state_root" ] \
+    || return 0
+  validate_managed_directory "$singleton_state_root"
   rm -f \
     "$singleton_state_root/phase" \
     "$singleton_state_root/creator-pid" \
     "$singleton_state_root/agent-version" \
     "$singleton_state_root/image-digest" \
     "$singleton_state_root/config.sha256"
-  rmdir "$singleton_state_root" 2>/dev/null || true
+}
+
+clear_singleton_state_files() {
+  local singleton_state_root="$1"
+  local preserve_stage_identity="${2:-false}"
+  local preserve_ssh_identity="${3:-false}"
+  local preserve_hosts_identity="${4:-false}"
+  local singleton_stage_root="$singleton_state_root/guest-stage"
+  local singleton_ssh_stage="$singleton_stage_root/ssh"
+  local preserve_identity_mode
+
+  for preserve_identity_mode in \
+    "$preserve_stage_identity" \
+    "$preserve_ssh_identity" \
+    "$preserve_hosts_identity"; do
+    case "$preserve_identity_mode" in
+      true|false) ;;
+      *) die "Internal error: invalid singleton staging preservation mode." ;;
+    esac
+  done
+  if [ "$preserve_stage_identity" != true ] \
+    && { [ "$preserve_ssh_identity" = true ] \
+      || [ "$preserve_hosts_identity" = true ]; }; then
+    die "Internal error: nested singleton source identity cannot outlive its staging directory."
+  fi
+
+  [ -e "$singleton_state_root" ] || [ -L "$singleton_state_root" ] || return 0
+  validate_managed_directory "$singleton_state_root"
+  validate_managed_directory "$singleton_stage_root"
+  validate_managed_directory "$singleton_ssh_stage"
+  if [ "$preserve_stage_identity" = true ]; then
+    verify_singleton_recreation_sources \
+      "$preserve_ssh_identity" "$preserve_hosts_identity"
+  fi
+  if [ -d "$singleton_stage_root" ]; then
+    rm -f "$singleton_stage_root/gitconfig"
+    if [ "$preserve_hosts_identity" != true ]; then
+      rm -f "$singleton_stage_root/container-hosts"
+    fi
+    if [ -d "$singleton_ssh_stage" ]; then
+      rm -f \
+        "$singleton_ssh_stage/config" \
+        "$singleton_ssh_stage/known_hosts" \
+        "$singleton_ssh_stage/known_hosts.old" \
+        "$singleton_ssh_stage/allowed_signers"
+      if [ "$preserve_ssh_identity" != true ]; then
+        rmdir "$singleton_ssh_stage" 2>/dev/null || true
+      fi
+    fi
+    if [ "$preserve_stage_identity" != true ]; then
+      rmdir "$singleton_stage_root" 2>/dev/null || true
+    fi
+  fi
+  clear_singleton_state_records "$singleton_state_root"
+  if [ "$preserve_stage_identity" != true ]; then
+    rmdir "$singleton_state_root" 2>/dev/null || true
+  fi
 }
 
 if [ -n "$singleton_control_action" ]; then
@@ -1721,6 +1860,8 @@ if [ -n "$singleton_control_action" ]; then
     validate_managed_directory "$control_profile_root"
     validate_managed_directory "$control_singleton_root"
   fi
+
+  ensure_container_services
 
   if [ "$singleton_control_action" = stop ]; then
     acquire_lifecycle_lock
@@ -1816,6 +1957,7 @@ no_proxy_value="${AGENT_CONTAINER_NO_PROXY:-localhost,127.0.0.1}"
 dns1_value="${AGENT_CONTAINER_DNS1:-}"
 dns2_value="${AGENT_CONTAINER_DNS2:-}"
 timezone_value="${AGENT_CONTAINER_TZ:-}"
+debian_mirror_value="${AGENT_CONTAINER_DEBIAN_MIRROR:-}"
 host_alias_value="${AGENT_CONTAINER_HOST_ALIAS:-}"
 block_host_value="${AGENT_CONTAINER_BLOCK_HOST:-}"
 extra_ca_setting="${AGENT_CONTAINER_EXTRA_CA_CERTS:-auto}"
@@ -1827,12 +1969,36 @@ reject_control_characters --container-no-proxy "$no_proxy_value"
 reject_control_characters --container-dns1 "$dns1_value"
 reject_control_characters --container-dns2 "$dns2_value"
 reject_control_characters --container-timezone "$timezone_value"
+reject_control_characters --container-debian-mirror "$debian_mirror_value"
 reject_control_characters --container-host-alias "$host_alias_value"
 reject_control_characters --container-block-host "$block_host_value"
 reject_control_characters --container-cpus "${AGENT_CONTAINER_CPUS:-4}"
 reject_control_characters --container-memory "${AGENT_CONTAINER_MEMORY:-4g}"
 
+case "$debian_mirror_value" in
+  '') ;;
+  http://*)
+    [ "${#debian_mirror_value}" -le 2048 ] \
+      || die "--container-debian-mirror is too long."
+    case "$debian_mirror_value" in
+      *[!A-Za-z0-9._~:/-]*|*/)
+        die "--container-debian-mirror must be an HTTP Debian main-repository URL without credentials, query parameters, fragments, or a trailing slash."
+        ;;
+    esac
+    debian_mirror_authority_and_path=${debian_mirror_value#*://}
+    case "$debian_mirror_authority_and_path" in
+      ?*/?*) ;;
+      *) die "--container-debian-mirror must include both a host and repository path." ;;
+    esac
+    ;;
+  https://*)
+    die "--container-debian-mirror must use http:// because the pinned Debian slim base has no bootstrap TLS trust store. APT still verifies Debian-signed repository metadata and package hashes."
+    ;;
+  *) die "--container-debian-mirror must be an http:// Debian main-repository URL." ;;
+esac
+
 host_aliases=()
+host_alias_count=0
 if [ -n "$host_alias_value" ]; then
   case "$host_alias_value" in
     ,*|*,|*,,*) die "--container-host-alias must contain comma-separated DNS names." ;;
@@ -1846,14 +2012,17 @@ EOF
         die "--container-host-alias contains an unsafe DNS name: $host_alias"
         ;;
     esac
-    if [ "${#host_aliases[@]}" -eq 0 ] \
-      || ! array_contains_value "$host_alias" "${host_aliases[@]}"; then
+    if [ "$host_alias_count" -eq 0 ] \
+      || ! array_contains_value \
+        "$host_alias" "${host_aliases[@]+"${host_aliases[@]}"}"; then
       host_aliases+=("$host_alias")
+      host_alias_count=$((host_alias_count + 1))
     fi
   done
 fi
 
 blocked_hosts=()
+blocked_host_count=0
 if [ -n "$block_host_value" ]; then
   case "$block_host_value" in
     ,*|*,|*,,*) die "--container-block-host must contain comma-separated DNS names." ;;
@@ -1867,12 +2036,15 @@ EOF
         die "--container-block-host contains an unsafe DNS name: $blocked_host"
         ;;
     esac
-    if array_contains_value "$blocked_host" "${host_aliases[@]}"; then
+    if array_contains_value \
+      "$blocked_host" "${host_aliases[@]+"${host_aliases[@]}"}"; then
       die "A hostname cannot be both --container-host-alias and --container-block-host: $blocked_host"
     fi
-    if [ "${#blocked_hosts[@]}" -eq 0 ] \
-      || ! array_contains_value "$blocked_host" "${blocked_hosts[@]}"; then
+    if [ "$blocked_host_count" -eq 0 ] \
+      || ! array_contains_value \
+        "$blocked_host" "${blocked_hosts[@]+"${blocked_hosts[@]}"}"; then
       blocked_hosts+=("$blocked_host")
+      blocked_host_count=$((blocked_host_count + 1))
     fi
   done
 fi
@@ -1900,6 +2072,10 @@ case "$proxy_values_lower" in
     die "host.docker.internal is Docker-specific and is unreachable from Apple containers. Configure a VM-reachable proxy address, or explicitly create and use Apple's host.container.internal bridge as documented in README.md."
     ;;
 esac
+
+home_canonical=$(resolve_absolute_dir "$host_home_dir") \
+  || die "Unable to resolve the host home directory."
+host_home_dir="$home_canonical"
 
 host_workspace=$(pwd -P)
 mount_root="$host_workspace"
@@ -1929,6 +2105,32 @@ if [ -n "$common_git_dir" ]; then
     || die "Git reported a common directory that does not exist: $common_git_dir"
   common_git_dir=$(resolve_absolute_dir "$common_git_dir")
 fi
+inferred_mount_root="$mount_root"
+
+workspace_root_input="${AGENT_CONTAINER_WORKSPACE_ROOT:-}"
+if [ -n "$workspace_root_input" ]; then
+  [ "$singleton_requested" = true ] \
+    || die "--container-workspace-root is supported only by the default persistent singleton; legacy run already provides explicit --share-ro/--share-rw roots."
+  reject_control_characters --container-workspace-root "$workspace_root_input"
+  case "$workspace_root_input" in
+    /*) ;;
+    *) die "--container-workspace-root must be an absolute existing directory." ;;
+  esac
+  [ -d "$workspace_root_input" ] \
+    || die "--container-workspace-root is not an existing directory: $workspace_root_input"
+  mount_root=$(resolve_absolute_dir "$workspace_root_input") \
+    || die "Unable to resolve --container-workspace-root: $workspace_root_input"
+  case "$mount_root" in
+    /) die "Refusing filesystem root as --container-workspace-root." ;;
+  esac
+  path_contains "$mount_root" "$host_workspace" \
+    || die "--container-workspace-root '$mount_root' does not contain the launch directory '$host_workspace'."
+  path_contains "$mount_root" "$inferred_mount_root" \
+    || die "--container-workspace-root '$mount_root' does not contain the detected Git root '$inferred_mount_root'."
+  if path_contains "$mount_root" "$home_canonical"; then
+    die "Refusing --container-workspace-root '$mount_root' because it contains the real host HOME '$home_canonical'. Choose the narrow common parent of the required repositories."
+  fi
+fi
 reject_control_characters "workspace path" "$host_workspace"
 reject_control_characters "workspace root" "$mount_root"
 reject_control_characters "Git common directory" "$common_git_dir"
@@ -1937,9 +2139,6 @@ if [ "$singleton_requested" = true ] \
   && ! path_contains "$mount_root" "$common_git_dir"; then
   die "The current Git worktree uses an external common directory '$common_git_dir'. Dynamic singleton sharing currently supports one workspace root; use 'agent-container run $profile_id --' for this worktree."
 fi
-
-home_canonical=$(resolve_absolute_dir "$host_home_dir")
-host_home_dir="$home_canonical"
 
 extra_share_paths=()
 extra_share_modes=()
@@ -1985,12 +2184,14 @@ fi
 
 max_workspace_files="${AGENT_CONTAINER_MAX_FILES:-40000}"
 case "$max_workspace_files" in
-  ''|*[!0-9]*) die "--container-max-files must be a positive integer." ;;
+  ''|0|0*|*[!0-9]*) die "--container-max-files must be a positive decimal integer." ;;
 esac
-[ "$max_workspace_files" -gt 0 ] \
-  || die "--container-max-files must be greater than zero."
+[ "${#max_workspace_files}" -le 9 ] \
+  || die "--container-max-files must not exceed 999999999."
 
 workspace_file_count=0
+workspace_root_file_count=0
+common_git_file_count=0
 
 state_root_input="$host_home_dir/.agent-container"
 if [ -n "${AGENT_CONTAINER_STATE_DIR:-}" ] \
@@ -2031,21 +2232,6 @@ if [ "$singleton_requested" = true ]; then
       printf 'block-host=%s\n' "$block_host_value"
     } | sha256_stream
   )
-fi
-
-if [ "$singleton_requested" != true ]; then
-  workspace_file_count=$(bounded_file_count "$mount_root" "$max_workspace_files")
-  if [ "$workspace_file_count" -le "$max_workspace_files" ] \
-    && [ -n "$common_git_dir" ] \
-    && ! path_contains "$mount_root" "$common_git_dir"; then
-    remaining_file_budget=$((max_workspace_files - workspace_file_count))
-    common_git_file_count=$(bounded_file_count "$common_git_dir" "$remaining_file_budget")
-    workspace_file_count=$((workspace_file_count + common_git_file_count))
-  fi
-  if [ "$workspace_file_count" -gt "$max_workspace_files" ] \
-    && ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
-    die "Workspace mounts have more than $max_workspace_files files. Apple VirtioFS issue #1097 can exhaust host file descriptors and has caused kernel panics. Reduce the mounted tree, or pass --container-accept-virtiofs-risk after reviewing $VIRTIOFS_ISSUE_URL"
-  fi
 fi
 
 for shared_tree in "$mount_root" "$common_git_dir"; do
@@ -2132,8 +2318,6 @@ reject_control_characters "GitHub configuration path" "$gh_config_dir"
 reject_control_characters "Git XDG configuration path" "$git_xdg_config_dir"
 
 for volume_source in \
-  "$mount_root" \
-  "$common_git_dir" \
   "$profile_home" \
   "$host_stage_dir" \
   "$gh_config_dir" \
@@ -2142,6 +2326,10 @@ for volume_source in \
 done
 if [ "$singleton_requested" = true ]; then
   validate_volume_source_path "$singleton_guest_stage"
+else
+  for volume_source in "$mount_root" "$common_git_dir"; do
+    [ -n "$volume_source" ] && validate_volume_source_path "$volume_source"
+  done
 fi
 if [ "${#extra_share_paths[@]}" -gt 0 ]; then
   for volume_source in "${extra_share_paths[@]}"; do
@@ -2150,37 +2338,397 @@ if [ "${#extra_share_paths[@]}" -gt 0 ]; then
 fi
 
 # Account for every user-controlled directory that becomes a VirtioFS share.
-# The profile HOME is isolated from the real host HOME, but it can still grow
-# large enough to trigger the upstream VirtioFS descriptor-retention issue.
-mounted_entry_count=$((workspace_file_count + 8))
-add_tree_to_mount_budget() {
-  local source="$1"
-  local remaining tree_count
-  [ -d "$source" ] || return 0
-  [ "$mounted_entry_count" -le "$max_workspace_files" ] || return 0
-  mounted_entry_count=$((mounted_entry_count + 1))
-  [ "$mounted_entry_count" -le "$max_workspace_files" ] || return 0
-  remaining=$((max_workspace_files - mounted_entry_count))
-  tree_count=$(bounded_file_count "$source" "$remaining")
-  mounted_entry_count=$((mounted_entry_count + tree_count))
+# Count each tree independently up to the public budget so a failure can name
+# the tree that caused it. The profile HOME is isolated from the real host HOME,
+# but repositories and package stores accidentally created there are still both
+# expensive and affected by Apple's descriptor-retention behavior.
+frozen_virtiofs_paths=()
+frozen_virtiofs_types=()
+frozen_virtiofs_identities=()
+frozen_virtiofs_labels=()
+record_virtiofs_tree() {
+  local kind="$1"
+  local label="$2"
+  local source="$3"
+  local projected_count="$4"
+  local count_is_exact="$5"
+
+  virtiofs_tree_kinds+=("$kind")
+  virtiofs_tree_labels+=("$label")
+  virtiofs_tree_paths+=("$source")
+  virtiofs_tree_counts+=("$projected_count")
+  virtiofs_tree_exact+=("$count_is_exact")
 }
 
-add_tree_to_mount_budget "$profile_home"
-if [ -n "$gh_config_dir" ]; then
-  add_tree_to_mount_budget "$gh_config_dir"
-fi
-if [ -n "$git_xdg_config_dir" ]; then
-  add_tree_to_mount_budget "$git_xdg_config_dir"
-fi
-if [ "${#extra_share_paths[@]}" -gt 0 ]; then
-  for extra_share_path in "${extra_share_paths[@]}"; do
-    add_tree_to_mount_budget "$extra_share_path"
+virtiofs_source_identity() {
+  local source="$1"
+  local identity
+
+  identity=$(/usr/bin/stat -f '%d:%i' -- "$source" 2>/dev/null || true)
+  case "$identity" in
+    [0-9]*:[0-9]*)
+      case "$identity" in *[!0-9:]*) identity="" ;; esac
+      ;;
+    *) identity="" ;;
+  esac
+  [ -n "$identity" ] \
+    || die "Unable to freeze filesystem identity for VirtioFS source: $source"
+  printf '%s\n' "$identity"
+}
+
+freeze_virtiofs_source_identity() {
+  local source_type="$1"
+  local label="$2"
+  local source="$3"
+  local current_identity frozen_index
+
+  case "$source_type" in
+    directory)
+      [ -d "$source" ] && [ ! -L "$source" ] \
+        || die "Cannot freeze an unsafe directory for the $label: $source"
+      ;;
+    file)
+      [ -f "$source" ] && [ ! -L "$source" ] \
+        || die "Cannot freeze an unsafe file for the $label: $source"
+      ;;
+    *) die "Internal error: unsupported VirtioFS source type '$source_type'." ;;
+  esac
+  current_identity=$(virtiofs_source_identity "$source")
+  frozen_index=0
+  while [ "$frozen_index" -lt "${#frozen_virtiofs_paths[@]}" ]; do
+    if [ "${frozen_virtiofs_paths[$frozen_index]}" = "$source" ]; then
+      [ "${frozen_virtiofs_types[$frozen_index]}" = "$source_type" ] \
+        && [ "${frozen_virtiofs_identities[$frozen_index]}" = "$current_identity" ] \
+        || die "VirtioFS source for the $label changed filesystem identity during launch: $source. Restore the original source and retry. $(virtiofs_creation_outcome)"
+      return 0
+    fi
+    frozen_index=$((frozen_index + 1))
   done
-fi
-if [ "$mounted_entry_count" -gt "$max_workspace_files" ] \
-  && ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
-  die "Projected VirtioFS shares have more than $max_workspace_files filesystem entries. Reduce mounted trees, or explicitly accept the upstream risk after reviewing $VIRTIOFS_ISSUE_URL"
-fi
+  frozen_virtiofs_paths+=("$source")
+  frozen_virtiofs_types+=("$source_type")
+  frozen_virtiofs_identities+=("$current_identity")
+  frozen_virtiofs_labels+=("$label")
+}
+
+verify_frozen_virtiofs_source_identity() {
+  local source_type="$1"
+  local label="$2"
+  local source="$3"
+  local current_identity frozen_index
+
+  case "$source_type" in
+    directory)
+      [ -d "$source" ] && [ ! -L "$source" ] \
+        || die "VirtioFS source for the $label is no longer a real directory: $source. Restore the original source and retry. $(virtiofs_creation_outcome)"
+      ;;
+    file)
+      [ -f "$source" ] && [ ! -L "$source" ] \
+        || die "VirtioFS source for the $label is no longer a real file: $source. Restore the original source and retry. $(virtiofs_creation_outcome)"
+      ;;
+    *) die "Internal error: unsupported VirtioFS source type '$source_type'." ;;
+  esac
+  current_identity=$(virtiofs_source_identity "$source")
+  frozen_index=0
+  while [ "$frozen_index" -lt "${#frozen_virtiofs_paths[@]}" ]; do
+    if [ "${frozen_virtiofs_paths[$frozen_index]}" = "$source" ]; then
+      [ "${frozen_virtiofs_types[$frozen_index]}" = "$source_type" ] \
+        && [ "${frozen_virtiofs_identities[$frozen_index]}" = "$current_identity" ] \
+        || die "VirtioFS source for the $label changed filesystem identity during launch: $source. Restore the original source and retry. $(virtiofs_creation_outcome)"
+      return 0
+    fi
+    frozen_index=$((frozen_index + 1))
+  done
+  die "VirtioFS source for the $label was not frozen before final validation: $source"
+}
+
+verify_all_frozen_virtiofs_source_identities() {
+  local frozen_index=0
+
+  [ "${#frozen_virtiofs_paths[@]}" -eq "${#frozen_virtiofs_types[@]}" ] \
+    && [ "${#frozen_virtiofs_paths[@]}" -eq "${#frozen_virtiofs_identities[@]}" ] \
+    && [ "${#frozen_virtiofs_paths[@]}" -eq "${#frozen_virtiofs_labels[@]}" ] \
+    || die "Internal error: incomplete frozen VirtioFS source metadata."
+  while [ "$frozen_index" -lt "${#frozen_virtiofs_paths[@]}" ]; do
+    verify_frozen_virtiofs_source_identity \
+      "${frozen_virtiofs_types[$frozen_index]}" \
+      "${frozen_virtiofs_labels[$frozen_index]}" \
+      "${frozen_virtiofs_paths[$frozen_index]}"
+    frozen_index=$((frozen_index + 1))
+  done
+}
+
+virtiofs_creation_outcome() {
+  if [ "${singleton_recreation_native_deleted:-false}" = true ]; then
+    printf "The verified stopped '%s' singleton was already deleted; no replacement container was created.\n" \
+      "$profile_id"
+  else
+    printf '%s\n' 'No container was created.'
+  fi
+}
+
+add_tree_to_mount_budget() {
+  local kind="$1"
+  local label="$2"
+  local source="$3"
+  local presence_policy="$4"
+  local charge_root="$5"
+  local planned_entry_floor="$6"
+  local refresh_phase="$7"
+  local resolved_source
+  local tree_count projected_count count_is_exact
+
+  if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+    if [ "$presence_policy" = planned-empty ]; then
+      tree_count=0
+      projected_count=$planned_entry_floor
+      if [ "$charge_root" = true ]; then
+        projected_count=$((projected_count + 1))
+      fi
+      record_virtiofs_tree \
+        "$kind" "$label" "$source" "$projected_count" true
+      mounted_entry_count=$((mounted_entry_count + projected_count))
+      last_virtiofs_tree_count=0
+      return 0
+    fi
+    die "VirtioFS source for the $label disappeared during launch: $source. Restore the original canonical directory and retry. $(virtiofs_creation_outcome)"
+  fi
+  [ -d "$source" ] && [ ! -L "$source" ] \
+    || die "VirtioFS source for the $label is no longer a real directory: $source. Restore the original canonical directory and retry. $(virtiofs_creation_outcome)"
+  resolved_source=$(resolve_absolute_dir "$source" || true)
+  [ "$resolved_source" = "$source" ] \
+    || die "VirtioFS source for the $label changed canonical identity during launch: $source. Restore the original directory and retry. $(virtiofs_creation_outcome)"
+  if [ "$refresh_phase" = pre-service ]; then
+    freeze_virtiofs_source_identity directory "$label" "$source"
+  else
+    verify_frozen_virtiofs_source_identity directory "$label" "$source"
+  fi
+  tree_count=$(bounded_file_count "$source" "$max_workspace_files")
+  projected_count=$tree_count
+  if [ "$presence_policy" = planned-empty ] \
+    && [ "$projected_count" -lt "$planned_entry_floor" ]; then
+    projected_count=$planned_entry_floor
+  fi
+  if [ "$charge_root" = true ]; then
+    projected_count=$((projected_count + 1))
+  fi
+  count_is_exact=true
+  [ "$tree_count" -le "$max_workspace_files" ] \
+    || count_is_exact=false
+  record_virtiofs_tree \
+    "$kind" "$label" "$source" "$projected_count" "$count_is_exact"
+  mounted_entry_count=$((mounted_entry_count + projected_count))
+  last_virtiofs_tree_count=$tree_count
+}
+
+add_file_to_mount_budget() {
+  local kind="$1"
+  local label="$2"
+  local source="$3"
+  local presence_policy="$4"
+  local refresh_phase="$5"
+  local source_parent resolved_parent
+
+  if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+    [ "$presence_policy" = planned ] \
+      || die "VirtioFS source for the $label disappeared during launch: $source. Restore the original file and retry. $(virtiofs_creation_outcome)"
+  else
+    [ -f "$source" ] && [ ! -L "$source" ] \
+      || die "VirtioFS source for the $label is no longer a real file: $source. Restore the original file and retry. $(virtiofs_creation_outcome)"
+    source_parent=$(dirname -- "$source")
+    resolved_parent=$(resolve_absolute_dir "$source_parent" || true)
+    [ "$resolved_parent/$(basename -- "$source")" = "$source" ] \
+      || die "VirtioFS source for the $label changed canonical identity during launch: $source. Restore the original file and retry. $(virtiofs_creation_outcome)"
+    if [ "$refresh_phase" = pre-service ]; then
+      freeze_virtiofs_source_identity file "$label" "$source"
+    else
+      verify_frozen_virtiofs_source_identity file "$label" "$source"
+    fi
+  fi
+  record_virtiofs_tree "$kind" "$label" "$source" 1 true
+  mounted_entry_count=$((mounted_entry_count + 1))
+}
+
+refresh_virtiofs_mount_budget() {
+  local refresh_phase="${1:-pre-service}"
+  local managed_presence stage_presence file_presence
+  local static_ssh_source static_hosts_source
+  local planned_stage_entries planned_ssh_entries
+
+  case "$refresh_phase" in
+    pre-service)
+      managed_presence=planned-empty
+      stage_presence=planned-empty
+      file_presence=planned
+      ;;
+    final)
+      managed_presence=required
+      stage_presence=required
+      file_presence=required
+      ;;
+    *) die "Internal error: unsupported VirtioFS refresh phase '$refresh_phase'." ;;
+  esac
+
+  workspace_file_count=0
+  workspace_root_file_count=0
+  common_git_file_count=0
+  mounted_entry_count=8
+  virtiofs_tree_labels=()
+  virtiofs_tree_paths=()
+  virtiofs_tree_counts=()
+  virtiofs_tree_kinds=()
+  virtiofs_tree_exact=()
+
+  # Project the deterministic files that cold creation will place in the
+  # Apple-mounted staging tree. Legacy staging owns identity/catalog/broker
+  # files; singleton staging owns only its static Git identity by default.
+  # SSH metadata is bounded to four allowlisted files plus its directory.
+  if [ "$singleton_requested" = true ]; then
+    planned_stage_entries=1
+  else
+    planned_stage_entries=9
+  fi
+  planned_ssh_entries=0
+  if [ "$mount_ssh_config" = true ]; then
+    planned_stage_entries=$((planned_stage_entries + 5))
+    planned_ssh_entries=4
+  fi
+  if [ "$host_alias_count" -gt 0 ] \
+    || [ "$blocked_host_count" -gt 0 ]; then
+    planned_stage_entries=$((planned_stage_entries + 1))
+  fi
+
+  if [ "$singleton_requested" != true ]; then
+    add_tree_to_mount_budget \
+      legacy-workspace "legacy workspace" \
+      "$mount_root" required false 0 "$refresh_phase"
+    workspace_root_file_count=$last_virtiofs_tree_count
+    workspace_file_count=$workspace_root_file_count
+    if [ -n "$common_git_dir" ] \
+      && ! path_contains "$mount_root" "$common_git_dir"; then
+      add_tree_to_mount_budget \
+        legacy-workspace "external Git common directory" \
+        "$common_git_dir" required false 0 "$refresh_phase"
+      common_git_file_count=$last_virtiofs_tree_count
+      workspace_file_count=$((workspace_file_count + common_git_file_count))
+    fi
+  fi
+
+  add_tree_to_mount_budget \
+    shadow-home "persistent '$profile_id' shadow HOME" \
+    "$profile_home" "$managed_presence" true 0 "$refresh_phase"
+  if [ "$singleton_requested" = true ]; then
+    add_tree_to_mount_budget \
+      static-stage "persistent '$profile_id' singleton staging" \
+      "$singleton_guest_stage" "$stage_presence" false \
+      "$planned_stage_entries" "$refresh_phase"
+  else
+    add_tree_to_mount_budget \
+      static-stage "ephemeral legacy session staging" \
+      "$host_stage_dir" "$stage_presence" false \
+      "$planned_stage_entries" "$refresh_phase"
+  fi
+  if [ -n "$gh_config_dir" ]; then
+    add_tree_to_mount_budget \
+      gh-config "GitHub CLI configuration" \
+      "$gh_config_dir" required true 0 "$refresh_phase"
+  fi
+  if [ -n "$git_xdg_config_dir" ]; then
+    add_tree_to_mount_budget \
+      git-config "Git XDG configuration" \
+      "$git_xdg_config_dir" required true 0 "$refresh_phase"
+  fi
+  if [ "${#extra_share_paths[@]}" -gt 0 ]; then
+    for extra_share_path in "${extra_share_paths[@]}"; do
+      add_tree_to_mount_budget \
+        legacy-share "additional legacy share" \
+        "$extra_share_path" required true 0 "$refresh_phase"
+    done
+  fi
+  if [ "$mount_ssh_config" = true ]; then
+    if [ "$singleton_requested" = true ]; then
+      static_ssh_source="$singleton_guest_stage/ssh"
+    else
+      static_ssh_source="$host_stage_dir/ssh"
+    fi
+    add_tree_to_mount_budget \
+      static-stage "separately mounted SSH metadata staging" \
+      "$static_ssh_source" "$stage_presence" true \
+      "$planned_ssh_entries" "$refresh_phase"
+  fi
+  if [ "$host_alias_count" -gt 0 ] \
+    || [ "$blocked_host_count" -gt 0 ]; then
+    if [ "$singleton_requested" = true ]; then
+      static_hosts_source="$singleton_guest_stage/container-hosts"
+    else
+      static_hosts_source="$host_stage_dir/container-hosts"
+    fi
+    add_file_to_mount_budget \
+      static-stage "separately mounted container hosts file" \
+      "$static_hosts_source" "$file_presence" "$refresh_phase"
+  fi
+  if [ "$mounted_entry_count" -gt "$max_workspace_files" ] \
+    && ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
+    offender_tree_index=""
+    offender_tree_count=-1
+    offender_tree_is_exact=true
+    tree_index=0
+    while [ "$tree_index" -lt "${#virtiofs_tree_counts[@]}" ]; do
+      tree_count=${virtiofs_tree_counts[$tree_index]}
+      if [ "${virtiofs_tree_exact[$tree_index]}" = false ]; then
+        offender_tree_index=$tree_index
+        offender_tree_count=$tree_count
+        offender_tree_is_exact=false
+        break
+      fi
+      if [ "$tree_count" -gt "$offender_tree_count" ]; then
+        offender_tree_index=$tree_index
+        offender_tree_count=$tree_count
+      fi
+      tree_index=$((tree_index + 1))
+    done
+    if [ "$offender_tree_is_exact" = true ] \
+      && [ "$offender_tree_count" -le 0 ]; then
+      offender_tree_index=""
+    fi
+    if [ -n "$offender_tree_index" ]; then
+      offender_tree_kind=${virtiofs_tree_kinds[$offender_tree_index]}
+      offender_tree_label=${virtiofs_tree_labels[$offender_tree_index]}
+      offender_tree_path=${virtiofs_tree_paths[$offender_tree_index]}
+      if [ "$offender_tree_is_exact" = true ]; then
+        offender_tree_description="The largest counted tree is the $offender_tree_label at '$offender_tree_path' ($offender_tree_count entries)."
+      else
+        offender_tree_description="A budget-exceeding tree is the $offender_tree_label at '$offender_tree_path' (more than $max_workspace_files entries; the bounded scan did not compute its exact size)."
+      fi
+      case "$offender_tree_kind" in
+        shadow-home)
+          offender_tree_advice="Move existing repositories, dependency trees, and package-manager caches out of this shadow HOME. --container-workspace-root prevents sibling-access workarounds from recreating them, but does not shrink data already stored here."
+          ;;
+        legacy-share)
+          offender_tree_advice="Reduce or remove the corresponding --share-ro/--share-rw tree. --container-workspace-root is unavailable in legacy run mode."
+          ;;
+        legacy-workspace)
+          offender_tree_advice="Reduce the legacy workspace tree, or use the default singleton SFTP transport when the repository layout permits."
+          ;;
+        gh-config)
+          offender_tree_advice="Reduce this directory or launch without --container-mount-gh."
+          ;;
+        git-config)
+          offender_tree_advice="Reduce this directory or launch without --container-full-git-config."
+          ;;
+        static-stage)
+          offender_tree_advice="Remove unexpected files from managed staging by stopping the profile and retrying. Per-session staging is cleaned automatically on exit."
+          ;;
+        *)
+          offender_tree_advice="Reduce the mounted tree."
+          ;;
+      esac
+      die "Projected VirtioFS shares exceed the $max_workspace_files-entry budget. $offender_tree_description $offender_tree_advice Do not accept the upstream risk before reviewing $VIRTIOFS_ISSUE_URL"
+    fi
+    die "Projected VirtioFS shares exceed the $max_workspace_files-entry budget before user trees are counted. Reduce mounted trees; do not accept the upstream risk before reviewing $VIRTIOFS_ISSUE_URL"
+  fi
+}
+
+refresh_virtiofs_mount_budget pre-service
 
 fd_stop_percent="${AGENT_CONTAINER_FD_STOP_PERCENT:-80}"
 if ! is_true "${AGENT_CONTAINER_DISABLE_FD_WATCHDOG:-false}"; then
@@ -2191,54 +2739,122 @@ if ! is_true "${AGENT_CONTAINER_DISABLE_FD_WATCHDOG:-false}"; then
     || die "--container-fd-stop-percent must be an integer from 50 through 95."
 fi
 
-host_num_files=$(sysctl -n kern.num_files 2>/dev/null || true)
-host_max_files=$(sysctl -n kern.maxfiles 2>/dev/null || true)
-host_max_files_per_proc=$(sysctl -n kern.maxfilesperproc 2>/dev/null || true)
-host_max_vnodes=$(sysctl -n kern.maxvnodes 2>/dev/null || true)
-host_free_vnodes=$(sysctl -n kern.free_vnodes 2>/dev/null || true)
-case "$host_num_files:$host_max_files:$host_max_files_per_proc:$host_max_vnodes:$host_free_vnodes" in
-  *[!0-9:]*)
-    host_num_files=""
-    host_max_files=""
-    host_max_files_per_proc=""
-    host_max_vnodes=""
-    host_free_vnodes=""
-    ;;
-esac
-if [ -z "$host_num_files" ] \
-  || [ -z "$host_max_files" ] \
-  || [ -z "$host_max_files_per_proc" ] \
-  || [ -z "$host_max_vnodes" ] \
-  || [ -z "$host_free_vnodes" ] \
-  || [ "$host_max_files" -le 0 ] \
-  || [ "$host_max_files_per_proc" -le 0 ] \
-  || [ "$host_max_vnodes" -le 0 ] \
-  || [ "$host_free_vnodes" -gt "$host_max_vnodes" ]; then
-  if is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
-    warn "Unable to read all macOS file/vnode limits; continuing only because --container-accept-virtiofs-risk is enabled."
-    # If counters recover after launch, a zero baseline makes the live
-    # watchdog conservative instead of performing arithmetic on an empty value.
+# Serialize native discovery, the host-headroom snapshot, and lifecycle
+# registration. The actual capacity check runs after native discovery so a
+# warm singleton client is not charged for an already-running HOME mount.
+acquire_lifecycle_lock "$singleton_requested"
+
+check_host_virtiofs_capacity() {
+  local increment="$1"
+  local host_counter safe_process_file_limit used_vnodes
+  local host_file_projection_unsafe vnode_projection_unsafe
+
+  if [ "$increment" -eq 0 ]; then
+    # Warm singleton clients add no Apple volume and do not own the legacy
+    # attached-run watchdog, so host capacity counters are irrelevant here.
     host_num_files=0
-  else
+    return 0
+  fi
+
+  host_num_files=$(sysctl -n kern.num_files 2>/dev/null || true)
+  host_max_files=$(sysctl -n kern.maxfiles 2>/dev/null || true)
+  host_max_files_per_proc=$(sysctl -n kern.maxfilesperproc 2>/dev/null || true)
+  host_max_vnodes=$(sysctl -n kern.maxvnodes 2>/dev/null || true)
+  host_free_vnodes=$(sysctl -n kern.free_vnodes 2>/dev/null || true)
+  case "$host_num_files:$host_max_files:$host_max_files_per_proc:$host_max_vnodes:$host_free_vnodes" in
+    *[!0-9:]*)
+      host_num_files=""
+      host_max_files=""
+      host_max_files_per_proc=""
+      host_max_vnodes=""
+      host_free_vnodes=""
+      ;;
+  esac
+  for host_counter in \
+    "$host_num_files" \
+    "$host_max_files" \
+    "$host_max_files_per_proc" \
+    "$host_max_vnodes" \
+    "$host_free_vnodes"; do
+    if [ "${#host_counter}" -gt 10 ] \
+      || { [ -n "$host_counter" ] \
+        && [ "$host_counter" -gt 2147483647 ] 2>/dev/null; }; then
+      host_num_files=""
+      host_max_files=""
+      host_max_files_per_proc=""
+      host_max_vnodes=""
+      host_free_vnodes=""
+      break
+    fi
+  done
+  if [ -z "$host_num_files" ] \
+    || [ -z "$host_max_files" ] \
+    || [ -z "$host_max_files_per_proc" ] \
+    || [ -z "$host_max_vnodes" ] \
+    || [ -z "$host_free_vnodes" ] \
+    || [ "$host_max_files" -le 0 ] \
+    || [ "$host_max_files_per_proc" -le 0 ] \
+    || [ "$host_max_vnodes" -le 0 ] \
+    || [ "$host_free_vnodes" -gt "$host_max_vnodes" ]; then
+    if is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
+      warn "Unable to read all macOS file/vnode limits; continuing only because --container-accept-virtiofs-risk is enabled."
+      # If counters recover after launch, a zero baseline makes the live
+      # watchdog conservative instead of using an empty value.
+      host_num_files=0
+      return 0
+    fi
     die "Unable to read macOS file/vnode limits for the VirtioFS safety preflight. Explicitly accept the upstream risk only after reviewing $VIRTIOFS_ISSUE_URL"
   fi
-else
-  projected_files=$((host_num_files + mounted_entry_count))
-  safe_file_limit=$((host_max_files * 70 / 100))
+
+  # Preserve the original 70% soft policy. At or above that projection, allow
+  # recovery only when growth remains below 90% and consumes strictly less
+  # than 10% of the headroom present in this serialized snapshot.
+  resource_projection_is_unsafe() {
+    local current="$1"
+    local maximum="$2"
+    local projected_increment="$3"
+    local soft_limit hard_limit remaining projected
+
+    [ "$projected_increment" -gt 0 ] || return 1
+    projected=$((current + projected_increment))
+    soft_limit=$((maximum * 70 / 100))
+    [ "$projected" -ge "$soft_limit" ] || return 1
+    hard_limit=$((maximum * 90 / 100))
+    remaining=$((maximum - current))
+    [ "$remaining" -gt 0 ] || return 0
+    [ "$projected" -ge "$hard_limit" ] \
+      || [ "$((projected_increment * 10))" -ge "$remaining" ]
+  }
+
   safe_process_file_limit=$((host_max_files_per_proc * 70 / 100))
   used_vnodes=$((host_max_vnodes - host_free_vnodes))
-  projected_vnodes=$((used_vnodes + mounted_entry_count))
-  safe_vnode_limit=$((host_max_vnodes * 70 / 100))
-  if [ "$projected_files" -ge "$safe_file_limit" ] \
-    || [ "$mounted_entry_count" -ge "$safe_process_file_limit" ] \
-    || [ "$projected_vnodes" -ge "$safe_vnode_limit" ]; then
+  host_file_projection_unsafe=false
+  vnode_projection_unsafe=false
+  resource_projection_is_unsafe \
+    "$host_num_files" "$host_max_files" "$increment" \
+    && host_file_projection_unsafe=true
+  resource_projection_is_unsafe \
+    "$used_vnodes" "$host_max_vnodes" "$increment" \
+    && vnode_projection_unsafe=true
+  if [ "$host_file_projection_unsafe" = true ] \
+    || [ "$increment" -ge "$safe_process_file_limit" ] \
+    || [ "$vnode_projection_unsafe" = true ]; then
     if ! is_true "${AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK:-false}"; then
-      die "Projected VirtioFS use crosses a 70% host file, per-process file, or vnode safety limit. Reduce the shared trees or explicitly accept the upstream risk. See $VIRTIOFS_ISSUE_URL"
+      die "Projected VirtioFS growth of $increment entries is unsafe for the current host headroom (files $host_num_files/$host_max_files; vnodes $used_vnodes/$host_max_vnodes). Projections below 70% are admitted; recovery above that line must remain below 90% and consume less than 10% of remaining headroom. The per-process file projection also stays below 70%. Reduce the shared trees; do not accept the upstream risk before reviewing $VIRTIOFS_ISSUE_URL"
     fi
   fi
-fi
+}
 
-acquire_lifecycle_lock "$singleton_requested"
+if "$container_bin" system status >/dev/null 2>&1; then
+  main_container_services_state=running
+else
+  main_container_services_state=stopped
+  # A stopped service cannot hide a warm running singleton. Check the full
+  # cold-start projection before mutating Apple service state, then sample
+  # again under the same lifecycle lock immediately before registration.
+  check_host_virtiofs_capacity "$mounted_entry_count"
+fi
+ensure_container_services "$main_container_services_state"
 
 umask 077
 mkdir -p "$state_root"
@@ -2250,9 +2866,17 @@ mkdir -p \
   "$profile_host_exec_home" \
   "$profile_meta" \
   "$sessions_root"
+freeze_virtiofs_source_identity \
+  directory "persistent '$profile_id' shadow HOME" "$profile_home"
 
 global_lock_acquired=false
 profile_lock_acquired=false
+singleton_state_published=false
+singleton_create_attempted=false
+singleton_recreation_native_deleted=false
+singleton_recreation_root_identity=""
+singleton_recreation_preserve_ssh_identity=false
+singleton_recreation_preserve_hosts_identity=false
 host_broker_pid=""
 workspace_broker_pid=""
 workspace_broker_watchdog_pid=""
@@ -2320,6 +2944,7 @@ close_workspace_broker_liveness() {
 }
 cleanup_session() {
   local cleanup_status=$?
+  local preserved_cleanup_status state_record_cleanup_status
 
   trap '' INT TERM HUP
   trap - EXIT
@@ -2335,6 +2960,48 @@ cleanup_session() {
   fi
   workspace_broker_pid=""
   stop_host_broker
+  if [ "$singleton_create_attempted" = false ]; then
+    if [ "$singleton_recreation_native_deleted" = true ]; then
+      # Verify all preserved mount objects before removing their contents. If
+      # one was replaced after native deletion, retain it fail-closed rather
+      # than deleting through an untrusted same-path replacement. Run this in
+      # a subshell because its fail-closed validators intentionally call die;
+      # EXIT cleanup must still remove safe state, session data, and locks.
+      (
+        set -e
+        clear_singleton_state_files \
+          "$singleton_root" true \
+          "$singleton_recreation_preserve_ssh_identity" \
+          "$singleton_recreation_preserve_hosts_identity"
+      )
+      preserved_cleanup_status=$?
+      if [ "$preserved_cleanup_status" -ne 0 ]; then
+        warn "Singleton staging or state root changed after the verified native container was deleted; retained untrusted managed paths under '$singleton_root'."
+        # These fixed-name records are not VirtioFS sources. Clear them
+        # independently so an absent native container cannot be paired with a
+        # stale ready/creating phase on the next launch. A replaced singleton
+        # root itself still fails closed without aborting the remaining EXIT
+        # cleanup.
+        (
+          set -e
+          verify_singleton_recreation_root_identity
+          clear_singleton_state_records "$singleton_root"
+        )
+        state_record_cleanup_status=$?
+        if [ "$state_record_cleanup_status" -ne 0 ]; then
+          warn "Could not safely clear inactive singleton state records under '$singleton_root'; inspect that path before the next launch."
+        fi
+      fi
+      # Keep verified empty mount objects in place. Removing them in a second
+      # path-based pass would reopen a needless identity race, and the next
+      # launch can safely reuse them.
+      singleton_recreation_native_deleted=false
+      singleton_state_published=false
+    elif [ "$singleton_state_published" = true ]; then
+      clear_singleton_state_files "$singleton_root"
+      singleton_state_published=false
+    fi
+  fi
   if [ -n "$gitconfig_tmp" ]; then
     rm -f "$gitconfig_tmp" || true
   fi
@@ -2851,6 +3518,8 @@ singleton_existing=false
 singleton_existing_state=""
 singleton_existing_creator_pid=""
 singleton_existing_config_hash=""
+orphan_native_ids=()
+orphan_native_pids=()
 while IFS=$'\t' read -r \
   native_id native_owned native_profile native_uid native_pid \
   native_mode native_roots_hash native_config_hash native_state; do
@@ -2899,12 +3568,35 @@ while IFS=$'\t' read -r \
     continue
   fi
 
-  warn "Removing orphaned Agent VM '$native_id' left by launcher PID $native_pid."
-  "$container_bin" delete --force "$native_id" >/dev/null 2>&1 \
-    || die "Unable to remove orphaned managed Agent VM '$native_id'."
+  orphan_native_ids+=("$native_id")
+  orphan_native_pids+=("$native_pid")
 done <<EOF
 $native_records
 EOF
+
+orphan_native_index=0
+while [ "$orphan_native_index" -lt "${#orphan_native_ids[@]}" ]; do
+  native_id=${orphan_native_ids[$orphan_native_index]}
+  native_pid=${orphan_native_pids[$orphan_native_index]}
+  warn "Removing orphaned Agent VM '$native_id' left by launcher PID $native_pid."
+  "$container_bin" delete --force "$native_id" >/dev/null 2>&1 \
+    || die "Unable to remove orphaned managed Agent VM '$native_id'."
+  orphan_native_index=$((orphan_native_index + 1))
+done
+
+# Reclaim proven dead VMs before sampling: they may be the resource pressure
+# this recovery path is meant to remove. The lifecycle lock still prevents a
+# competing launcher from registering new growth between this snapshot and
+# this launcher's own durable registration.
+virtiofs_capacity_increment=$mounted_entry_count
+if [ "$singleton_requested" = true ] \
+  && [ "$singleton_existing" = true ] \
+  && [ "$singleton_existing_state" = running ]; then
+  # The persistent VM already owns its static VirtioFS mounts. A new client
+  # adds SFTP/SSHFS and host-tool channels, not another shadow-HOME mount.
+  virtiofs_capacity_increment=0
+fi
+check_host_virtiofs_capacity "$virtiofs_capacity_increment"
 
 # Remove only complete, dead registrations. Malformed records fail closed
 # because their directories may hold opted-in Git or SSH material.
@@ -3007,6 +3699,8 @@ if [ "$singleton_requested" != true ]; then
 fi
 
 mkdir "$host_stage_dir"
+freeze_virtiofs_source_identity \
+  directory "ephemeral launch session staging" "$host_stage_dir"
 printf '%s\n' "$$" > "$host_stage_dir/pid"
 printf '%s\n' "$profile_id" > "$host_stage_dir/profile"
 if [ "$singleton_requested" = true ]; then
@@ -3600,6 +4294,14 @@ prepare_singleton_guest_stage() {
       "$singleton_ssh_stage/allowed_signers"
     rmdir "$singleton_ssh_stage" 2>/dev/null || true
   fi
+  freeze_virtiofs_source_identity \
+    directory "persistent '$profile_id' singleton staging" \
+    "$singleton_guest_stage"
+  if [ "$mount_ssh_config" = true ]; then
+    freeze_virtiofs_source_identity \
+      directory "separately mounted SSH metadata staging" \
+      "$singleton_ssh_stage"
+  fi
 }
 
 if [ "$mount_ssh_config" = true ]; then
@@ -3612,6 +4314,9 @@ if [ "$mount_ssh_config" = true ]; then
       chmod 0600 "$host_stage_dir/ssh/$ssh_metadata"
     fi
   done
+  freeze_virtiofs_source_identity \
+    directory "separately mounted SSH metadata staging" \
+    "$host_stage_dir/ssh"
 fi
 
 requested_agent_version="${AGENT_CONTAINER_VERSION:-$profile_version}"
@@ -3819,6 +4524,7 @@ asset_fingerprint=$(
   {
     sha256_file "$asset_dir/Containerfile"
     sha256_file "$asset_dir/Containerfile.dockerignore"
+    sha256_file "$asset_dir/image-setup.sh"
     sha256_file "$asset_dir/entrypoint.sh"
     sha256_file "$asset_dir/host-exec-client"
     sha256_file "$asset_dir/host-exec-broker.mjs"
@@ -3939,7 +4645,9 @@ if [ "$build_required" = true ]; then
   echo "Building $profile_display_name image '$image_name' (version $agent_version)..."
   build_args=(
     build
-    --progress plain
+    # Let Apple render compact, in-place progress in a terminal while retaining
+    # plain logs for redirected/non-interactive builds and failure reports.
+    --progress auto
     --tag "$image_name"
     --file Containerfile
     --platform linux/arm64
@@ -3961,6 +4669,10 @@ if [ "$build_required" = true ]; then
     --build-arg "AGENT_PROBE_ARG=$profile_probe_arg"
     --build-arg "AGENT_CA_FINGERPRINT=$extra_ca_fingerprint"
   )
+
+  if [ -n "$debian_mirror_value" ]; then
+    build_args+=(--build-arg "DEBIAN_MIRROR=$debian_mirror_value")
+  fi
 
   if [ -n "$extra_ca_bundle" ]; then
     build_args+=(--secret "id=agent_ca_bundle,src=$extra_ca_bundle")
@@ -4005,7 +4717,7 @@ if [ "$singleton_requested" = true ]; then
   singleton_gitconfig_hash=$(sha256_file "$host_stage_dir/gitconfig")
   singleton_ssh_config_hash=none
   if [ "$mount_ssh_config" = true ]; then
-    singleton_ssh_config_hash=$(sha256_tree "$host_stage_dir/ssh")
+    singleton_ssh_config_hash=$(sha256_ssh_metadata "$host_stage_dir/ssh")
   fi
   singleton_gh_config_hash=none
   if [ -n "$gh_config_dir" ]; then
@@ -4085,11 +4797,37 @@ if [ "$singleton_requested" = true ]; then
             die "The stopped '$profile_id' singleton failed full provenance verification and was retained."
           }
         rm -f "$singleton_inspect_tmp"
+        singleton_recreation_preserve_ssh_identity="$mount_ssh_config"
+        singleton_recreation_preserve_hosts_identity=false
+        if [ "$host_alias_count" -gt 0 ] \
+          || [ "$blocked_host_count" -gt 0 ]; then
+          singleton_recreation_preserve_hosts_identity=true
+        fi
+        # Prove every source that must survive the controlled replacement
+        # before deleting the still-recoverable stopped native container.
+        singleton_recreation_root_identity=$( \
+          virtiofs_source_identity "$singleton_root"
+        )
+        verify_singleton_recreation_sources \
+          "$singleton_recreation_preserve_ssh_identity" \
+          "$singleton_recreation_preserve_hosts_identity"
+        # Re-run the complete count and host-headroom gate while the stopped
+        # container is still recoverable. In particular, retain it if the
+        # shadow HOME grew after the launch-wide pre-service projection.
+        refresh_virtiofs_mount_budget final
+        check_host_virtiofs_capacity "$mounted_entry_count"
+        verify_all_frozen_virtiofs_source_identities
         warn "Removing a verified stopped '$profile_id' singleton before recreation."
         "$container_bin" delete --force "$singleton_container_name" \
           >/dev/null 2>&1 \
           || die "Unable to delete the verified stopped '$profile_id' singleton."
-        clear_singleton_state_files "$singleton_root"
+        singleton_recreation_native_deleted=true
+        # Keep the identities frozen above across the controlled replacement
+        # while removing staged content and old state. Final validation can
+        # then prove each mount source is still the same filesystem object.
+        clear_singleton_state_files \
+          "$singleton_root" true "$mount_ssh_config" \
+          "$singleton_recreation_preserve_hosts_identity"
         singleton_existing=false
         ;;
       stopping)
@@ -4152,11 +4890,6 @@ fi
 
 if [ "$singleton_requested" = true ]; then
   prepare_singleton_guest_stage
-  atomic_write_line "$singleton_config_hash_file" "$singleton_config_hash"
-  atomic_write_line "$singleton_image_digest_file" "$image_digest"
-  atomic_write_line "$singleton_agent_version_file" "$agent_version"
-  atomic_write_line "$singleton_root/creator-pid" "$$"
-  atomic_write_line "$singleton_phase_file" creating
   container_name="$singleton_container_name"
 else
   container_name="agent-$profile_id-$host_uid-$$"
@@ -4181,25 +4914,33 @@ create_args=(
   --volume "$profile_home:$host_home_dir"
 )
 
-if [ "${#host_aliases[@]}" -gt 0 ] \
-  || [ "${#blocked_hosts[@]}" -gt 0 ]; then
+if [ "$host_alias_count" -gt 0 ] \
+  || [ "$blocked_host_count" -gt 0 ]; then
   if [ "$singleton_requested" = true ]; then
     resolve_singleton_host_gateway
     container_hosts_file="$singleton_guest_stage/container-hosts"
+    if [ "$singleton_recreation_native_deleted" = true ]; then
+      verify_frozen_virtiofs_source_identity \
+        file "separately mounted container hosts file" \
+        "$container_hosts_file"
+    fi
   else
     container_hosts_file="$host_stage_dir/container-hosts"
   fi
   {
     printf '%s\n' '127.0.0.1 localhost'
-    for host_alias in "${host_aliases[@]}"; do
+    for host_alias in "${host_aliases[@]+"${host_aliases[@]}"}"; do
       printf '%s %s\n' "$host_gateway" "$host_alias"
     done
-    for blocked_host in "${blocked_hosts[@]}"; do
+    for blocked_host in "${blocked_hosts[@]+"${blocked_hosts[@]}"}"; do
       printf '0.0.0.0 %s\n' "$blocked_host"
       printf ':: %s\n' "$blocked_host"
     done
   } > "$container_hosts_file"
   chmod 0600 "$container_hosts_file"
+  freeze_virtiofs_source_identity \
+    file "separately mounted container hosts file" \
+    "$container_hosts_file"
   create_args+=(--volume "$container_hosts_file:/etc/hosts:ro")
 fi
 
@@ -4490,6 +5231,30 @@ reconcile_failed_singleton_create() {
   return 1
 }
 
+if [ "$singleton_requested" = true ]; then
+  atomic_write_line "$singleton_config_hash_file" "$singleton_config_hash"
+  atomic_write_line "$singleton_image_digest_file" "$image_digest"
+  atomic_write_line "$singleton_agent_version_file" "$agent_version"
+  atomic_write_line "$singleton_root/creator-pid" "$$"
+  atomic_write_line "$singleton_phase_file" creating
+  singleton_state_published=true
+fi
+
+# Image resolution and building can take long enough for both mounted trees
+# and unrelated host resource use to change. Re-count every actual VirtioFS
+# source and take a current headroom snapshot at the final safe point before
+# Apple creates another VM. Warm singleton clients returned above. Singleton
+# state is already published and will be rolled back by EXIT if this gate
+# rejects before the Apple create attempt.
+refresh_virtiofs_mount_budget final
+check_host_virtiofs_capacity "$mounted_entry_count"
+# The count above can span several large trees, and the capacity snapshot adds
+# another gap. Revalidate every canonical path/inode pair together at the last
+# userspace instruction before create so a same-path replacement during either
+# operation cannot inherit the frozen mount authorization.
+verify_all_frozen_virtiofs_source_identities
+
+singleton_create_attempted=true
 if ! "$container_bin" "${create_args[@]}" >/dev/null; then
   if [ "$singleton_requested" = true ]; then
     if reconcile_failed_singleton_create; then

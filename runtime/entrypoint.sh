@@ -113,6 +113,38 @@ mkdir -p -- "$runtime_dir"
 chown "$runtime_uid:$runtime_gid" "$runtime_dir"
 chmod 0700 "$runtime_dir"
 
+# Keep pnpm's rebuildable store/cache/state on the guest's writable container
+# layer. The parent stays root-owned, so the runtime user cannot replace the
+# fixed directory itself with a symlink between singleton starts; pnpm owns and
+# creates only descendants below that directory.
+pnpm_data_parent=/var/lib/agent-container
+pnpm_data_dir="$pnpm_data_parent/pnpm"
+if [ -L "$pnpm_data_parent" ] \
+  || { [ -e "$pnpm_data_parent" ] && [ ! -d "$pnpm_data_parent" ]; }; then
+  echo "Error: refusing an unsafe pnpm data parent: $pnpm_data_parent" >&2
+  exit 65
+fi
+mkdir -p -- "$pnpm_data_parent"
+chown 0:0 "$pnpm_data_parent"
+chmod 0755 "$pnpm_data_parent"
+if [ -L "$pnpm_data_dir" ] \
+  || { [ -e "$pnpm_data_dir" ] && [ ! -d "$pnpm_data_dir" ]; }; then
+  echo "Error: refusing an unsafe pnpm data directory: $pnpm_data_dir" >&2
+  exit 65
+fi
+mkdir -p -- "$pnpm_data_dir"
+chown "$runtime_uid:$runtime_gid" "$pnpm_data_dir"
+chmod 0700 "$pnpm_data_dir"
+[ "$(stat -c '%u:%g:%a' -- "$pnpm_data_parent")" = 0:0:755 ] \
+  && [ "$(stat -c '%u:%g:%a' -- "$pnpm_data_dir")" = "$runtime_uid:$runtime_gid:700" ] \
+  || {
+    echo "Error: failed to prepare guest-local pnpm data storage." >&2
+    exit 65
+  }
+pnpm_store_dir="$pnpm_data_dir/store"
+pnpm_cache_dir="$pnpm_data_dir/cache"
+pnpm_state_dir="$pnpm_data_dir/state"
+
 runtime_path="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 host_command_manifest=/run/agent-host/host-commands.tsv
 if [ -f "$host_command_manifest" ] && [ ! -L "$host_command_manifest" ]; then
@@ -167,5 +199,8 @@ exec setpriv \
     LOGNAME="$runtime_user" \
     SHELL=/bin/bash \
     XDG_RUNTIME_DIR="$runtime_dir" \
+    PNPM_CONFIG_STORE_DIR="$pnpm_store_dir" \
+    PNPM_CONFIG_CACHE_DIR="$pnpm_cache_dir" \
+    PNPM_CONFIG_STATE_DIR="$pnpm_state_dir" \
     PATH="$runtime_path" \
     "$@"

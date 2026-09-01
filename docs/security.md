@@ -45,6 +45,11 @@ Each client separately receives:
 - its own private guest mount namespace and SSHFS mount;
 - its own current working directory and exit status.
 
+By default the client workspace root is its current Git top-level directory,
+or cwd outside Git. `--container-workspace-root PATH` is an explicit
+per-client authorization to replace that root with one containing directory.
+It affects neither another client nor the persistent singleton configuration.
+
 A private mount namespace means project B is not present in project A's normal
 path view merely because both clients use one VM. It is not a strong security
 boundary against a malicious same-profile peer: same-UID processes share a
@@ -63,7 +68,8 @@ lifecycle.
 The Agent can read and write:
 
 - the current Git top-level directory, or cwd outside Git, through that
-  invocation's SSHFS mount;
+  invocation's SSHFS mount; when `--container-workspace-root` is present, this
+  becomes the complete explicitly selected containing directory;
 - its profile's isolated shadow HOME;
 - normal writable paths in the persistent Linux container root.
 
@@ -88,7 +94,9 @@ real one. `--no-container-host-tools` removes the channel entirely.
 The workspace is intentionally read-write. The Agent and code it executes can
 modify or delete tracked and untracked files, replace hooks, and write secrets
 into the repository. Micro-VM isolation does not protect data that crosses its
-boundary deliberately.
+boundary deliberately. An explicit containing root authorizes every sibling
+and untracked file below it, not only the dependency paths that motivated the
+option, and all readable content remains exfiltratable over the guest network.
 
 The shadow HOME uses the same guest path string as the real HOME but has a
 different host source below `~/.agent-container/profiles/<profile>/home`.
@@ -102,7 +110,10 @@ compromised session can affect later sessions of that profile.
 
 One Rust broker is created for one client. Before publishing an endpoint it:
 
-- canonicalizes an existing directory and rejects `/`;
+- requires an explicit input to be an absolute existing directory and
+  canonicalizes it;
+- requires the selected directory to contain the cwd and detected Git root;
+- rejects `/`, the complete real HOME, and overlap with private Agent state;
 - verifies fixed macOS system executables;
 - reads 256 random bits from `/dev/urandom`;
 - binds the inspected Apple gateway on an ephemeral IPv4 port.
@@ -135,13 +146,15 @@ After authentication, the broker starts exactly
 `/usr/libexec/sftp-server -e -d ROOT` through `/usr/bin/sandbox-exec`. The
 profile begins with `deny default`, imports the minimum system baseline, denies
 network access, permits the fixed SFTP executable, and grants file read/write
-only below the canonical workspace plus ancestor traversal metadata.
+only below the effective workspace plus ancestor traversal metadata.
 
 Workspace text is not interpolated into the sandbox language. It is supplied
 as a profile parameter and as an `OsString` argument. This prevents quote
 injection and avoids lossy argument conversion. Symlink traversal is still
 subject to the sandbox's resolved filesystem policy, so a symlink in the
-workspace does not authorize an outside target.
+workspace does not authorize an outside target. A sibling link works only when
+its resolved target is already below an explicitly selected containing root.
+The launcher does not discover links or enlarge that root automatically.
 
 The Rust parent remains outside that sandbox to own the TCP endpoint and relay
 bytes. It does not parse requested paths, execute a shell, or expose a general
@@ -157,10 +170,16 @@ boundary in the future.
 ### Guest mount setup
 
 The root helper creates a private mount namespace before mounting. It rejects
-non-canonical roots/cwds, protected guest trees, an occupied or nonempty
-mountpoint, unexpected filesystem types, and a cwd that resolves through a
-workspace symlink or outside the root. SSHFS connects through a fixed root-owned
-transport helper and FUSE device.
+non-canonical roots/cwds, protected guest trees, a root that is already a
+mountpoint, every existing nested mount below that root, unexpected filesystem
+types, and a cwd that resolves through a workspace symlink or outside the root.
+An ordinary nonempty directory is safe to cover inside the private namespace:
+unmounting reveals its original content unchanged. Cleanup uses `rmdir` only
+for an empty final mountpoint that the helper itself created, so it never
+deletes a pre-existing underlay. FUSE3 allows that overlay without an option;
+the removed FUSE2 `nonempty` flag is deliberately not passed because current
+SSHFS rejects it. SSHFS connects through a fixed root-owned transport helper
+and FUSE device.
 
 After readiness, the helper places the Agent session leader in a private,
 root-owned cgroup v2 leaf. `setpriv` then starts the profile executable with the
@@ -190,7 +209,7 @@ Each singleton client may also start one host-tool broker: the same
 authenticated Node.js broker legacy `run` uses, loaded with the complete host
 command catalog. The launcher freezes the ordered host `PATH` directories and
 the deny/first policy into a catalog specification, declares one writable
-execution root — the canonical workspace — and stages a fresh 256-bit session
+execution root — the effective workspace — and stages a fresh 256-bit session
 token. The broker expands the specification into the validated manifest
 in-process: every executable is canonicalized inside an admitted tool root,
 Agent binaries, launcher commands, `container`, and `sudo` are always denied,
@@ -205,15 +224,23 @@ name sits behind it and is used only when the guest image lacks the command.
 The command list is convenience surface, not the security boundary; the
 generated sandbox is. Every proxied process runs under a generated
 `deny default` `sandbox-exec` profile whose writable filesystem scope is the
-workspace root plus the isolated broker execution HOME. Only `git` and `gh`
-run with `HOME` set to the real home — so host credential helpers and the
-GitHub CLI login behave exactly as in a host terminal, with additional reads
-limited to `~/.gitconfig`, XDG Git configuration, SSH metadata (never
-private-key files), and `~/.config/gh`. Every other cataloged command runs
-with the isolated execution HOME and cannot read real-home dotfiles or stored
-credentials through the sandbox. The broker authenticates every request,
-polls its launcher PID, and exits when the client ends, so the channel cannot
-outlive the terminal that created it.
+effective workspace root plus the isolated broker execution HOME. Only `git`
+and `gh` run with `HOME` set to the real home, with additional reads limited to
+`~/.gitconfig`, XDG Git configuration, SSH metadata (never private-key files),
+and `~/.config/gh`. Existing host authentication is therefore usable, but the
+GitHub configuration stays read-only. Configuration-changing `gh auth`
+operations are rejected before spawn with an instruction to rerun the original
+operation, including its hostname and options, in a normal macOS terminal.
+Every other cataloged command runs with the isolated execution
+HOME and cannot read real-home dotfiles or stored credentials through the
+sandbox. The broker authenticates every request, polls its launcher PID, and
+exits when the client ends, so the channel cannot outlive the terminal that
+created it.
+
+The workspace and host-tool brokers always receive the same effective root.
+Consequently, `--container-workspace-root` expands both guest SFTP access and
+sandboxed native host-command access; disabling host tools removes the latter,
+but does not narrow the explicitly enlarged SSHFS mount.
 
 When the launching terminal exports a live `SSH_AUTH_SOCK`, the broker
 environment carries that one socket path and supplies it to exactly the
@@ -337,7 +364,8 @@ that requested it.
 `run` is a separate explicit authorization for a broader, short-lived path. It
 uses Apple volumes for the project and additional shares and can route selected
 commands to a native macOS host-command broker. It requires stopping the same
-profile's singleton first.
+profile's singleton first. `--container-workspace-root` is rejected in this
+mode; `run` accepts broader roots only through its reviewed share options.
 
 The broker freezes eligible host executable paths and tool roots in manifests,
 authenticates requests, executes without a shell, and applies a generated macOS
@@ -369,6 +397,12 @@ Managed paths are canonicalized, kept below the real HOME, checked for unsafe
 symlinks, and required to carry ownership markers before nonempty adoption.
 Private state may not overlap workspaces or explicit shares. Staging uses a
 restrictive umask and is removed when its client ends.
+
+An explicit singleton workspace root is validated before either broker starts.
+Filesystem root, the complete real HOME, roots that do not contain the current
+cwd and detected Git root, and roots overlapping private state fail closed.
+The launcher never treats a dependency manifest or symlink as permission to
+select a broader parent automatically.
 
 Container names are not ownership evidence. Image and container operations use
 recorded references plus exact project labels, host UID, profile, creator PID,
@@ -404,9 +438,16 @@ application failures and a kernel panic. The default project is transported by
 SFTP/SSHFS rather than a persistent Apple volume, substantially narrowing the
 large-workspace trigger.
 
+The same remains true for an explicit `--container-workspace-root`: it enlarges
+the SFTP and host-exec authorization but does not create an Apple volume and is
+not charged to the VirtioFS entry budget.
+
 VirtioFS remains for the isolated profile HOME and selected static
 configuration mounts. Legacy `run` also uses it for the project and extra
-shares. The runtime retains:
+shares. The image keeps Corepack's exact pnpm payload read-only and directs
+pnpm's mutable store/cache/state to `/var/lib/agent-container/pnpm` in the
+container-local writable layer, rather than letting dependency installs grow
+the VirtioFS-backed HOME. The runtime retains:
 
 - a configurable entry budget, default 40,000, for relevant mounted trees;
 - projected host file/per-process-file/vnode preflight;
@@ -418,6 +459,24 @@ A default singleton outlives its client launcher, so it cannot retain that
 client-owned live watchdog after disconnect. File-count and projected-capacity
 checks still run before client attachment. This residual risk is one reason to
 keep shadow HOME and static mounts small and to stop unused profile VMs.
+
+Canonical-path, overlap, and per-tree entry-budget checks are local preflights
+that complete before stopped Apple services start. A stopped service also gets
+the full cold host file/vnode projection before startup. With services already
+running, lifecycle-serialized native discovery and verified orphan reclamation
+precede a fresh capacity sample; warm attachment contributes zero projected
+Apple-volume entries. Cold paths re-count every mounted tree and resample host
+capacity after image work at the final pre-create boundary. Missing managed
+directories are represented as planned mounts in the first projection, with
+deterministic nonzero floors for the legacy/singleton staging files the
+launcher will create and for optional SSH/hosts contributions. The final pass
+requires every source to exist as the same canonical, non-symlink directory or
+file and, for sources that already existed, with the same macOS
+filesystem-object identity (`st_dev:st_ino`). It includes the generated staging
+tree plus nested SSH metadata and hosts-file mounts that Apple receives as
+separate sources. Thus a 40,000-entry tree failure identifies its actual local
+source and is not a machine-API startup failure, and even same-path replacement
+during a slow build fails before `container create`.
 
 The following flags weaken those controls and are intended for controlled
 testing:
@@ -466,6 +525,17 @@ The facility cannot cover every bootstrap hop. OCI `FROM` resolution happens
 before the BuildKit secret is available, and the current apt bootstrap happens
 before guest CA installation. Redirects, CDNs, and installer-internal downloads
 may also use endpoints not represented by automatic mode.
+
+An explicit `--container-debian-mirror` accepts only an `http://` Debian main
+repository used during image construction. The pinned slim base has no TLS
+trust store before its first APT transaction, so accepting an HTTPS mirror here
+would claim bootstrap trust that does not exist. HTTP provides no transport
+confidentiality, but APT still requires Debian-signed release metadata, expiry,
+and package hashes. The Debian security stanza remains fixed to the official
+`http://deb.debian.org/debian-security`; this option is not a fully isolated
+repository route. The completed native image digest is inspected before use.
+The transient main-mirror choice does not weaken the Agent installer's TLS
+policy or become a persistent singleton capability.
 
 Error classes must remain distinct:
 

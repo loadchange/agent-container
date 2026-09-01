@@ -208,10 +208,23 @@ send_outbound_frame() {
 }
 
 cleanup() {
+  local sender_grace_count=0
   local sender_wait_count=0
   trap - EXIT INT TERM HUP PIPE
   if [ -n "$stdin_sender_pid" ]; then
+    # The response-side exit frame can win a short race with an ordinary
+    # /dev/null or small-pipe sender that has already sent stdin_end but has
+    # not published its completion marker. Give that sender a bounded chance
+    # to finish before treating it like a blocked producer.
+    while [ ! -f "$outbound_sender_done" ] \
+      && kill -0 "$stdin_sender_pid" >/dev/null 2>&1 \
+      && [ "$sender_grace_count" -lt 10 ]; do
+      sleep 0.01
+      sender_grace_count=$((sender_grace_count + 1))
+    done
     if [ -f "$outbound_sender_done" ] && [ ! -L "$outbound_sender_done" ]; then
+      wait "$stdin_sender_pid" >/dev/null 2>&1 || true
+    elif ! kill -0 "$stdin_sender_pid" >/dev/null 2>&1; then
       wait "$stdin_sender_pid" >/dev/null 2>&1 || true
     else
       # The sender owns a separate process group. TERM reaches a blocked dd /
@@ -294,7 +307,7 @@ if [ "$stdin_enabled" = true ]; then
     if send_outbound_frame '{"type":"stdin_end"}'; then
       : > "$outbound_sender_done"
     fi
-  ) &
+  ) 2>/dev/null &
   stdin_sender_pid=$!
   set +m
   exec 8<&-

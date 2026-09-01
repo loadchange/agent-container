@@ -22,6 +22,7 @@ readonly RELEASE_ASSET_SOURCES=(
   "agent-container-runtime:runtime/agent-container-runtime"
   "Containerfile:runtime/Containerfile"
   "Containerfile.dockerignore:runtime/Containerfile.dockerignore"
+  "image-setup.sh:runtime/image-setup.sh"
   "entrypoint.sh:runtime/entrypoint.sh"
   "host-exec-client:runtime/host-exec-client"
   "host-exec-broker.mjs:runtime/host-exec-broker.mjs"

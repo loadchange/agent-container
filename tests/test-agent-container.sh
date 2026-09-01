@@ -3,10 +3,24 @@ set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 fixture_dir="$repo_root/tests/fixtures"
-command -v cargo >/dev/null 2>&1 \
-  || { printf 'cargo is required for launcher tests\n' >&2; exit 69; }
-cargo build --quiet --locked --offline --release \
-  --manifest-path "$repo_root/Cargo.toml"
+test_launcher_override=${AGENT_CONTAINER_TEST_LAUNCHER:-}
+if [ -n "$test_launcher_override" ]; then
+  case "$test_launcher_override" in
+    /*) ;;
+    *) printf 'launcher override must be absolute\n' >&2; exit 64 ;;
+  esac
+  [ -f "$test_launcher_override" ] \
+    && [ ! -L "$test_launcher_override" ] \
+    && [ -x "$test_launcher_override" ] \
+    || { printf 'launcher override is not a safe executable\n' >&2; exit 64; }
+  test_launcher_binary=$test_launcher_override
+else
+  command -v cargo >/dev/null 2>&1 \
+    || { printf 'cargo is required for launcher tests\n' >&2; exit 69; }
+  cargo build --quiet --locked --offline --release \
+    --manifest-path "$repo_root/Cargo.toml"
+  test_launcher_binary="$repo_root/target/release/agent-container-launcher"
+fi
 test_root=$(mktemp -d /tmp/agent-container-test.XXXXXX)
 test_root=$(CDPATH= cd -- "$test_root" && pwd -P)
 tests_run=0
@@ -235,6 +249,8 @@ reset_case_environment() {
     AGENT_CONTAINER_HOST_BROKER_BIN \
     AGENT_CONTAINER_HOST_EXEC_DENY \
     AGENT_CONTAINER_HOST_EXEC_FIRST \
+    AGENT_CONTAINER_HOST_ALIAS \
+    AGENT_CONTAINER_BLOCK_HOST \
     AGENT_CONTAINER_HOST_GATEWAY \
     AGENT_CONTAINER_HOST_NODE_BIN \
     AGENT_CONTAINER_HOST_SSH_AGENT \
@@ -247,6 +263,7 @@ reset_case_environment() {
     AGENT_CONTAINER_NO_PROXY \
     AGENT_CONTAINER_DNS1 \
     AGENT_CONTAINER_DNS2 \
+    AGENT_CONTAINER_DEBIAN_MIRROR \
     AGENT_CONTAINER_EXTRA_CA_CERTS \
     AGENT_CONTAINER_OPENSSL_BIN \
     AGENT_CONTAINER_SECURITY_BIN \
@@ -254,6 +271,7 @@ reset_case_environment() {
     AGENT_CONTAINER_SKIP_BUILD \
     AGENT_CONTAINER_TZ \
     AGENT_CONTAINER_VERSION \
+    AGENT_CONTAINER_WORKSPACE_ROOT \
     AGENT_CONTAINER_FD_STOP_PERCENT \
     AGENT_CONTAINER_MAX_FILES \
     AGENT_CONTAINER_MEMORY \
@@ -289,6 +307,12 @@ reset_case_environment() {
     FAKE_POST_START_INSPECT_MODE \
     FAKE_RETAG_AFTER_INSPECT \
     FAKE_READ_STDIN \
+    FAKE_GROW_DIRECTORY_AFTER_STOPPED_INSPECT \
+    FAKE_GROW_DIRECTORY_ENTRY_COUNT \
+    FAKE_REPLACE_DIRECTORY_ON_SYSCTL \
+    FAKE_REPLACE_DIRECTORY_ON_SYSCTL_SNAPSHOT \
+    FAKE_REPLACE_DIRECTORY_AFTER_DELETE \
+    FAKE_REPLACEMENT_SINGLETON_RECORDS \
     FAKE_RUN_OUTPUT \
     FAKE_RUN_SLEEP \
     FAKE_RUN_STATUS \
@@ -298,7 +322,15 @@ reset_case_environment() {
     FAKE_SECURITY_VERSION_ANCHOR_BODY \
     FAKE_START_FAIL \
     FAKE_SYSTEM_START_FAIL \
+    FAKE_SYSTEM_START_OUTPUT \
+    FAKE_SYSTEM_READY_AFTER_START \
+    FAKE_SYSTEM_STATUS_FAILURES_AFTER_START \
     FAKE_SYSTEM_RUNNING \
+    FAKE_NUM_FILES \
+    FAKE_MAX_FILES \
+    FAKE_MAX_FILES_PER_PROC \
+    FAKE_MAX_VNODES \
+    FAKE_FREE_VNODES \
     GROK_SANDBOX \
     TEST_CONTAINER_BIN \
     TEST_FAKE_BUILD_GATE \
@@ -325,7 +357,7 @@ new_case() {
   case_curl_log="$case_dir/curl.log"
   case_security_log="$case_dir/security.log"
   case_openssl_log="$case_dir/openssl.log"
-  case_asset_dir="$repo_root/runtime"
+  case_asset_dir=${test_override_asset_dir:-"$repo_root/runtime"}
   mkdir -p "$case_home" "$case_workspace"
   : > "$case_log"
   : > "$case_curl_log"
@@ -333,25 +365,47 @@ new_case() {
   : > "$case_openssl_log"
 }
 
-copy_case_assets() {
-  case_asset_dir="$case_dir/assets"
-  mkdir -p "$case_asset_dir/profiles"
+stage_case_assets() {
+  local destination=$1
+
+  mkdir -p "$destination/profiles"
   cp \
     "$repo_root/runtime/Containerfile" \
     "$repo_root/runtime/Containerfile.dockerignore" \
+    "$repo_root/runtime/image-setup.sh" \
     "$repo_root/runtime/entrypoint.sh" \
     "$repo_root/runtime/host-exec-broker.mjs" \
     "$repo_root/runtime/host-exec-client" \
     "$repo_root/runtime/agent-workspace-connect" \
     "$repo_root/runtime/agent-workspace-session" \
-    "$case_asset_dir/"
-  cp "$repo_root"/runtime/profiles/*.json "$case_asset_dir/profiles/"
+    "$destination/"
+  cp "$repo_root"/runtime/profiles/*.json "$destination/profiles/"
+  if [ -n "$test_launcher_override" ]; then
+    {
+      printf '%s\n' '#!/bin/bash'
+      printf '%s\n' 'set -euo pipefail'
+      printf 'exec %q "$@"\n' "$test_launcher_override"
+    } > "$destination/agent-container-darwin-arm64"
+    chmod 0755 "$destination/agent-container-darwin-arm64"
+  fi
 }
+
+copy_case_assets() {
+  case_asset_dir="$case_dir/assets"
+  stage_case_assets "$case_asset_dir"
+}
+
+test_override_asset_dir=
+if [ -n "$test_launcher_override" ]; then
+  test_override_asset_dir="$test_root/launcher-override-assets"
+  stage_case_assets "$test_override_asset_dir"
+  ln -s "$test_launcher_override" "$test_root/agent-container"
+fi
 
 launch_exec() {
   local program="$1"
   shift
-  local program_name requested_test_profile
+  local launcher_argv0 program_name requested_test_profile
   local -a runner_env launcher_options program_arguments
 
   program_arguments=("$@")
@@ -416,8 +470,20 @@ launch_exec() {
     || launcher_options+=(--container-dns2 "$AGENT_CONTAINER_DNS2")
   [ -z "${AGENT_CONTAINER_TZ:-}" ] \
     || launcher_options+=(--container-timezone "$AGENT_CONTAINER_TZ")
+  [ -z "${AGENT_CONTAINER_DEBIAN_MIRROR:-}" ] \
+    || launcher_options+=(
+      --container-debian-mirror "$AGENT_CONTAINER_DEBIAN_MIRROR"
+    )
+  [ -z "${AGENT_CONTAINER_HOST_ALIAS:-}" ] \
+    || launcher_options+=(--container-host-alias "$AGENT_CONTAINER_HOST_ALIAS")
+  [ -z "${AGENT_CONTAINER_BLOCK_HOST:-}" ] \
+    || launcher_options+=(--container-block-host "$AGENT_CONTAINER_BLOCK_HOST")
   [ -z "${AGENT_CONTAINER_FORWARD_ENV:-}" ] \
     || launcher_options+=(--container-forward-env "$AGENT_CONTAINER_FORWARD_ENV")
+  [ -z "${AGENT_CONTAINER_WORKSPACE_ROOT:-}" ] \
+    || launcher_options+=(
+      --container-workspace-root "$AGENT_CONTAINER_WORKSPACE_ROOT"
+    )
   if [ -n "${AGENT_CONTAINER_FORWARD_API_KEY+x}" ]; then
     case "$AGENT_CONTAINER_FORWARD_API_KEY" in
       1|true|TRUE|yes|YES|on|ON)
@@ -537,6 +603,14 @@ launch_exec() {
     "FAKE_POST_START_INSPECT_MODE=${FAKE_POST_START_INSPECT_MODE:-}"
     "FAKE_RETAG_AFTER_INSPECT=${FAKE_RETAG_AFTER_INSPECT:-false}"
     "FAKE_READ_STDIN=${FAKE_READ_STDIN:-false}"
+    "FAKE_GROW_DIRECTORY_AFTER_STOPPED_INSPECT=${FAKE_GROW_DIRECTORY_AFTER_STOPPED_INSPECT:-}"
+    "FAKE_GROW_DIRECTORY_ENTRY_COUNT=${FAKE_GROW_DIRECTORY_ENTRY_COUNT:-0}"
+    "FAKE_GROW_DIRECTORY_MARKER=$case_home/fake-grow-directory-marker"
+    "FAKE_REPLACE_DIRECTORY_ON_SYSCTL=${FAKE_REPLACE_DIRECTORY_ON_SYSCTL:-}"
+    "FAKE_REPLACE_DIRECTORY_ON_SYSCTL_SNAPSHOT=${FAKE_REPLACE_DIRECTORY_ON_SYSCTL_SNAPSHOT:-0}"
+    "FAKE_SYSCTL_SNAPSHOT_STATE=$case_home/fake-sysctl-snapshot-count"
+    "FAKE_REPLACE_DIRECTORY_AFTER_DELETE=${FAKE_REPLACE_DIRECTORY_AFTER_DELETE:-}"
+    "FAKE_REPLACEMENT_SINGLETON_RECORDS=${FAKE_REPLACEMENT_SINGLETON_RECORDS:-false}"
     "FAKE_RUN_OUTPUT=${FAKE_RUN_OUTPUT:-}"
     "FAKE_RUN_SLEEP=${FAKE_RUN_SLEEP:-}"
     "FAKE_RUN_STATUS=${FAKE_RUN_STATUS:-0}"
@@ -548,8 +622,17 @@ launch_exec() {
     "FAKE_OPENSSL_LOG=$case_openssl_log"
     "FAKE_START_FAIL=${FAKE_START_FAIL:-false}"
     "FAKE_SYSTEM_START_FAIL=${FAKE_SYSTEM_START_FAIL:-false}"
+    "FAKE_SYSTEM_START_OUTPUT=${FAKE_SYSTEM_START_OUTPUT:-}"
+    "FAKE_SYSTEM_READY_AFTER_START=${FAKE_SYSTEM_READY_AFTER_START:-true}"
+    "FAKE_SYSTEM_STATUS_FAILURES_AFTER_START=${FAKE_SYSTEM_STATUS_FAILURES_AFTER_START:-0}"
+    "FAKE_SYSTEM_STATUS_COUNT_STATE=$case_home/fake-system-status-count"
     "FAKE_SYSTEM_RUNNING=${FAKE_SYSTEM_RUNNING:-true}"
     "FAKE_SYSTEM_STARTED_STATE=$case_home/fake-system-started"
+    "FAKE_NUM_FILES=${FAKE_NUM_FILES:-1000}"
+    "FAKE_MAX_FILES=${FAKE_MAX_FILES:-100000}"
+    "FAKE_MAX_FILES_PER_PROC=${FAKE_MAX_FILES_PER_PROC:-60000}"
+    "FAKE_MAX_VNODES=${FAKE_MAX_VNODES:-200000}"
+    "FAKE_FREE_VNODES=${FAKE_FREE_VNODES:-150000}"
     "TEST_FAKE_BUILD_GATE=${TEST_FAKE_BUILD_GATE:-}"
     "TEST_FAKE_BUILD_MARKER=${TEST_FAKE_BUILD_MARKER:-}"
     "TEST_FAKE_CONTAINER_REAL=${TEST_FAKE_CONTAINER_REAL:-}"
@@ -582,6 +665,26 @@ launch_exec() {
   done
 
   cd "${TEST_LAUNCH_CWD:-$case_workspace}"
+  if [ -n "$test_launcher_override" ]; then
+    case "$program" in
+      "$repo_root/bin/agent-container") launcher_argv0=agent-container ;;
+      "$repo_root/bin/claude-container") launcher_argv0=claude-container ;;
+      "$repo_root/bin/codex-container") launcher_argv0=codex-container ;;
+      "$repo_root/bin/grok-container") launcher_argv0=grok-container ;;
+      *) launcher_argv0= ;;
+    esac
+    if [ -n "$launcher_argv0" ]; then
+      exec /usr/bin/env -i "${runner_env[@]}" \
+        /bin/bash -c '
+          launcher_argv0=$1
+          launcher=$2
+          shift 2
+          exec -a "$launcher_argv0" "$launcher" "$@"
+        ' test-launcher-dispatch \
+        "$launcher_argv0" "$test_launcher_override" \
+        "${launcher_options[@]}" "${program_arguments[@]}"
+    fi
+  fi
   exec /usr/bin/env -i "${runner_env[@]}" \
     /bin/bash "$program" "${launcher_options[@]}" "${program_arguments[@]}"
 }
@@ -661,7 +764,7 @@ assert_native_installer_build_args() {
   assert_line "$file" "ARG=AGENT_VERSION=$version"
   assert_line "$file" "ARG=AGENT_COMMAND=$command"
   assert_line "$file" "ARG=--progress"
-  assert_line "$file" "ARG=plain"
+  assert_line "$file" "ARG=auto"
   assert_not_contains "$file" "AGENT_PACKAGE="
 }
 
@@ -677,6 +780,58 @@ grep -Eq '^grok[[:space:]]+preview[[:space:]]+Grok CLI$' "$case_dir/out" \
   || fail "profiles did not list preview Grok"
 [ ! -s "$case_log" ] || fail "profile listing contacted the Apple runtime"
 pass "profiles are listed from validated declarative metadata"
+
+tests_run=$((tests_run + 1))
+new_case guest_pnpm_storage
+containerfile="$repo_root/runtime/Containerfile"
+containerignore="$repo_root/runtime/Containerfile.dockerignore"
+image_setup="$repo_root/runtime/image-setup.sh"
+entrypoint="$repo_root/runtime/entrypoint.sh"
+workspace_session="$repo_root/runtime/agent-workspace-session"
+runtime="$repo_root/runtime/agent-container-runtime"
+containerfile_bytes=$(wc -c < "$containerfile" | tr -d '[:space:]')
+case "$containerfile_bytes" in
+  ''|*[!0-9]*) fail "Containerfile size was not numeric" ;;
+esac
+[ "$containerfile_bytes" -le 10000 ] \
+  || fail "Containerfile exceeds the Apple builder shim's safe 10 KB input budget"
+[ -f "$image_setup" ] && [ ! -L "$image_setup" ] && [ -x "$image_setup" ] \
+  || fail "image setup must be a regular executable build asset"
+assert_line "$containerignore" '!image-setup.sh'
+assert_line "$containerfile" 'COPY image-setup.sh /tmp/agent-image-setup'
+[ "$(grep -Fxc -- 'COPY image-setup.sh /tmp/agent-image-setup' "$containerfile")" -eq 1 ] \
+  || fail "Containerfile should copy image setup exactly once"
+assert_contains "$containerfile" '/tmp/agent-image-setup ca'
+assert_contains "$containerfile" '/tmp/agent-image-setup toolchain'
+assert_contains "$containerfile" 'rm -f /tmp/agent-image-setup'
+assert_line "$containerfile" 'ENV COREPACK_HOME=/usr/local/lib/agent-corepack'
+assert_contains "$containerfile" 'ARG PNPM_VERSION=11.7.0'
+assert_contains "$containerfile" 'COREPACK_ENABLE_NETWORK=0'
+assert_contains "$image_setup" 'setup_ca()'
+assert_contains "$image_setup" 'setup_toolchain()'
+assert_contains "$image_setup" 'ca_secret=/run/secrets/agent_ca_bundle'
+assert_contains "$image_setup" 'update-ca-certificates'
+assert_contains "$image_setup" 'chmod -R a-w "$COREPACK_HOME"'
+assert_contains "$image_setup" '/usr/bin/setpriv'
+assert_contains "$image_setup" 'XDG_CACHE_HOME="$probe_home/.cache"'
+assert_contains "$image_setup" '[ ! -e "$probe_home/.cache/node/corepack" ]'
+assert_contains "$repo_root/install.sh" '/bin/sh -n "$tmp_dir/image-setup.sh"'
+assert_contains "$repo_root/scripts/build-release.sh" \
+  '/bin/sh -n "$dist_dir/image-setup.sh"'
+assert_not_contains "$image_setup" 'COREPACK_HOME=/root'
+assert_not_contains "$containerfile" 'COREPACK_HOME=/root'
+for pnpm_setting in STORE CACHE STATE; do
+  assert_contains "$containerfile" \
+    "PNPM_CONFIG_${pnpm_setting}_DIR=/var/lib/agent-container/pnpm/"
+  assert_contains "$entrypoint" \
+    "PNPM_CONFIG_${pnpm_setting}_DIR=\"\$pnpm_"
+  assert_contains "$workspace_session" \
+    "PNPM_CONFIG_${pnpm_setting}_DIR=/var/lib/agent-container/pnpm/"
+  assert_contains "$runtime" "PNPM_CONFIG_${pnpm_setting}_DIR"
+done
+assert_contains "$entrypoint" 'chown 0:0 "$pnpm_data_parent"'
+assert_contains "$entrypoint" 'chmod 0700 "$pnpm_data_dir"'
+pass "guest pnpm bootstrap and mutable data stay off every VirtioFS-backed HOME"
 
 tests_run=$((tests_run + 1))
 new_case unknown_profile
@@ -979,6 +1134,126 @@ assert_not_contains "$case_dir/err" 'Host tool proxying is disabled'
 pass "singleton clients stage the full host-tool catalog and hand the channel over by name only"
 
 tests_run=$((tests_run + 1))
+new_case singleton_explicit_workspace_root
+TEST_SINGLETON_LAUNCH=true
+workspace_scope="$test_root/explicit-workspace-scope"
+workspace_project="$workspace_scope/sample-app"
+workspace_dependency="$workspace_scope/shared-harness"
+mkdir -p "$workspace_project" "$workspace_dependency"
+printf '%s\n' dependency > "$workspace_dependency/visible-from-common-root"
+printf '%s\n' \
+  '{"private":true,"devDependencies":{"@example/harness":"link:../shared-harness"}}' \
+  > "$workspace_project/package.json"
+AGENT_CONTAINER_WORKSPACE_ROOT="$workspace_scope"
+scope_capture_broker="$case_dir/capture-host-broker"
+{
+  printf '%s\n' '#!/bin/bash'
+  printf '%s\n' 'set -euo pipefail'
+  printf '%s\n' 'session_dir='
+  printf '%s\n' 'previous='
+  printf '%s\n' 'for argument in "$@"; do'
+  printf '%s\n' '  [ "$previous" != --session-dir ] || session_dir=$argument'
+  printf '%s\n' '  previous=$argument'
+  printf '%s\n' 'done'
+  printf '%s\n' '[ -n "$session_dir" ] || exit 66'
+  printf 'cp -R "$session_dir" %q\n' "$case_dir/captured-session"
+  printf 'exec %q "$@"\n' "$fixture_dir/host-exec-broker"
+} > "$scope_capture_broker"
+chmod 0755 "$scope_capture_broker"
+AGENT_CONTAINER_HOST_BROKER_BIN="$scope_capture_broker"
+AGENT_CONTAINER_HOST_TOOLS=
+run_program_from "$workspace_project" \
+  "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_dir/captured-session/host-roots.tsv" \
+  "$(printf 'rw\t%s' "$workspace_scope")"
+session_arguments=$(call_arguments_containing \
+  "$case_log" /usr/local/bin/agent-workspace-session)
+printf '%s\n' "$session_arguments" > "$case_dir/session.args"
+assert_line "$case_dir/session.args" "ARG=$workspace_scope"
+assert_line "$case_dir/session.args" "ARG=$workspace_project"
+assert_no_line "$case_dir/captured-session/host-roots.tsv" \
+  "$(printf 'rw\t%s' "$workspace_project")"
+pass "an explicit singleton workspace root admits sibling dependencies through one SFTP and host-tool scope"
+
+tests_run=$((tests_run + 1))
+new_case singleton_workspace_root_allows_colon
+TEST_SINGLETON_LAUNCH=true
+colon_scope="$case_dir/workspace:scope"
+colon_project="$colon_scope/project"
+mkdir -p "$colon_project"
+AGENT_CONTAINER_WORKSPACE_ROOT="$colon_scope"
+run_program_from "$colon_project" \
+  "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+session_arguments=$(call_arguments_containing \
+  "$case_log" /usr/local/bin/agent-workspace-session)
+printf '%s\n' "$session_arguments" > "$case_dir/session.args"
+assert_line "$case_dir/session.args" "ARG=$colon_scope"
+assert_line "$case_dir/session.args" "ARG=$colon_project"
+pass "SFTP-only singleton roots are not rejected by Apple volume path syntax"
+
+tests_run=$((tests_run + 1))
+new_case singleton_workspace_root_must_contain_cwd
+TEST_SINGLETON_LAUNCH=true
+unrelated_scope="$test_root/unrelated-workspace-scope"
+mkdir "$unrelated_scope"
+AGENT_CONTAINER_WORKSPACE_ROOT="$unrelated_scope"
+if run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a workspace root outside the launch directory should fail"
+fi
+assert_contains "$case_dir/err" "does not contain the launch directory"
+assert_no_line "$case_log" 'ARG=system'
+assert_no_line "$case_log" 'ARG=create'
+pass "an explicit workspace root cannot silently redirect the launch to another tree"
+
+tests_run=$((tests_run + 1))
+new_case singleton_workspace_root_must_contain_git_root
+TEST_SINGLETON_LAUNCH=true
+git_scope="$case_dir/git-scope"
+git_child="$git_scope/nested/child"
+mkdir -p "$git_child"
+/usr/bin/git -C "$git_scope" init -q
+AGENT_CONTAINER_WORKSPACE_ROOT="$git_child"
+if run_program_from "$git_child" \
+  "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a workspace root containing cwd but excluding its Git root should fail"
+fi
+assert_contains "$case_dir/err" "does not contain the detected Git root"
+assert_contains "$case_dir/err" "$git_scope"
+assert_no_line "$case_log" 'ARG=system'
+assert_no_line "$case_log" 'ARG=create'
+pass "an explicit workspace root must preserve the complete detected Git repository"
+
+tests_run=$((tests_run + 1))
+new_case singleton_workspace_root_rejects_home
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_WORKSPACE_ROOT="$case_home"
+if run_program_from "$case_home" \
+  "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "the real host HOME should not be accepted as a workspace root"
+fi
+assert_contains "$case_dir/err" "contains the real host HOME"
+assert_no_line "$case_log" 'ARG=system'
+assert_no_line "$case_log" 'ARG=create'
+pass "workspace-root expansion never exposes the complete real HOME"
+
+tests_run=$((tests_run + 1))
+new_case legacy_run_rejects_workspace_root
+AGENT_CONTAINER_WORKSPACE_ROOT="$case_workspace"
+if run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "legacy run should reject the singleton-only workspace-root option"
+fi
+assert_contains "$case_dir/err" "supported only by the default persistent singleton"
+assert_no_line "$case_log" 'ARG=system'
+assert_no_line "$case_log" 'ARG=create'
+pass "legacy run keeps its separate explicit-share vocabulary"
+
+tests_run=$((tests_run + 1))
 new_case singleton_host_tools_disabled
 TEST_SINGLETON_LAUNCH=true
 AGENT_CONTAINER_HOST_TOOLS=false
@@ -1263,19 +1538,54 @@ new_case extra_share_virtiofs_budget
 AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
 budget_share="$case_dir/budget-share"
 mkdir "$budget_share"
-touch \
-  "$budget_share/one" \
-  "$budget_share/two" \
-  "$budget_share/three"
-AGENT_CONTAINER_MAX_FILES=10
+for generated_index in $(seq 1 12); do
+  touch "$budget_share/generated-$generated_index"
+done
+AGENT_CONTAINER_MAX_FILES=30
 if run_program "$repo_root/bin/agent-container" run codex \
   --share-ro "$budget_share" -- --version \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "extra shares should count against the VirtioFS file budget"
 fi
 assert_contains "$case_dir/err" "Projected VirtioFS shares"
+assert_contains "$case_dir/err" "additional legacy share"
+assert_contains "$case_dir/err" "--share-ro/--share-rw"
+assert_not_contains "$case_dir/err" "--container-workspace-root prevents"
 assert_no_line "$case_log" "ARG=create"
-pass "extra shares participate in the fail-closed VirtioFS budget"
+pass "extra shares receive their own fail-closed VirtioFS remediation"
+
+tests_run=$((tests_run + 1))
+new_case combined_virtiofs_budget_names_largest_exact_tree
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+for generated_index in $(seq 1 10); do
+  touch "$case_workspace/workspace-$generated_index"
+done
+combined_share="$case_dir/combined-share"
+mkdir "$combined_share"
+touch \
+  "$combined_share/share-one" \
+  "$combined_share/share-two" \
+  "$combined_share/share-three"
+combined_state="$case_home/.agent-container"
+combined_shadow_home="$combined_state/profiles/codex/home"
+mkdir -p "$combined_shadow_home"
+printf '%s\n' 'managed by agent-container' \
+  > "$combined_state/.agent-container-owned"
+touch \
+  "$combined_shadow_home/shadow-one" \
+  "$combined_shadow_home/shadow-two"
+AGENT_CONTAINER_MAX_FILES=33
+if run_program "$repo_root/bin/agent-container" run codex \
+  --share-ro "$combined_share" -- --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "several individually safe trees should still obey the combined budget"
+fi
+assert_contains "$case_dir/err" \
+  "The largest counted tree is the legacy workspace at '$case_workspace' (10 entries)."
+assert_not_contains "$case_dir/err" \
+  "largest counted tree is the persistent 'codex' shadow HOME"
+assert_no_line "$case_log" "ARG=create"
+pass "combined-budget diagnostics compare every exact VirtioFS source"
 
 tests_run=$((tests_run + 1))
 new_case profile_isolation
@@ -1639,6 +1949,12 @@ for managed_env_name in \
   IS_SANDBOX \
   BASE_IMAGE \
   DEFAULT_BASE_IMAGE \
+  COREPACK_HOME \
+  COREPACK_ENABLE_NETWORK \
+  COREPACK_DEFAULT_TO_LATEST \
+  PNPM_CONFIG_STORE_DIR \
+  PNPM_CONFIG_CACHE_DIR \
+  PNPM_CONFIG_STATE_DIR \
   HTTP_PROXY \
   FTP_PROXY \
   BASH_COMPAT \
@@ -1749,11 +2065,16 @@ assert_line "$case_log" "ARG=AGENT_VERSION=0.2.115"
 pass "an unchanged native latest channel is warm and a moved channel rebuilds"
 
 tests_run=$((tests_run + 1))
-new_case workspace_helpers_invalidate_image_recipe
+new_case image_assets_invalidate_image_recipe
 copy_case_assets
 AGENT_CONTAINER_VERSION=0.146.0
 run_program "$repo_root/bin/codex-container" --version \
   >"$case_dir/first.out" 2>"$case_dir/first.err"
+
+printf '%s\n' '# fingerprint mutation: image setup' \
+  >> "$case_asset_dir/image-setup.sh"
+run_program "$repo_root/bin/codex-container" --version \
+  >"$case_dir/image-setup.out" 2>"$case_dir/image-setup.err"
 
 printf '%s\n' '# fingerprint mutation: connect' \
   >> "$case_asset_dir/agent-workspace-connect"
@@ -1765,9 +2086,9 @@ printf '%s\n' '# fingerprint mutation: session' \
 run_program "$repo_root/bin/codex-container" --version \
   >"$case_dir/session.out" 2>"$case_dir/session.err"
 
-[ "$(grep -Fxc -- 'ARG=build' "$case_log")" -eq 3 ] \
-  || fail "workspace helper changes did not invalidate the image recipe independently"
-pass "both workspace helpers participate in image reuse and singleton configuration"
+[ "$(grep -Fxc -- 'ARG=build' "$case_log")" -eq 4 ] \
+  || fail "image setup and workspace helper changes did not invalidate the recipe independently"
+pass "image setup and both workspace helpers participate in image reuse"
 
 tests_run=$((tests_run + 1))
 new_case malicious_plain_version_response
@@ -2050,6 +2371,12 @@ new_case piped_stdin_tty_stdout
 run_program "$repo_root/bin/agent-container" claude --version \
   >"$case_dir/warm.out" 2>"$case_dir/warm.err"
 : > "$case_log"
+pty_launcher=(/bin/bash "$repo_root/bin/agent-container")
+pty_asset_dir="$repo_root/runtime"
+if [ -n "$test_launcher_override" ]; then
+  pty_launcher=("$test_root/agent-container")
+  pty_asset_dir=$test_override_asset_dir
+fi
 if ! (
   cd "$case_workspace"
   exec /usr/bin/env -i \
@@ -2062,9 +2389,9 @@ if ! (
     FAKE_IMAGE_STATE_DIR="$case_home/fake-images" \
     FAKE_READ_STDIN=true \
     /usr/bin/python3 "$repo_root/tests/pty-run.py" --pipe-stdin \
-      /bin/bash "$repo_root/bin/agent-container" \
+      "${pty_launcher[@]}" \
         --container-bin "$fixture_dir/container" \
-        --container-assets "$repo_root/runtime" \
+        --container-assets "$pty_asset_dir" \
         --container-host-gateway 127.0.0.1 \
         --container-openssl "$fixture_dir/openssl" \
         --container-security "$fixture_dir/security" \
@@ -2105,32 +2432,457 @@ if run_program "$repo_root/bin/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "VirtioFS file-count threshold should fail closed"
 fi
-assert_contains "$case_dir/err" "Apple VirtioFS issue #1097"
+assert_contains "$case_dir/err" "A budget-exceeding tree is the legacy workspace"
+assert_contains "$case_dir/err" "container/issues/1097"
 assert_no_line "$case_log" "ARG=start"
-pass "VirtioFS issue #1097 retains a fail-closed workspace gate"
+pass "VirtioFS issue #1097 names a capped legacy workspace without claiming an exact largest tree"
+
+tests_run=$((tests_run + 1))
+new_case virtiofs_planned_stage_gate
+AGENT_CONTAINER_MAX_FILES=7
+if run_program "$repo_root/bin/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a budget below planned cold staging should fail closed"
+fi
+assert_contains "$case_dir/err" \
+  "ephemeral legacy session staging"
+assert_contains "$case_dir/err" "(9 entries)"
+assert_command_count "$case_log" system 0
+pass "cold staging is projected before Apple service startup"
+
+tests_run=$((tests_run + 1))
+new_case stopped_service_planned_stage_gate
+FAKE_SYSTEM_RUNNING=false
+AGENT_CONTAINER_MAX_FILES=17
+if run_program "$repo_root/bin/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "planned staging should exceed the cold budget before service startup"
+fi
+assert_contains "$case_dir/err" \
+  "ephemeral legacy session staging"
+assert_command_count "$case_log" system 0
+assert_no_line "$case_log" 'ARG=start'
+assert_no_line "$case_log" 'ARG=build'
+pass "full cold staging projection rejects before stopped services are mutated"
+
+tests_run=$((tests_run + 1))
+new_case singleton_shadow_home_virtiofs_gate
+TEST_SINGLETON_LAUNCH=true
+FAKE_SYSTEM_RUNNING=false
+AGENT_CONTAINER_MAX_FILES=10
+shadow_state="$case_home/.agent-container"
+shadow_profile_home="$shadow_state/profiles/claude/home"
+mkdir -p "$shadow_profile_home"
+printf '%s\n' 'managed by agent-container' \
+  > "$shadow_state/.agent-container-owned"
+touch \
+  "$shadow_profile_home/generated-one" \
+  "$shadow_profile_home/generated-two" \
+  "$shadow_profile_home/generated-three"
+if run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "an oversized singleton shadow HOME should fail closed"
+fi
+assert_contains "$case_dir/err" "persistent 'claude' shadow HOME"
+assert_contains "$case_dir/err" "$shadow_profile_home"
+assert_contains "$case_dir/err" "The largest counted tree"
+assert_contains "$case_dir/err" "--container-workspace-root"
+assert_command_count "$case_log" system 0
+assert_command_count "$case_log" list 0
+assert_no_line "$case_log" 'ARG=build'
+assert_no_line "$case_log" 'ARG=create'
+pass "shadow-HOME offenders are named before stopped Apple services are mutated"
+
+tests_run=$((tests_run + 1))
+new_case singleton_capped_shadow_home_virtiofs_gate
+TEST_SINGLETON_LAUNCH=true
+FAKE_SYSTEM_RUNNING=false
+AGENT_CONTAINER_MAX_FILES=10
+shadow_state="$case_home/.agent-container"
+shadow_profile_home="$shadow_state/profiles/claude/home"
+mkdir -p "$shadow_profile_home"
+printf '%s\n' 'managed by agent-container' \
+  > "$shadow_state/.agent-container-owned"
+for generated_index in $(seq 1 12); do
+  touch "$shadow_profile_home/generated-$generated_index"
+done
+if run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a bounded shadow-HOME scan above the budget should fail closed"
+fi
+assert_contains "$case_dir/err" "A budget-exceeding tree is the persistent 'claude' shadow HOME"
+assert_contains "$case_dir/err" "bounded scan did not compute its exact size"
+assert_not_contains "$case_dir/err" "The largest tree"
+assert_command_count "$case_log" system 0
+pass "capped scans identify one budget-exceeding tree without a false largest-tree claim"
+
+tests_run=$((tests_run + 1))
+new_case singleton_shadow_home_risk_acceptance
+TEST_SINGLETON_LAUNCH=true
+FAKE_SYSTEM_RUNNING=false
+AGENT_CONTAINER_MAX_FILES=10
+AGENT_CONTAINER_ACCEPT_VIRTIOFS_RISK=true
+shadow_state="$case_home/.agent-container"
+shadow_profile_home="$shadow_state/profiles/claude/home"
+mkdir -p "$shadow_profile_home"
+printf '%s\n' 'managed by agent-container' \
+  > "$shadow_state/.agent-container-owned"
+touch \
+  "$shadow_profile_home/generated-one" \
+  "$shadow_profile_home/generated-two" \
+  "$shadow_profile_home/generated-three"
+run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_command_count "$case_log" system 3
+assert_line "$case_log" 'ARG=create'
+pass "explicit risk acceptance still crosses the reordered local preflight"
+
+tests_run=$((tests_run + 1))
+new_case precreate_virtiofs_recount
+AGENT_CONTAINER_MAX_FILES=20
+build_gate="$case_dir/build.gate"
+build_marker="$case_dir/build.marker"
+gated_container="$case_dir/gated-container"
+: > "$build_gate"
+: > "$build_marker"
+write_build_gated_container "$gated_container"
+TEST_CONTAINER_BIN="$gated_container"
+TEST_FAKE_CONTAINER_REAL="$fixture_dir/container"
+TEST_FAKE_BUILD_GATE="$build_gate"
+TEST_FAKE_BUILD_MARKER="$build_marker"
+run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err" &
+background_pid=$!
+for build_wait_attempt in $(seq 1 3000); do
+  [ -s "$build_marker" ] && break
+  kill -0 "$background_pid" 2>/dev/null \
+    || fail "gated launch exited before reaching image build"
+  sleep 0.01
+done
+[ -s "$build_marker" ] \
+  || fail "gated launch did not reach image build"
+for generated_index in $(seq 1 21); do
+  touch "$case_workspace/generated-during-build-$generated_index"
+done
+rm -f "$build_gate"
+set +e
+wait "$background_pid"
+recount_status=$?
+set -e
+background_pid=""
+[ "$recount_status" -ne 0 ] \
+  || fail "workspace growth during image build bypassed the final entry budget"
+assert_contains "$case_dir/err" \
+  "A budget-exceeding tree is the legacy workspace"
+assert_line "$case_log" 'ARG=build'
+assert_no_line "$case_log" 'ARG=create'
+pass "cold creation re-counts VirtioFS trees after a slow image build"
+
+tests_run=$((tests_run + 1))
+new_case precreate_virtiofs_source_identity
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+swap_share="$case_dir/swap-share"
+swap_backup="$case_dir/swap-backup"
+swap_target="$case_dir/swap-target"
+mkdir "$swap_share" "$swap_target"
+build_gate="$case_dir/build.gate"
+build_marker="$case_dir/build.marker"
+gated_container="$case_dir/gated-container"
+: > "$build_gate"
+: > "$build_marker"
+write_build_gated_container "$gated_container"
+TEST_CONTAINER_BIN="$gated_container"
+TEST_FAKE_CONTAINER_REAL="$fixture_dir/container"
+TEST_FAKE_BUILD_GATE="$build_gate"
+TEST_FAKE_BUILD_MARKER="$build_marker"
+run_program "$repo_root/bin/agent-container" run claude \
+  --share-ro "$swap_share" -- --version \
+  >"$case_dir/out" 2>"$case_dir/err" &
+background_pid=$!
+for build_wait_attempt in $(seq 1 3000); do
+  [ -s "$build_marker" ] && break
+  kill -0 "$background_pid" 2>/dev/null \
+    || fail "source-identity launch exited before reaching image build"
+  sleep 0.01
+done
+[ -s "$build_marker" ] \
+  || fail "source-identity launch did not reach image build"
+mv "$swap_share" "$swap_backup"
+mv "$swap_target" "$swap_share"
+rm -f "$build_gate"
+set +e
+wait "$background_pid"
+source_identity_status=$?
+set -e
+background_pid=""
+[ "$source_identity_status" -ne 0 ] \
+  || fail "a replaced VirtioFS source bypassed final identity validation"
+assert_contains "$case_dir/err" \
+  "VirtioFS source for the additional legacy share changed filesystem identity"
+assert_no_line "$case_log" 'ARG=create'
+pass "cold creation revalidates every frozen VirtioFS source after image work"
+
+tests_run=$((tests_run + 1))
+new_case precreate_virtiofs_source_identity_after_final_scan
+AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
+late_swap_share="$case_dir/late-swap-share"
+mkdir "$late_swap_share"
+FAKE_REPLACE_DIRECTORY_ON_SYSCTL="$late_swap_share"
+FAKE_REPLACE_DIRECTORY_ON_SYSCTL_SNAPSHOT=2
+if run_program "$repo_root/bin/agent-container" run claude \
+  --share-ro "$late_swap_share" -- --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a VirtioFS source replaced after the final scan reached create"
+fi
+assert_contains "$case_dir/err" \
+  "VirtioFS source for the additional legacy share changed filesystem identity"
+assert_no_line "$case_log" 'ARG=create'
+[ -f "$late_swap_share/replacement-sentinel" ] \
+  && [ -d "$late_swap_share.original" ] \
+  || fail "the final-capacity fault did not replace the frozen test source"
+pass "all frozen VirtioFS identities are revalidated together after the final scan"
+
+tests_run=$((tests_run + 1))
+new_case precreate_legacy_stage_recount
+AGENT_CONTAINER_MAX_FILES=20
+build_gate="$case_dir/build.gate"
+build_marker="$case_dir/build.marker"
+gated_container="$case_dir/gated-container"
+: > "$build_gate"
+: > "$build_marker"
+write_build_gated_container "$gated_container"
+TEST_CONTAINER_BIN="$gated_container"
+TEST_FAKE_CONTAINER_REAL="$fixture_dir/container"
+TEST_FAKE_BUILD_GATE="$build_gate"
+TEST_FAKE_BUILD_MARKER="$build_marker"
+run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err" &
+background_pid=$!
+for build_wait_attempt in $(seq 1 3000); do
+  [ -s "$build_marker" ] && break
+  kill -0 "$background_pid" 2>/dev/null \
+    || fail "stage-recount launch exited before reaching image build"
+  sleep 0.01
+done
+[ -s "$build_marker" ] \
+  || fail "stage-recount launch did not reach image build"
+legacy_stage=""
+for stage_candidate in \
+  "$case_home/.agent-container/sessions"/session-*; do
+  [ -d "$stage_candidate" ] && [ ! -L "$stage_candidate" ] || continue
+  [ -z "$legacy_stage" ] \
+    || fail "legacy launch published more than one managed staging directory"
+  legacy_stage="$stage_candidate"
+done
+[ -n "$legacy_stage" ] \
+  || fail "legacy launch did not publish its managed staging directory"
+for generated_index in $(seq 1 21); do
+  touch "$legacy_stage/generated-during-build-$generated_index"
+done
+rm -f "$build_gate"
+set +e
+wait "$background_pid"
+stage_recount_status=$?
+set -e
+background_pid=""
+[ "$stage_recount_status" -ne 0 ] \
+  || fail "legacy staging growth bypassed the final entry budget"
+assert_contains "$case_dir/err" \
+  "ephemeral legacy session staging"
+assert_no_line "$case_log" 'ARG=create'
+pass "cold creation counts the actual legacy staging tree before create"
+
+tests_run=$((tests_run + 1))
+new_case precreate_singleton_shadow_home_recount
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_MAX_FILES=20
+build_gate="$case_dir/build.gate"
+build_marker="$case_dir/build.marker"
+gated_container="$case_dir/gated-container"
+: > "$build_gate"
+: > "$build_marker"
+write_build_gated_container "$gated_container"
+TEST_CONTAINER_BIN="$gated_container"
+TEST_FAKE_CONTAINER_REAL="$fixture_dir/container"
+TEST_FAKE_BUILD_GATE="$build_gate"
+TEST_FAKE_BUILD_MARKER="$build_marker"
+run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err" &
+background_pid=$!
+for build_wait_attempt in $(seq 1 3000); do
+  [ -s "$build_marker" ] && break
+  kill -0 "$background_pid" 2>/dev/null \
+    || fail "singleton recount launch exited before reaching image build"
+  sleep 0.01
+done
+[ -s "$build_marker" ] \
+  || fail "singleton recount launch did not reach image build"
+singleton_shadow_home="$case_home/.agent-container/profiles/claude/home"
+[ -d "$singleton_shadow_home" ] && [ ! -L "$singleton_shadow_home" ] \
+  || fail "cold singleton did not create its managed shadow HOME"
+for generated_index in $(seq 1 21); do
+  touch "$singleton_shadow_home/generated-during-build-$generated_index"
+done
+rm -f "$build_gate"
+set +e
+wait "$background_pid"
+singleton_recount_status=$?
+set -e
+background_pid=""
+[ "$singleton_recount_status" -ne 0 ] \
+  || fail "singleton shadow-HOME growth bypassed the final entry budget"
+assert_contains "$case_dir/err" \
+  "persistent 'claude' shadow HOME"
+assert_no_line "$case_log" 'ARG=create'
+for singleton_state_name in \
+  phase creator-pid agent-version image-digest config.sha256; do
+  [ ! -e "$case_home/.agent-container/profiles/claude/singleton/$singleton_state_name" ] \
+    || fail "a pre-create safety rejection retained stale singleton state: $singleton_state_name"
+done
+pass "cold singleton recounts HOME growth without publishing stale create state"
+
+tests_run=$((tests_run + 1))
+new_case low_file_baseline_preserves_soft_policy
+TEST_SINGLETON_LAUNCH=true
+FAKE_NUM_FILES=0
+FAKE_MAX_FILES=100
+FAKE_MAX_FILES_PER_PROC=1000
+run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" 'ARG=create'
+assert_not_contains "$case_dir/err" 'current host headroom'
+pass "a projection below the original 70% soft line is admitted without the recovery headroom rule"
+
+tests_run=$((tests_run + 1))
+new_case high_vnode_baseline_small_growth
+TEST_SINGLETON_LAUNCH=true
+FAKE_MAX_VNODES=1000
+FAKE_FREE_VNODES=290
+run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" 'ARG=create'
+assert_not_contains "$case_dir/err" 'current host headroom'
+pass "a pre-existing vnode cache above 70% permits only a genuinely small singleton mount"
+
+tests_run=$((tests_run + 1))
+new_case vnode_projection_is_monotonic_below_boundary
+FAKE_MAX_VNODES=1000
+FAKE_FREE_VNODES=301
+AGENT_CONTAINER_MAX_FILES=100
+# 12 workspace entries + 9 actual legacy-stage entries + the shadow-HOME
+# root + the conservative fixed overhead produce a 30-entry final projection.
+for generated_index in $(seq 1 12); do
+  touch "$case_workspace/generated-$generated_index"
+done
+run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_line "$case_log" 'ARG=create'
+assert_not_contains "$case_dir/err" 'current host headroom'
+pass "a 30-entry projection is admitted with 301 vnodes of headroom"
+
+tests_run=$((tests_run + 1))
+new_case vnode_projection_is_monotonic_above_boundary
+FAKE_MAX_VNODES=1000
+FAKE_FREE_VNODES=300
+AGENT_CONTAINER_MAX_FILES=100
+# Keep this tree identical to the admitted case so only host headroom changes.
+for generated_index in $(seq 1 12); do
+  touch "$case_workspace/generated-$generated_index"
+done
+if run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "the same projection should not become safer as host vnode use rises"
+fi
+assert_contains "$case_dir/err" 'current host headroom'
+assert_contains "$case_dir/err" 'vnodes 700/1000'
+assert_no_line "$case_log" 'ARG=create'
+pass "the same 30-entry projection is rejected with only 300 vnodes of headroom"
+
+tests_run=$((tests_run + 1))
+new_case high_vnode_baseline_rejects_growth
+FAKE_SYSTEM_RUNNING=false
+FAKE_MAX_VNODES=1000
+FAKE_FREE_VNODES=290
+AGENT_CONTAINER_MAX_FILES=100
+for generated_index in $(seq 1 25); do
+  touch "$case_workspace/generated-$generated_index"
+done
+if run_program "$repo_root/bin/claude-container" --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a high vnode baseline should reject a material new VirtioFS tree"
+fi
+assert_contains "$case_dir/err" 'current host headroom'
+assert_contains "$case_dir/err" 'vnodes 710/1000'
+assert_command_count "$case_log" system 1
+assert_no_line "$case_log" 'ARG=start'
+assert_no_line "$case_log" 'ARG=create'
+pass "high-baseline recovery rejects growth before starting stopped Apple services"
 
 tests_run=$((tests_run + 1))
 new_case service_preflight
 FAKE_SYSTEM_RUNNING=false
+FAKE_SYSTEM_START_OUTPUT='Launching container-apiserver; internal progress'
 run_program "$repo_root/bin/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"
 assert_contains "$case_dir/err" "starting them now"
+assert_not_contains "$case_dir/err" 'internal progress'
 assert_command_count "$case_log" system 3
 assert_line "$case_log" "ARG=start"
 assert_line "$case_log" "ARG=build"
-pass "stopped Apple services are started automatically and rechecked"
+pass "stopped Apple services start after local checks without leaking internal progress"
+
+tests_run=$((tests_run + 1))
+new_case service_delayed_readiness
+FAKE_SYSTEM_RUNNING=false
+FAKE_SYSTEM_STATUS_FAILURES_AFTER_START=2
+FAKE_SYSTEM_START_OUTPUT='machine API warming up internally'
+run_program "$repo_root/bin/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_command_count "$case_log" system 5
+assert_not_contains "$case_dir/err" 'machine API warming up internally'
+assert_line "$case_log" "ARG=build"
+pass "service startup tolerates bounded machine-API readiness lag without leaking progress"
 
 tests_run=$((tests_run + 1))
 new_case service_start_failure
 FAKE_SYSTEM_RUNNING=false
 FAKE_SYSTEM_START_FAIL=true
+FAKE_SYSTEM_START_OUTPUT='machine API startup failed internally'
 if run_program "$repo_root/bin/agent-container" claude --version \
   >"$case_dir/out" 2>"$case_dir/err"; then
   fail "a failed Apple service start should stop the launch"
 fi
 assert_contains "$case_dir/err" "Unable to start Apple container services"
+assert_contains "$case_dir/err" 'machine API startup failed internally'
 assert_no_line "$case_log" "ARG=build"
 pass "Apple service auto-start failures remain actionable and fail closed"
+
+tests_run=$((tests_run + 1))
+new_case service_readiness_failure
+FAKE_SYSTEM_RUNNING=false
+FAKE_SYSTEM_READY_AFTER_START=false
+FAKE_SYSTEM_START_OUTPUT='machine API remained unavailable after start'
+if run_program "$repo_root/bin/agent-container" claude --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "a successful start command without readiness should stop the launch"
+fi
+assert_contains "$case_dir/err" \
+  "Apple container services did not become ready"
+assert_contains "$case_dir/err" \
+  'machine API remained unavailable after start'
+assert_no_line "$case_log" "ARG=list"
+assert_no_line "$case_log" "ARG=build"
+pass "post-start readiness failures replay the suppressed startup diagnostics"
+
+tests_run=$((tests_run + 1))
+new_case singleton_control_service_preflight
+FAKE_SYSTEM_RUNNING=false
+run_program "$repo_root/bin/agent-container" singleton status claude \
+  >"$case_dir/out" 2>"$case_dir/err"
+assert_command_count "$case_log" system 3
+assert_command_count "$case_log" list 1
+assert_contains "$case_dir/out" 'claude singleton: stopped'
+pass "singleton control keeps service auto-start before its first native query"
 
 tests_run=$((tests_run + 1))
 new_case version_preflight
@@ -2146,6 +2898,7 @@ pass "minimum Apple container version is enforced"
 
 tests_run=$((tests_run + 1))
 new_case explicit_network_settings
+AGENT_CONTAINER_DEBIAN_MIRROR='http://mirror.example.test/debian'
 AGENT_CONTAINER_HTTP_PROXY='http://proxy.example.test:8080'
 AGENT_CONTAINER_NO_PROXY='localhost,127.0.0.1,example.test'
 AGENT_CONTAINER_DNS1='1.1.1.1'
@@ -2158,11 +2911,34 @@ assert_line "$case_log" "ARG=NO_PROXY=localhost,127.0.0.1,example.test"
 assert_line "$case_log" "ARG=--dns"
 assert_line "$case_log" "ARG=1.1.1.1"
 assert_line "$case_log" "ARG=TZ=Asia/Singapore"
+assert_line "$case_log" 'ARG=DEBIAN_MIRROR=http://mirror.example.test/debian'
+assert_contains "$repo_root/runtime/Containerfile" \
+  's|^URIs: ${DEBIAN_MIRROR}$|URIs: http://deb.debian.org/debian|'
+assert_contains "$repo_root/runtime/Containerfile" \
+  "grep -Fqx 'URIs: http://deb.debian.org/debian'"
+assert_contains "$repo_root/runtime/Containerfile" \
+  "grep -Fqx 'URIs: http://deb.debian.org/debian-security'"
 assert_line "$case_curl_log" "FIRST_ARG=--disable"
 assert_line "$case_curl_log" "PROXY_SET=true"
 assert_line "$case_curl_log" "PROXY="
 assert_line "$case_curl_log" "NOPROXY=localhost,127.0.0.1,example.test"
-pass "HTTP proxy, DNS, and timezone enter only through explicit generic settings"
+pass "build-only Debian mirror, HTTP proxy, DNS, and timezone stay explicitly scoped"
+
+tests_run=$((tests_run + 1))
+new_case https_debian_mirror_rejected
+AGENT_CONTAINER_VERSION=0.146.0
+AGENT_CONTAINER_DEBIAN_MIRROR='https://mirror.example.test/debian'
+if run_program "$repo_root/bin/agent-container" codex --version \
+  >"$case_dir/out" 2>"$case_dir/err"; then
+  fail "an HTTPS Debian mirror should fail before the bootstrap build"
+fi
+assert_contains "$case_dir/err" \
+  "must use http:// because the pinned Debian slim base has no bootstrap TLS trust store"
+assert_no_line "$case_log" "ARG=system"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=create"
+unset AGENT_CONTAINER_DEBIAN_MIRROR
+pass "HTTPS Debian mirrors fail before services or an untrusted bootstrap build"
 
 tests_run=$((tests_run + 1))
 new_case latest_lookup_https_proxy_policy
@@ -2218,6 +2994,7 @@ new_case network_control_characters_rejected
 AGENT_CONTAINER_VERSION=0.146.0
 for control_setting_name in \
   AGENT_CONTAINER_HTTP_PROXY \
+  AGENT_CONTAINER_DEBIAN_MIRROR \
   AGENT_CONTAINER_NO_PROXY \
   AGENT_CONTAINER_TZ \
   AGENT_CONTAINER_CPUS \
@@ -2236,6 +3013,19 @@ for control_setting_name in \
   unset "$control_setting_name"
   : > "$case_log"
 done
+
+AGENT_CONTAINER_DEBIAN_MIRROR='http://mirror.example.test/debian?channel=stable'
+if run_program "$repo_root/bin/codex-container" --version \
+  >"$case_dir/invalid-mirror.out" \
+  2>"$case_dir/invalid-mirror.err"; then
+  fail "a Debian mirror URL with a query should fail closed"
+fi
+assert_contains "$case_dir/invalid-mirror.err" \
+  "without credentials, query parameters, fragments, or a trailing slash"
+assert_no_line "$case_log" "ARG=build"
+assert_no_line "$case_log" "ARG=create"
+unset AGENT_CONTAINER_DEBIAN_MIRROR
+: > "$case_log"
 
 control_setting_name=AGENT_CONTAINER_HTTP_PROXY
 control_setting_value=$(printf 'safe\033forged-field=value')
@@ -2832,28 +3622,35 @@ mkdir -p "$singleton_project_a" "$singleton_project_b"
 run_program_from "$singleton_project_a" \
   "$repo_root/bin/grok-container" from-a "two words" \
   >"$case_dir/a.out" 2>"$case_dir/a.err"
+FAKE_MAX_VNODES=1000
+FAKE_FREE_VNODES=50
 run_program_from "$singleton_project_b" \
   "$repo_root/bin/grok-container" from-b "" \
   >"$case_dir/b.out" 2>"$case_dir/b.err"
+FAKE_NUM_FILES=not-a-number
+run_program_from "$singleton_project_a" \
+  "$repo_root/bin/grok-container" from-a-again \
+  >"$case_dir/a-again.out" 2>"$case_dir/a-again.err"
 
 [ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 1 ] \
   || fail "two Grok workspaces created more than one singleton"
 [ "$(grep -Fxc -- 'ARG=start' "$case_log")" -eq 1 ] \
   || fail "the warm Grok attach restarted its singleton"
-[ "$(grep -Fxc -- 'ARG=/usr/local/bin/agent-workspace-session' "$case_log")" -eq 2 ] \
-  || fail "two Grok workspaces did not receive two isolated exec sessions"
-[ "$(grep -Fxc -- "ARG=$singleton_project_a" "$case_log")" -eq 2 ] \
+[ "$(grep -Fxc -- 'ARG=/usr/local/bin/agent-workspace-session' "$case_log")" -eq 3 ] \
+  || fail "three Grok clients did not receive isolated exec sessions"
+[ "$(grep -Fxc -- "ARG=$singleton_project_a" "$case_log")" -eq 4 ] \
   || fail "workspace A root and cwd were not isolated in its exec"
 [ "$(grep -Fxc -- "ARG=$singleton_project_b" "$case_log")" -eq 2 ] \
   || fail "workspace B root and cwd were not isolated in its exec"
 assert_line "$case_log" 'ARG=from-a'
 assert_line "$case_log" 'ARG=two words'
 assert_line "$case_log" 'ARG=from-b'
+assert_line "$case_log" 'ARG=from-a-again'
 assert_no_line "$case_log" "ARG=$singleton_project_a:$singleton_project_a"
 assert_no_line "$case_log" "ARG=$singleton_project_b:$singleton_project_b"
 run_program "$repo_root/bin/agent-container" singleton stop grok \
   >"$case_dir/stop.out" 2>"$case_dir/stop.err"
-pass "A and B reuse one Grok VM with independent cwd, arguments, and exec sessions"
+pass "warm A/B clients reuse one VM without recharging its mount or requiring host capacity counters"
 
 tests_run=$((tests_run + 1))
 new_case singleton_warm_latest_is_pinned
@@ -2890,8 +3687,11 @@ slow_watchdog_marker="$case_dir/slow-broker.watchdog-stopped"
 slow_broker_lock_fd_marker="$case_dir/slow-broker.lock-fd-closed"
 slow_watchdog_lock_fd_marker="$case_dir/slow-broker-watchdog.lock-fd-closed"
 mkdir -p "$slow_release" "$slow_test_bin"
-cp "$repo_root/target/release/agent-container-launcher" \
-  "$slow_release/agent-container-bin"
+if [ -n "$test_launcher_override" ]; then
+  ln -s "$test_launcher_override" "$slow_release/agent-container-bin"
+else
+  cp "$test_launcher_binary" "$slow_release/agent-container-bin"
+fi
 cp "$repo_root/runtime/agent-container-runtime" \
   "$slow_release/agent-container-runtime"
 : > "$slow_broker_gate"
@@ -2914,7 +3714,7 @@ printf '%s\n' 0 > "$slow_poll_count"
   printf 'rm -f -- %q\n' "$slow_broker_active"
   printf 'printf "%%s\\n" started > %q\n' "$slow_broker_marker"
   printf 'exec %q "$@"\n' \
-    "$repo_root/target/release/agent-container-launcher"
+    "$test_launcher_binary"
 } > "$slow_release/agent-container-darwin-arm64"
 {
   printf '%s\n' '#!/bin/bash'
@@ -2945,11 +3745,12 @@ printf '%s\n' 0 > "$slow_poll_count"
   printf '%s\n' 'exec /bin/sleep "$@"'
 } > "$slow_test_bin/sleep"
 chmod 0755 \
-  "$slow_release/agent-container-bin" \
   "$slow_release/agent-container" \
   "$slow_release/agent-container-runtime" \
   "$slow_release/agent-container-darwin-arm64" \
   "$slow_test_bin/sleep"
+[ -L "$slow_release/agent-container-bin" ] \
+  || chmod 0755 "$slow_release/agent-container-bin"
 # Installed releases resolve the physical workspace launcher from the asset
 # directory, which the installer always stages alongside the runtime. Model
 # that layout so the delayed fake is the launcher this case dispatches.
@@ -3063,6 +3864,191 @@ assert_contains "$case_dir/second.err" \
 run_program "$repo_root/bin/agent-container" singleton stop grok \
   >"$case_dir/stop.out" 2>"$case_dir/stop.err"
 pass "a verified stopped singleton is safely deleted and recreated"
+
+tests_run=$((tests_run + 1))
+new_case singleton_stopped_growth_retained_before_delete
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+AGENT_CONTAINER_MAX_FILES=20
+run_program "$repo_root/bin/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+cp "$case_home/fake-created-container.json.stopped" \
+  "$case_home/fake-created-container.json"
+singleton_shadow_home="$case_home/.agent-container/profiles/grok/home"
+FAKE_GROW_DIRECTORY_AFTER_STOPPED_INSPECT="$singleton_shadow_home"
+FAKE_GROW_DIRECTORY_ENTRY_COUNT=21
+if run_program "$repo_root/bin/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"; then
+  fail "stopped recreation deleted its recoverable container after HOME outgrew the budget"
+fi
+assert_contains "$case_dir/second.err" \
+  "persistent 'grok' shadow HOME"
+assert_command_count "$case_log" delete 0
+[ -f "$case_home/fake-created-container.json" ] \
+  || fail "pre-delete rejection did not retain the stopped native singleton"
+for retained_singleton_record in \
+  phase creator-pid agent-version image-digest config.sha256; do
+  [ -f "$case_home/.agent-container/profiles/grok/singleton/$retained_singleton_record" ] \
+    || fail "pre-delete rejection removed existing singleton state: $retained_singleton_record"
+done
+pass "stopped recreation re-counts HOME and retains the native singleton before deletion"
+
+tests_run=$((tests_run + 1))
+new_case singleton_stopped_recreation_with_ssh
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+AGENT_CONTAINER_MOUNT_SSH_CONFIG=true
+mkdir -p "$case_home/.ssh"
+chmod 0700 "$case_home/.ssh"
+printf '%s\n' 'Host example.test' '  User git' > "$case_home/.ssh/config"
+chmod 0600 "$case_home/.ssh/config"
+run_program "$repo_root/bin/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+cp "$case_home/fake-created-container.json.stopped" \
+  "$case_home/fake-created-container.json"
+run_program "$repo_root/bin/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 2 ] \
+  || fail "a stopped singleton with SSH staging was not recreated exactly once"
+run_program "$repo_root/bin/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "stopped recreation preserves the frozen nested SSH staging identity"
+
+tests_run=$((tests_run + 1))
+new_case singleton_stopped_missing_ssh_is_retained
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+AGENT_CONTAINER_MOUNT_SSH_CONFIG=true
+mkdir -p "$case_home/.ssh"
+chmod 0700 "$case_home/.ssh"
+printf '%s\n' 'Host example.test' '  User git' > "$case_home/.ssh/config"
+chmod 0600 "$case_home/.ssh/config"
+run_program "$repo_root/bin/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+cp "$case_home/fake-created-container.json.stopped" \
+  "$case_home/fake-created-container.json"
+rm -f "$case_home/.agent-container/profiles/grok/singleton/guest-stage/ssh/config"
+rmdir "$case_home/.agent-container/profiles/grok/singleton/guest-stage/ssh"
+if run_program "$repo_root/bin/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"; then
+  fail "recreation accepted a missing frozen SSH staging source"
+fi
+assert_contains "$case_dir/second.err" \
+  "SSH metadata staging is no longer a real directory"
+assert_command_count "$case_log" delete 0
+run_program "$repo_root/bin/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "missing frozen nested staging is rejected before native deletion"
+
+tests_run=$((tests_run + 1))
+new_case singleton_stopped_recreation_stage_replaced_after_delete
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+run_program "$repo_root/bin/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+cp "$case_home/fake-created-container.json.stopped" \
+  "$case_home/fake-created-container.json"
+singleton_stage="$case_home/.agent-container/profiles/grok/singleton/guest-stage"
+FAKE_REPLACE_DIRECTORY_AFTER_DELETE="$singleton_stage"
+if run_program "$repo_root/bin/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"; then
+  fail "recreation accepted a replaced staging source after native deletion"
+fi
+assert_contains "$case_dir/second.err" "changed filesystem identity"
+assert_contains "$case_dir/second.err" \
+  "verified stopped 'grok' singleton was already deleted; no replacement container was created"
+assert_contains "$case_dir/second.err" \
+  "retained untrusted managed paths under '$case_home/.agent-container/profiles/grok/singleton'"
+assert_command_count "$case_log" delete 1
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 1 ] \
+  || fail "a replacement container was created after staging identity changed"
+[ -f "$singleton_stage/replacement-sentinel" ] \
+  && [ -d "$singleton_stage.original" ] \
+  || fail "cleanup deleted a replaced or original singleton staging tree"
+for inactive_singleton_record in \
+  phase creator-pid agent-version image-digest config.sha256; do
+  [ ! -e "$case_home/.agent-container/profiles/grok/singleton/$inactive_singleton_record" ] \
+    || fail "cleanup retained stale singleton state record: $inactive_singleton_record"
+done
+[ ! -d "$case_home/.agent-container/session.lock" ] \
+  && [ ! -d "$case_home/.agent-container/profiles/grok/session.lock" ] \
+  && [ ! -d "$case_home/.local/share/.agent-container.install.lock" ] \
+  || fail "failed recreation left a global, profile, or lifecycle lock"
+if find "$case_home/.agent-container/sessions" -mindepth 1 -print -quit \
+  | grep -q .; then
+  fail "failed recreation left per-session staging"
+fi
+pass "post-delete source replacement retains untrusted data but clears safe state and locks"
+
+tests_run=$((tests_run + 1))
+new_case singleton_stopped_recreation_root_replaced_after_delete
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+run_program "$repo_root/bin/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+cp "$case_home/fake-created-container.json.stopped" \
+  "$case_home/fake-created-container.json"
+singleton_root="$case_home/.agent-container/profiles/grok/singleton"
+FAKE_REPLACE_DIRECTORY_AFTER_DELETE="$singleton_root"
+FAKE_REPLACEMENT_SINGLETON_RECORDS=true
+if run_program "$repo_root/bin/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"; then
+  fail "recreation accepted a replaced singleton state root after native deletion"
+fi
+assert_contains "$case_dir/second.err" \
+  "Singleton state root changed filesystem identity"
+assert_contains "$case_dir/second.err" \
+  "Could not safely clear inactive singleton state records"
+assert_command_count "$case_log" delete 1
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 1 ] \
+  || fail "a replacement container was created after the state root changed"
+[ -f "$singleton_root/replacement-sentinel" ] \
+  && [ -d "$singleton_root.original" ] \
+  || fail "cleanup deleted a replaced or original singleton state root"
+for replacement_singleton_record in \
+  phase creator-pid agent-version image-digest config.sha256; do
+  assert_line "$singleton_root/$replacement_singleton_record" \
+    foreign-replacement-record
+done
+[ ! -d "$case_home/.agent-container/session.lock" ] \
+  && [ ! -d "$case_home/.agent-container/profiles/grok/session.lock" ] \
+  && [ ! -d "$case_home/.local/share/.agent-container.install.lock" ] \
+  || fail "state-root replacement left a global, profile, or lifecycle lock"
+pass "post-delete state-root replacement is retained without deleting foreign records"
+
+tests_run=$((tests_run + 1))
+new_case singleton_stopped_recreation_with_hosts
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+AGENT_CONTAINER_HOST_ALIAS=host-service.example.test
+run_program "$repo_root/bin/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+cp "$case_home/fake-created-container.json.stopped" \
+  "$case_home/fake-created-container.json"
+run_program "$repo_root/bin/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 2 ] \
+  || fail "a stopped singleton with hosts staging was not recreated exactly once"
+run_program "$repo_root/bin/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "stopped recreation preserves the frozen hosts-file identity"
+
+tests_run=$((tests_run + 1))
+new_case singleton_stopped_recreation_with_blocked_hosts
+TEST_SINGLETON_LAUNCH=true
+AGENT_CONTAINER_VERSION=0.2.114
+AGENT_CONTAINER_BLOCK_HOST=blocked-service.example.test
+run_program "$repo_root/bin/grok-container" first-client \
+  >"$case_dir/first.out" 2>"$case_dir/first.err"
+cp "$case_home/fake-created-container.json.stopped" \
+  "$case_home/fake-created-container.json"
+run_program "$repo_root/bin/grok-container" second-client \
+  >"$case_dir/second.out" 2>"$case_dir/second.err"
+[ "$(grep -Fxc -- 'ARG=create' "$case_log")" -eq 2 ] \
+  || fail "a stopped singleton with blocked-host staging was not recreated exactly once"
+run_program "$repo_root/bin/agent-container" singleton stop grok \
+  >"$case_dir/stop.out" 2>"$case_dir/stop.err"
+pass "blocked-host-only staging is Bash-3-safe across stopped recreation"
 
 tests_run=$((tests_run + 1))
 new_case singleton_config_change_fails_closed
@@ -3313,6 +4299,12 @@ new_case real_pty
 run_program "$repo_root/bin/agent-container" claude --version \
   >"$case_dir/warm.out" 2>"$case_dir/warm.err"
 : > "$case_log"
+pty_launcher=(/bin/bash "$repo_root/bin/agent-container")
+pty_asset_dir="$repo_root/runtime"
+if [ -n "$test_launcher_override" ]; then
+  pty_launcher=("$test_root/agent-container")
+  pty_asset_dir=$test_override_asset_dir
+fi
 if ! (
   cd "$case_workspace"
   exec /usr/bin/env -i \
@@ -3325,9 +4317,9 @@ if ! (
     FAKE_IMAGE_STATE_DIR="$case_home/fake-images" \
     FAKE_READ_STDIN=true \
     /usr/bin/python3 "$repo_root/tests/pty-run.py" \
-      /bin/bash "$repo_root/bin/agent-container" \
+      "${pty_launcher[@]}" \
         --container-bin "$fixture_dir/container" \
-        --container-assets "$repo_root/runtime" \
+        --container-assets "$pty_asset_dir" \
         --container-host-gateway 127.0.0.1 \
         --container-openssl "$fixture_dir/openssl" \
         --container-security "$fixture_dir/security" \

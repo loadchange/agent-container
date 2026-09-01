@@ -433,18 +433,22 @@ set -e
 pass 'client bounds cleanup when the host exits before caller stdin closes'
 
 # Basename invocation with no argv exercises Bash 3.2 + nounset empty-array
-# behavior. Empty non-TTY stdin makes `node` exit without entering a REPL.
-set +e
-( CDPATH= cd -- "$workspace" \
-    && AGENT_HOST_EXEC_DIR="$session_dir" \
-      /bin/bash -c "$client_source" node ) \
-  < /dev/null > "$client_stdout" 2> "$client_stderr"
-zero_argv_status=$?
-set -e
-[ "$zero_argv_status" -eq 0 ] \
-  || fail "basename/zero-argv invocation returned $zero_argv_status: $(sed -n '1,3p' "$client_stderr")"
-[ ! -s "$client_stdout" ] && [ ! -s "$client_stderr" ] \
-  || fail 'basename/zero-argv invocation produced unexpected output'
+# behavior. Empty non-TTY stdin makes `node` exit without entering a REPL;
+# repetition also catches deferred sender job notifications from the preceding
+# blocked-input cleanup.
+for zero_argv_attempt in 1 2 3 4 5; do
+  set +e
+  ( CDPATH= cd -- "$workspace" \
+      && AGENT_HOST_EXEC_DIR="$session_dir" \
+        /bin/bash -c "$client_source" node ) \
+    < /dev/null > "$client_stdout" 2> "$client_stderr"
+  zero_argv_status=$?
+  set -e
+  [ "$zero_argv_status" -eq 0 ] \
+    || fail "basename/zero-argv invocation $zero_argv_attempt returned $zero_argv_status: $(sed -n '1,3p' "$client_stderr")"
+  [ ! -s "$client_stdout" ] && [ ! -s "$client_stderr" ] \
+    || fail "basename/zero-argv invocation $zero_argv_attempt produced unexpected output (stdout: $(sed -n '1,3p' "$client_stdout"); stderr: $(sed -n '1,3p' "$client_stderr"))"
+done
 pass 'command basename invocation supports zero argv under macOS Bash'
 
 set +e
@@ -503,6 +507,41 @@ set -e
 [ "$gh_gitconfig_status" -ne 0 ] && [ ! -s "$client_stdout" ] \
   || fail 'host gh unexpectedly read Git configuration outside its scope'
 pass 'host gh cannot read real-home files outside ~/.config/gh'
+
+set +e
+( CDPATH= cd -- "$workspace" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
+      /bin/bash -c "$client_source" host-exec \
+        gh auth login -h github.com ) \
+  < /dev/null > "$client_stdout" 2> "$client_stderr"
+gh_auth_mutation_status=$?
+set -e
+[ "$gh_auth_mutation_status" -eq 125 ] && [ ! -s "$client_stdout" ] \
+  || fail "guest gh auth mutation returned $gh_auth_mutation_status instead of a host-setup error"
+grep -Fq 'HOST_SETUP_REQUIRED' "$client_stderr" \
+  || fail "guest gh auth mutation lacked its structured error: $(sed -n '1,3p' "$client_stderr")"
+grep -Fq 'normal macOS terminal' "$client_stderr" \
+  || fail "guest gh auth mutation lacked host-side remediation: $(sed -n '1,3p' "$client_stderr")"
+pass 'GitHub authentication mutations point to a normal macOS terminal'
+
+set +e
+( CDPATH= cd -- "$unshared_root" \
+    && AGENT_HOST_EXEC_DIR="$session_dir" \
+      /bin/bash -c "$client_source" host-exec node --version ) \
+  < /dev/null > "$client_stdout" 2> "$client_stderr"
+outside_cwd_status=$?
+set -e
+[ "$outside_cwd_status" -eq 125 ] \
+  || fail "out-of-root cwd returned $outside_cwd_status instead of protocol status 125"
+grep -Fq 'CWD_DENIED' "$client_stderr" \
+  || fail "out-of-root cwd lacked CWD_DENIED: $(sed -n '1,3p' "$client_stderr")"
+grep -Fq "$workspace" "$client_stderr" \
+  || fail "out-of-root cwd did not name the admitted workspace: $(sed -n '1,3p' "$client_stderr")"
+grep -Fq -- '--container-workspace-root' "$client_stderr" \
+  || fail "out-of-root cwd lacked the sibling-repository remedy: $(sed -n '1,3p' "$client_stderr")"
+grep -Fq -- '--share-ro/--share-rw' "$client_stderr" \
+  || fail "out-of-root cwd lacked the legacy-run remedy: $(sed -n '1,3p' "$client_stderr")"
+pass 'out-of-root host commands name their admitted root and mode-specific launcher remedies'
 
 # Identity commands receive the launcher-controlled agent socket and can
 # request signatures from inside the sandbox; the private key file itself

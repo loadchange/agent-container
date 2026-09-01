@@ -1,6 +1,35 @@
 #!/bin/bash
+set -euo pipefail
+
 case "${*: -1}" in
-  kern.num_files) echo "${FAKE_NUM_FILES:-1000}" ;;
+  kern.num_files)
+    if [ -n "${FAKE_REPLACE_DIRECTORY_ON_SYSCTL:-}" ]; then
+      snapshot_state="${FAKE_SYSCTL_SNAPSHOT_STATE:?FAKE_SYSCTL_SNAPSHOT_STATE is required}"
+      snapshot_count=0
+      if [ -s "$snapshot_state" ]; then
+        snapshot_count=$(cat "$snapshot_state")
+      fi
+      case "$snapshot_count:${FAKE_REPLACE_DIRECTORY_ON_SYSCTL_SNAPSHOT:-}" in
+        *[!0-9:]*) exit 64 ;;
+      esac
+      snapshot_count=$((snapshot_count + 1))
+      printf '%s\n' "$snapshot_count" > "$snapshot_state"
+      if [ "$snapshot_count" -eq "${FAKE_REPLACE_DIRECTORY_ON_SYSCTL_SNAPSHOT:-0}" ]; then
+        replaced_directory="$FAKE_REPLACE_DIRECTORY_ON_SYSCTL"
+        original_directory="$replaced_directory.original"
+        [ -d "$replaced_directory" ] \
+          && [ ! -L "$replaced_directory" ] \
+          && [ ! -e "$original_directory" ] \
+          && [ ! -L "$original_directory" ] \
+          || exit 79
+        mv "$replaced_directory" "$original_directory"
+        mkdir "$replaced_directory"
+        printf '%s\n' replaced-during-final-capacity \
+          > "$replaced_directory/replacement-sentinel"
+      fi
+    fi
+    echo "${FAKE_NUM_FILES:-1000}"
+    ;;
   kern.maxfiles) echo "${FAKE_MAX_FILES:-100000}" ;;
   kern.maxfilesperproc) echo "${FAKE_MAX_FILES_PER_PROC:-60000}" ;;
   kern.maxvnodes) echo "${FAKE_MAX_VNODES:-200000}" ;;

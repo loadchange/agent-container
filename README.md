@@ -59,23 +59,26 @@ default path therefore does not pre-mount project A, project B, a common parent,
 or a configured root list. For each invocation, the launcher:
 
 1. resolves the current Git top-level directory, or the current directory when
-   outside Git;
+   outside Git, unless that invocation explicitly selects a containing root
+   with `--container-workspace-root`;
 2. starts a one-connection Rust workspace broker on macOS;
 3. starts a per-client host-tool broker that mirrors the complete host PATH
    catalog into the guest: `git` and `gh` default to sandboxed host
    executables with the host identity and credentials, and every host command
-   the guest image does not provide (node, npm, npx, uv, cargo, ...) runs as
+   the guest image does not provide (uv, cargo, go, ...) runs as
    the corresponding sandboxed host executable;
 4. starts `container exec` in a private guest mount namespace;
-5. mounts that one host project at the same absolute path through SSHFS and raw
-   SFTP;
+5. mounts that one effective host workspace root at the same absolute path
+   through SSHFS and raw SFTP;
 6. changes to the caller's original cwd and starts a fresh Agent process as the
    host numeric UID/GID;
 7. unmounts the workspace and exits both brokers when that Agent process ends.
 
 This makes project switching dynamic. No root registration, root environment
 variable, or singleton restart is needed when moving between ordinary Git
-repositories.
+repositories. The optional workspace-root override is per invocation and
+widens both SFTP access and the host-tool sandbox for that client only; it does
+not become a persistent mount or silently affect another client.
 
 The private mount namespace prevents one client's SSHFS mount from appearing in
 another client's normal filesystem view. Clients of the same profile still
@@ -115,7 +118,9 @@ container system start
 
 You normally do not need to run `container system start` yourself. Every Claude,
 Codex, or Grok launch checks the service, starts it once when it is stopped, and
-verifies that it became ready before touching images or singleton containers.
+waits up to five seconds for the machine API before touching images or
+singleton containers. Successful internal startup progress stays quiet; on a
+start or readiness failure, the launcher replays the captured diagnostics.
 
 `agent-container` does not install, upgrade, or reconfigure Apple's service.
 Updating Apple `container` does not require rebuilding profile images: each
@@ -218,13 +223,22 @@ All three profiles are enabled normally; Grok needs no special opt-in. The host
 resolves a floating publisher channel to one exact version before deciding
 whether an image is reusable. Claude and Grok install one native ELF; Codex
 retains its complete standalone tree because its executable depends on adjacent
-helpers and resources. Node.js and npm are not installed in the normal Agent
-image; the host installations serve those commands through the default
-host-tool broker, which a host Node.js runtime powers. Its absence only
-degrades that channel to the guest binaries.
+helpers and resources. The normal Agent image also pins the Node.js 22.20.0
+archive and pnpm 11.7.0, includes Node's npm/Corepack, and verifies Debian
+Python 3.11 or newer at build time. JavaScript builds therefore stay in the
+Linux guest, and subprocesses launched with a clean system PATH see the guest
+Python rather than a macOS fallback. Corepack's exact pnpm payload lives in a
+shared read-only image directory and runtime Corepack downloads are disabled.
+pnpm's rebuildable store, cache, and state live in the singleton's writable
+guest layer under `/var/lib/agent-container/pnpm`, so neither first use nor a
+large install can repopulate a profile's VirtioFS-backed shadow HOME. A verified
+host Node.js runtime powers the optional host-tool broker; if it is unavailable,
+the native guest toolchain remains usable.
 
-The first invocation may build the image and create the profile singleton. A
-version probe is a convenient prebuild:
+The first invocation may build the image and create the profile singleton.
+Build progress uses Apple's automatic renderer, which stays compact in a real
+terminal while retaining plain diagnostic output when redirected. A version
+probe is a convenient prebuild:
 
 ```bash
 claude-container --version
@@ -296,19 +310,46 @@ running singleton differs from newly requested settings or a publisher channel
 has moved, stop that profile and launch it again. The launcher fails closed
 instead of silently attaching to a differently configured VM.
 
-### Linked worktrees
+### Sibling and linked dependencies
 
-The dynamic default transports one Git root. A linked worktree whose Git common
-directory is outside that root currently needs the advanced `run` path, which
-can mount both paths with Apple volumes. Stop the profile singleton first:
+The dynamic default transports one Git root. When a repository deliberately
+uses sibling checkouts or `link:../...` dependencies, select the narrowest
+common ancestor explicitly for that singleton invocation. For example, with
+these sibling trees:
 
-```bash
-agent-container singleton stop codex
-codex-container run --
+```text
+/Users/alice/work/sample-app
+/Users/alice/work/shared-harness
 ```
 
-Ordinary repositories, nested directories, and switching between unrelated Git
-roots need no special configuration.
+launch from `sample-app` with:
+
+```bash
+cd /Users/alice/work/sample-app
+claude-container \
+  --container-workspace-root /Users/alice/work
+```
+
+The effective SFTP mount and host-exec sandbox now cover the complete `work`
+directory, not only those two repositories. Every other sibling
+under that directory is therefore also readable and writable by the Agent.
+Choose a narrower purpose-built parent when that broader authority is not
+acceptable.
+
+The selected path must name an absolute existing directory; its canonical
+directory must contain both the caller's cwd and the detected Git root.
+Filesystem root `/`, the complete real HOME, and any root that overlaps private
+`~/.agent-container` state are rejected. The launcher never follows a manifest
+link or widens authority automatically: selecting the reviewed parent always
+requires this option on the affected invocation.
+
+`--container-workspace-root` applies only to the normal persistent singleton
+path and is rejected by legacy `run`. It still carries one root over
+SFTP/SSHFS, so it does not create an Apple VirtioFS workspace mount. A linked
+Git worktree or dependency layout that cannot place all required paths under
+one acceptable root still needs the advanced `run` path and its separately
+reviewed shares. Ordinary repositories, nested directories, and switching
+between unrelated Git roots need no special configuration.
 
 ## Workspace transport and semantics
 
@@ -316,8 +357,9 @@ The default workspace channel is not SSH login. The Rust broker generates a
 random 256-bit token, binds one ephemeral TCP port, accepts one connection, and
 requires a bounded authentication line within five seconds. It then runs
 `/usr/libexec/sftp-server` inside a default-deny macOS `sandbox-exec` profile
-whose writable filesystem scope is the canonical project root. The broker does
-not start a shell, accept commands, expose HOME, or provide a reusable daemon.
+whose writable filesystem scope is the effective workspace root. The broker
+does not start a shell, accept commands, expose HOME, or provide a reusable
+daemon.
 
 The guest's SSHFS transport sends the authentication frame and then forwards an
 unmodified SFTP byte stream. The token is not placed in an argv vector and is
@@ -348,16 +390,19 @@ By default, every client's guest PATH mirrors the complete host command
 catalog through an authenticated host-tool broker. Working inside the
 container is intended to feel like working in a host terminal:
 
-- commands the verified guest image provides (bash, coreutils, rg, jq, ...)
+- commands the verified guest image provides (bash, coreutils, Python 3.11+,
+  Node.js 22.20.0, npm, Corepack, pnpm 11.7.0, rg, jq, ...)
   run natively in the guest at full speed;
-- commands the guest does not provide (node, npm, npx, uv, cargo, go, ...)
+- commands the guest does not provide (uv, cargo, go, ...)
   resolve to per-session shims that run the corresponding **host**
   executables — the host's exact versions and caches — against the same
   workspace path on the real filesystem;
 - `git` and `gh` are host-first: they shadow the guest copies and operate
   with the operator's real Git configuration, credential helpers, and GitHub
-  CLI login, so `git push` and `gh pr create` work exactly as they do in a
-  host terminal.
+  CLI login, so an already-authenticated `git push` or `gh pr create` behaves
+  as it does in a host terminal. GitHub authentication files remain read-only;
+  `gh auth login`, `refresh`, `logout`, and `setup-git` instead tell you to run
+  the command in a normal macOS terminal.
 
 The launcher freezes the host PATH directories and policy into a catalog
 specification; the broker expands it in-process (no per-command fork/exec
@@ -368,7 +413,7 @@ around the guest PATH.
 The channel keeps its original security shape:
 
 - each proxied process runs under a generated macOS `sandbox-exec` profile
-  whose only writable trees are the current workspace root and the isolated
+  whose only writable trees are the effective workspace root and the isolated
   broker execution HOME — never the real host HOME;
 - only `git` and `gh` receive the real HOME; every other proxied command runs
   with the isolated execution HOME, so host credentials and dotfiles stay
@@ -382,9 +427,15 @@ The channel keeps its original security shape:
   never proxied; `--container-host-exec-deny` removes further names and
   `--container-host-exec-first` promotes names over guest copies.
 
-Because host tools operate on the real project directory, I/O-heavy work
-(`git status`, `npm install`, `uv sync`, test runs) avoids SFTP round-trips
-entirely. Each proxied invocation still crosses the broker channel
+Because proxied host tools operate on the real project directory, their
+I/O-heavy work (`git status`, `uv sync`, host Cargo/Go builds) avoids SFTP
+round-trips entirely. Node/npm/pnpm and their tests run natively in the guest
+against the SSHFS workspace so child processes use the same Linux toolchain.
+The pinned pnpm payload is already present in a shared read-only Corepack cache;
+its mutable store/cache/state remain in the container-local writable layer. It
+neither downloads Corepack itself on first use nor consumes the shadow-HOME
+VirtioFS entry budget.
+Each proxied invocation still crosses the broker channel
 (~0.2 s per command start); host-side processes, PIDs, and listening ports
 live on macOS, not in the guest, and interactive TTY programs (REPLs,
 `npm login`) are not forwarded yet.
@@ -405,9 +456,10 @@ prerequisite) is unavailable, the default launch prints one warning and falls
 back to the guest binaries; passing `--container-host-tools` explicitly makes
 the same condition fail closed instead. `--no-container-host-tools` disables
 the channel and silences the warning. A host `gh` login stored only in the
-macOS Keychain may not be readable under the sandbox; use
-`gh auth login --insecure-storage`, `GH_TOKEN` forwarding, or the guest `gh`
-login in that case.
+macOS Keychain may not be readable under the sandbox. Run any `gh auth login`
+or `refresh` operation (including hostname and storage options) in a normal
+macOS terminal, forward `GH_TOKEN`, or disable host tools and use the guest
+`gh` configuration instead.
 
 ## Configuration: `--container-*`
 
@@ -427,6 +479,7 @@ Boolean options use `--container-<name>` and `--no-container-<name>`.
 | `--container-build-memory VALUE` | `4g` | Memory for Apple's shared image builder when created |
 | `--container-version VALUE` | profile channel | `latest` or one exact native version |
 | `--container-base-image VALUE` | pinned Debian Bookworm slim digest | Alternate safe OCI base or mirror reference |
+| `--container-debian-mirror URL` | Debian official main repository | Explicit HTTP Debian main-repository transport used only when an image build is required; Debian security remains official |
 | `--container-http-proxy VALUE` | unset | Builder and guest HTTP proxy |
 | `--container-https-proxy VALUE` | unset | Host HTTPS channel, builder, and guest HTTPS proxy |
 | `--container-all-proxy VALUE` | unset | Host channel fallback, builder, and guest all-protocol proxy |
@@ -435,6 +488,7 @@ Boolean options use `--container-<name>` and `--no-container-<name>`.
 | `--container-dns1 VALUE` | unset | Primary build/guest DNS server |
 | `--container-dns2 VALUE` | unset | Secondary build/guest DNS server |
 | `--container-timezone VALUE` | unset | Guest `TZ`, such as `Asia/Singapore` |
+| `--container-workspace-root PATH` | current Git root or cwd | For one default-singleton client, explicitly widen the SFTP and host-exec root to a containing directory; rejected by legacy `run` |
 | `--container-forward-env VALUE` | unset | Comma-separated exact exported names for provider, model, token, or Agent settings |
 | `--container-host-exec-deny VALUE` | unset | Comma-separated host commands never proxied into the guest |
 | `--container-host-exec-first VALUE` | unset | Comma-separated host commands preferred over guest copies, like the built-in `git`/`gh` |
@@ -636,8 +690,18 @@ Diagnose failures by layer:
 The extra-CA secret arrives after the OCI `FROM` pull, and the current Debian
 bootstrap occurs before that CA is installed. Registry and early apt
 interception still require Apple/system trust, a public mirror, or a
-non-intercepted route. A guest CA expands trust for all software using Debian's
-system store, not only the Agent installer.
+non-intercepted route. When the official Debian route is unusably slow, pass a
+reviewed repository such as
+`--container-debian-mirror http://mirrors.aliyun.com/debian`; Debian's signed
+repository metadata, expiry, and package hashes remain mandatory. The pinned
+slim base has no bootstrap TLS trust store, so this narrowly scoped option
+accepts only `http://` and provides authenticity and integrity, not transport
+confidentiality. It changes only the main repository; Debian security continues
+to use `http://deb.debian.org/debian-security`, so this is not a fully isolated
+build route. The mirror is a one-build transport choice rather than persistent
+singleton configuration, so warm launches do not need to repeat it. A guest CA
+expands trust for all software using Debian's system store, not only the Agent
+installer.
 
 ## Advanced legacy `run` mode
 
@@ -666,7 +730,8 @@ codex-container run \
 workspace and additional shares. It starts the same host-tool broker and
 command catalog as the default path; only the workspace transport and
 lifecycle differ. Guest commands win normally, while host Git and gh are
-preferred. Tighten the command surface per launch with:
+preferred. `--container-workspace-root` is not a shorthand for `run` shares and
+is rejected in this mode. Tighten the command surface per launch with:
 
 ```bash
 codex-container run --no-host-exec git --
@@ -689,10 +754,12 @@ changed or deleted.
 The Micro-VM reduces ambient macOS access; it does not make untrusted prompts or
 repositories harmless. By default an Agent can:
 
-- read and write the selected project root;
+- read and write the effective workspace root: the selected project root by
+  default, or the complete explicitly selected `--container-workspace-root`;
 - read and write its profile HOME;
 - run cataloged host commands inside a workspace-scoped macOS sandbox — with
-  the host Git configuration, credential helpers, GitHub CLI login, and the
+  the host Git configuration, credential helpers, existing GitHub CLI login,
+  and the
   terminal's live SSH agent for `git`/`gh`, and an isolated agent-free
   execution HOME for everything else (`--no-container-host-tools` disables
   the channel; `--no-container-host-ssh-agent` withholds the agent);
@@ -720,9 +787,30 @@ volumes, and legacy `run` uses VirtioFS for its workspace and extra shares.
 The launcher retains file-count checks and host file/vnode preflight for those
 paths. The live watchdog belongs to the attached legacy `run` lifecycle; a
 persistent singleton has no launcher process that can monitor it after clients
-disconnect. Risk-acceptance and watchdog-disabling flags are for controlled
-tests, not routine use. See [docs/performance.md](docs/performance.md) for a
-benchmark and safety protocol.
+disconnect. An expanded singleton workspace selected with
+`--container-workspace-root` remains SFTP/SSHFS and is not added to the
+VirtioFS entry budget.
+
+Path, overlap, and per-tree entry-budget checks run before the launcher starts
+stopped Apple container services. A stopped service also receives a full cold
+file/vnode projection before startup. With services already running, the
+lifecycle lock serializes native discovery, verified orphan cleanup, a fresh
+capacity sample, and registration; a warm singleton client is charged zero new
+VirtioFS entries. Every cold path re-counts all mounted trees and samples host
+headroom again after any image work, immediately before `container create`. A
+fresh managed HOME is projected as an empty mount rather than disappearing
+from the first estimate. The final pass also counts generated session/static
+staging and separately mounted nested files or directories. Before services
+start, deterministic nonzero floors reserve the files the launcher will add to
+legacy or singleton staging, including optional SSH metadata and hosts data.
+Each existing source is frozen by canonical path and macOS filesystem-object
+identity (`st_dev:st_ino`), so the final pass rejects a source that disappeared,
+became a symlink, or was replaced by a different directory at the same path. A
+path-specific budget error therefore names a local tree
+without first launching
+`container-apiserver`. Risk-acceptance and
+watchdog-disabling flags are for controlled tests, not routine use. See
+[docs/performance.md](docs/performance.md) for a benchmark and safety protocol.
 
 ## Persistent layout
 

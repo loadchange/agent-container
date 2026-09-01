@@ -872,6 +872,20 @@ function validateRequest(request, configuration) {
     fail('INVALID_REQUEST', 'stdin must be a boolean.');
   }
 
+  // GitHub credentials belong to the macOS operator. The gh sandbox exposes
+  // the real GitHub/Git configuration read-only, so these configuration-
+  // changing auth operations cannot complete reliably. Reject them after the
+  // complete protocol shape is validated but before spawn.
+  const ghAuthMutation = command.name === 'gh'
+    && request.argv[0] === 'auth'
+    && ['login', 'logout', 'refresh', 'setup-git'].includes(request.argv[1]);
+  if (ghAuthMutation) {
+    fail(
+      'HOST_SETUP_REQUIRED',
+      `The 'gh auth ${request.argv[1]}' operation needs writable host configuration. Re-run the original command, including its hostname and options, in a normal macOS terminal.`,
+    );
+  }
+
   return { command, request, forwardedEnvironment };
 }
 
@@ -883,12 +897,25 @@ async function resolveRequestCwd(cwdInput, configuration) {
     if (!info.isDirectory()) fail('CWD_DENIED', 'cwd is not a directory.');
   } catch (error) {
     if (error instanceof BrokerError) throw error;
-    fail('CWD_DENIED', 'cwd cannot be resolved.');
+    fail(
+      'CWD_DENIED',
+      `cwd ${JSON.stringify(cwdInput)} cannot be resolved on the macOS host. It may be guest-only, removed, inaccessible, or outside the transported workspace.`,
+    );
   }
   const allowed = pathContains(configuration.execHome, cwd)
     || configuration.roots.some((root) => pathContains(root.path, cwd));
   if (!allowed) {
-    fail('CWD_DENIED', 'cwd is outside the declared execution roots.');
+    const visibleRoots = configuration.roots
+      .slice(0, 4)
+      .map((root) => JSON.stringify(root.path))
+      .join(', ');
+    const remainingRoots = configuration.roots.length > 4
+      ? `, plus ${configuration.roots.length - 4} more`
+      : '';
+    fail(
+      'CWD_DENIED',
+      `cwd ${JSON.stringify(cwd)} is outside the declared execution roots (${visibleRoots}${remainingRoots}). Start a new invocation whose explicit scope contains it (default singleton: --container-workspace-root; legacy run: --share-ro/--share-rw).`,
+    );
   }
   return cwd;
 }

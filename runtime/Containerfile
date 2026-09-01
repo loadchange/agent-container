@@ -1,8 +1,28 @@
 ARG BASE_IMAGE=mirror.gcr.io/library/debian:bookworm-slim@sha256:9b67294679b30e5d6ab257b40594feeb4a4b81f7fcf4131f4decf0d6a212a9b0
 FROM ${BASE_IMAGE}
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+ARG DEBIAN_MIRROR=
+RUN set -eu; \
+    sources_file=/etc/apt/sources.list.d/debian.sources; \
+    test -f "$sources_file"; \
+    case "${DEBIAN_MIRROR}" in \
+      '') ;; \
+      http://*) \
+        case "${DEBIAN_MIRROR}" in \
+          *[!A-Za-z0-9._~:/-]*|*/) exit 64 ;; \
+        esac; \
+        mirror_authority_and_path=${DEBIAN_MIRROR#*://}; \
+        case "$mirror_authority_and_path" in ?*/?*) ;; *) exit 64 ;; esac; \
+        sed -i \
+          "s|^URIs: http://deb.debian.org/debian$|URIs: ${DEBIAN_MIRROR}|" \
+          "$sources_file"; \
+        grep -Fqx "URIs: ${DEBIAN_MIRROR}" "$sources_file"; \
+        ;; \
+      *) exit 64 ;; \
+    esac; \
+    grep -Fqx 'URIs: http://deb.debian.org/debian-security' "$sources_file"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
         bash \
         bubblewrap \
         ca-certificates \
@@ -20,8 +40,8 @@ RUN apt-get update \
         socat \
         sshfs \
         tar \
-        util-linux \
-    && rm -rf /var/lib/apt/lists/*
+        util-linux; \
+    rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; \
     fuse_config=/etc/fuse.conf; \
@@ -31,69 +51,52 @@ RUN set -eu; \
     fi; \
     chmod 0644 "$fuse_config"
 
-# Apple container builders use the guest's Debian trust store rather than the
-# macOS Keychain.  The launcher may provide one macOS-verified or explicitly
-# selected PEM CA bundle as a BuildKit secret.  Its public fingerprint is an
-# ordinary build argument solely so CA changes invalidate the cached layer;
-# the bundle itself never appears in the builder argv or build metadata.
+# Install only the launcher's verified BuildKit CA secret.
+COPY image-setup.sh /tmp/agent-image-setup
 ARG AGENT_CA_FINGERPRINT=none
 RUN --mount=type=secret,id=agent_ca_bundle \
-    set -eu; \
-    ca_secret=/run/secrets/agent_ca_bundle; \
-    case "${AGENT_CA_FINGERPRINT}" in \
-      none) [ ! -s "$ca_secret" ] ;; \
-      *) \
-        printf '%s\n' "${AGENT_CA_FINGERPRINT}" \
-          | grep -Eq '^[0-9a-f]{64}$'; \
-        test -s "$ca_secret"; \
-        ca_size=$(wc -c < "$ca_secret" | tr -d '[:space:]'); \
-        case "$ca_size" in ''|*[!0-9]*) exit 65 ;; esac; \
-        [ "$ca_size" -le 1048576 ]; \
-        [ "$(sha256sum "$ca_secret" | awk '{print $1}')" = "${AGENT_CA_FINGERPRINT}" ]; \
-        ca_dir=/usr/local/share/ca-certificates/agent-container; \
-        install -d -m 0755 "$ca_dir"; \
-        awk -v output_dir="$ca_dir" ' \
-          BEGIN { inside = 0; count = 0; valid = 1 } \
-          /^-----BEGIN CERTIFICATE-----$/ { \
-            if (inside || count >= 64) valid = 0; \
-            count += 1; \
-            output = sprintf("%s/ca-%03d.crt", output_dir, count); \
-            inside = 1; \
-            print > output; \
-            next; \
-          } \
-          /^-----END CERTIFICATE-----$/ { \
-            if (!inside) valid = 0; \
-            if (inside) { print > output; close(output) } \
-            inside = 0; \
-            next; \
-          } \
-          inside && /^[A-Za-z0-9+\/=]+$/ { print > output; next } \
-          !inside && /^[[:space:]]*$/ { next } \
-          { valid = 0 } \
-          END { if (!valid || inside || count == 0 || count > 64) exit 1 } \
-        ' "$ca_secret"; \
-        ca_count=0; \
-        for ca_file in "$ca_dir"/*.crt; do \
-          test -f "$ca_file"; \
-          ca_count=$((ca_count + 1)); \
-          openssl x509 -in "$ca_file" -noout >/dev/null; \
-          openssl x509 -in "$ca_file" -checkend 0 -noout >/dev/null; \
-          ca_not_before=$(openssl x509 -in "$ca_file" -startdate -noout); \
-          case "$ca_not_before" in notBefore=*) ;; *) exit 65 ;; esac; \
-          ca_not_before=${ca_not_before#notBefore=}; \
-          ca_not_before_epoch=$(date -u --date="$ca_not_before" '+%s'); \
-          [ "$ca_not_before_epoch" -le "$(date -u '+%s')" ]; \
-          openssl x509 -in "$ca_file" -noout -ext basicConstraints \
-            | grep -Eq '^[[:space:]]*CA:TRUE([,[:space:]]|$)'; \
-        done; \
-        [ "$ca_count" -ge 1 ] && [ "$ca_count" -le 64 ]; \
-        update-ca-certificates; \
-        ;; \
-    esac
+    AGENT_CA_FINGERPRINT="$AGENT_CA_FINGERPRINT" \
+    /tmp/agent-image-setup ca
 
-# Keep profile-specific ARGs below the common tool layer so Claude, Codex, and
-# Grok share one cached Debian setup instead of reinstalling it per profile.
+# Keep Python in Debian's clean system PATH.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 xz-utils \
+    && /usr/bin/python3 -c 'import sys; assert sys.version_info >= (3, 11)' \
+    && rm -rf /var/lib/apt/lists/*
+
+# Restore the official main source after the build-only mirror.
+RUN set -eu; \
+    sources_file=/etc/apt/sources.list.d/debian.sources; \
+    if [ -n "${DEBIAN_MIRROR}" ]; then \
+      sed -i \
+        "s|^URIs: ${DEBIAN_MIRROR}$|URIs: http://deb.debian.org/debian|" \
+        "$sources_file"; \
+    fi; \
+    grep -Fqx 'URIs: http://deb.debian.org/debian' "$sources_file"; \
+    grep -Fqx 'URIs: http://deb.debian.org/debian-security' "$sources_file"
+
+# Pin the guest toolchain for reproducible builds.
+ARG NODE_VERSION=22.20.0
+ARG NODE_LINUX_ARM64_SHA256=06907b9c088ce62305bc1530e5c1ae1510245114645768f7750c349c5b6fe667
+ARG PNPM_VERSION=11.7.0
+ENV COREPACK_HOME=/usr/local/lib/agent-corepack
+RUN NODE_VERSION="$NODE_VERSION" \
+    NODE_SHA="$NODE_LINUX_ARM64_SHA256" \
+    PNPM_VERSION="$PNPM_VERSION" \
+    COREPACK_HOME="$COREPACK_HOME" \
+    /tmp/agent-image-setup toolchain \
+    && rm -f /tmp/agent-image-setup
+
+# Share an offline, read-only Corepack payload.
+ENV COREPACK_ENABLE_NETWORK=0 \
+    COREPACK_DEFAULT_TO_LATEST=0
+
+# Keep pnpm's mutable data off the VirtioFS-backed HOME.
+ENV PNPM_CONFIG_STORE_DIR=/var/lib/agent-container/pnpm/store \
+    PNPM_CONFIG_CACHE_DIR=/var/lib/agent-container/pnpm/cache \
+    PNPM_CONFIG_STATE_DIR=/var/lib/agent-container/pnpm/state
+
+# Keep profile-specific args below the shared tool layers.
 ARG AGENT_PROFILE
 ARG AGENT_INSTALLER_URL
 ARG AGENT_INSTALLER_SHELL
@@ -105,9 +108,7 @@ ARG AGENT_VERSION
 ARG AGENT_COMMAND
 ARG AGENT_PROBE_ARG=--version
 
-# Profiles select one official native installer. The host resolves every
-# floating publisher channel to an exact version before this build begins, so
-# the version participates in both the layer cache key and image provenance.
+# Install one host-resolved exact native Agent version.
 RUN set -eu; \
     case "${AGENT_PROFILE}" in claude|codex|grok) ;; *) exit 64 ;; esac; \
     case "${AGENT_INSTALLER_URL}" in https://*) ;; *) exit 64 ;; esac; \

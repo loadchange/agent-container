@@ -7,6 +7,8 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 connect_script="$repo_root/runtime/agent-workspace-connect"
 session_script="$repo_root/runtime/agent-workspace-session"
 peer_source="$repo_root/tests/fixtures/workspace-bridge-peer.rs"
+broker_launcher_override=${AGENT_WORKSPACE_TEST_LAUNCHER:-}
+physical_launcher=${AGENT_WORKSPACE_TEST_PHYSICAL_LAUNCHER:-"$repo_root/dist/agent-container-darwin-arm64"}
 test_root=$(mktemp -d /tmp/agent-workspace-bridge.XXXXXX)
 test_root=$(CDPATH= cd -- "$test_root" && pwd -P)
 tests_run=0
@@ -363,7 +365,8 @@ if [ "$(uname -s)" != Darwin ]; then
   broker_skip_reason="requires macOS sandbox-exec and sftp-server"
 elif [ "$bridge_fixture_available" != true ]; then
   broker_skip_reason="host transport fixture is unavailable"
-elif ! command -v cargo >/dev/null 2>&1; then
+elif [ -z "$broker_launcher_override" ] \
+  && ! command -v cargo >/dev/null 2>&1; then
   broker_skip_reason="cargo is unavailable"
 elif [ ! -x /usr/bin/sandbox-exec ] \
   || [ ! -x /usr/libexec/sftp-server ] \
@@ -373,15 +376,27 @@ fi
 if [ -n "$broker_skip_reason" ]; then
   skip "Rust broker supports real SFTP workspace list, read, and write" "$broker_skip_reason"
 else
-  if ! CARGO_TARGET_DIR="$test_root/cargo-target" \
-      cargo build --quiet --locked --offline \
-        --manifest-path "$repo_root/Cargo.toml" \
-        --bin agent-container-launcher \
-      > "$test_root/cargo-build.out" 2> "$test_root/cargo-build.err"; then
-    show_diagnostic_file "$test_root/cargo-build.err"
-    fail "could not build the Rust workspace broker"
+  if [ -n "$broker_launcher_override" ]; then
+    case "$broker_launcher_override" in
+      /*) ;;
+      *) fail "workspace broker launcher override must be absolute" ;;
+    esac
+    [ -f "$broker_launcher_override" ] \
+      && [ ! -L "$broker_launcher_override" ] \
+      && [ -x "$broker_launcher_override" ] \
+      || fail "workspace broker launcher override is not a safe executable"
+    broker_binary=$broker_launcher_override
+  else
+    if ! CARGO_TARGET_DIR="$test_root/cargo-target" \
+        cargo build --quiet --locked --offline \
+          --manifest-path "$repo_root/Cargo.toml" \
+          --bin agent-container-launcher \
+        > "$test_root/cargo-build.out" 2> "$test_root/cargo-build.err"; then
+      show_diagnostic_file "$test_root/cargo-build.err"
+      fail "could not build the Rust workspace broker"
+    fi
+    broker_binary="$test_root/cargo-target/debug/agent-container-launcher"
   fi
-  broker_binary="$test_root/cargo-target/debug/agent-container-launcher"
   [ -x "$broker_binary" ] || fail "Rust workspace broker binary was not produced"
   workspace_root=$(mktemp -d "$test_root/workspace.XXXXXX")
   printf '\000WORKSPACE-SEED\377\n' > "$workspace_root/seed.bin"
@@ -451,7 +466,6 @@ else
 fi
 
 next_test
-physical_launcher="$repo_root/dist/agent-container-darwin-arm64"
 if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
   skip "physical release launcher dispatches the private workspace broker" \
     "requires the built macOS arm64 release in dist/"
@@ -509,6 +523,11 @@ for session_contract in \
   '--mount' \
   '--propagation private' \
   'trap cleanup EXIT' \
+  '/proc/self/mountinfo' \
+  'workspace_root_mountinfo=${workspace_root//\\/\\134}' \
+  'ROOT is already a mountpoint in this session namespace.' \
+  'ROOT contains an existing nested mount in this session namespace.' \
+  '/usr/bin/mkdir -- "$workspace_root"' \
   '/usr/bin/sshfs' \
   'agent-container:.' \
   '-o cache_timeout=1' \
@@ -526,10 +545,18 @@ for session_contract in \
   'printf '\''%s\n'\'' "$agent_pid" > "$agent_cgroup/cgroup.procs"' \
   'while :; do' \
   'session_runtime_dir=$(/usr/bin/mktemp -d' \
-  'XDG_RUNTIME_DIR="$session_runtime_dir"'; do
+  'XDG_RUNTIME_DIR="$session_runtime_dir"' \
+  '[ "$mountpoint_created" = true ]' \
+  '/usr/bin/rmdir -- "$workspace_root"'; do
   grep -Fq -- "$session_contract" "$session_script" \
     || fail "workspace session helper is missing contract: $session_contract"
 done
+grep -Fq -- '-o nonempty' "$session_script" \
+  && fail "workspace session must not pass the obsolete FUSE2 nonempty option"
+grep -Fq -- 'ROOT mountpoint is not empty.' "$session_script" \
+  && fail "workspace session must allow ordinary nonempty private-namespace underlays"
+grep -Fq -- 'if [ ! -e "$workspace_root" ]' "$session_script" \
+  && fail "workspace mountpoint ownership must use an atomic final mkdir"
 grep -Fq -- '/usr/bin/setsid --fork' "$session_script" \
   && fail "workspace session must keep the direct Agent PID instead of a setsid supervisor"
 grep -Eq '^[[:space:]]*wait[[:space:]]+-n([[:space:]]|$)' "$session_script" \
@@ -568,7 +595,7 @@ if [ "$(id -u)" -ne 0 ]; then
   grep -Fq 'must run as root' "$test_root/session-nonroot.err" \
     || fail "workspace session non-root rejection was not explicit"
 fi
-pass "workspace session statically enforces private mount and privilege-drop contracts"
+pass "workspace session statically permits ordinary underlays, rejects nested mounts, and enforces privilege-drop contracts"
 
 next_test
 skip "workspace session performs a live FUSE mount" \

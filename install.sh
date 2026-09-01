@@ -26,6 +26,7 @@ ASSETS=(
   agent-container-runtime
   Containerfile
   Containerfile.dockerignore
+  image-setup.sh
   entrypoint.sh
   host-exec-client
   host-exec-broker.mjs
@@ -125,7 +126,7 @@ asset_is_selected() {
   local requested_asset="$1"
   local asset_profile
   case "$requested_asset" in
-    agent-container-darwin-arm64|agent-container-runtime|Containerfile|Containerfile.dockerignore|entrypoint.sh|host-exec-client|host-exec-broker.mjs|agent-workspace-connect|agent-workspace-session)
+    agent-container-darwin-arm64|agent-container-runtime|Containerfile|Containerfile.dockerignore|image-setup.sh|entrypoint.sh|host-exec-client|host-exec-broker.mjs|agent-workspace-connect|agent-workspace-session)
       return 0
       ;;
     profiles/*.json)
@@ -887,15 +888,19 @@ validate_native_launcher \
 # and JSON asset before any installed path is touched.
 bash -n \
   "$tmp_dir/agent-container-runtime" \
+  "$tmp_dir/image-setup.sh" \
   "$tmp_dir/entrypoint.sh" \
   "$tmp_dir/host-exec-client" \
   "$tmp_dir/agent-workspace-connect" \
   "$tmp_dir/agent-workspace-session" \
   || die "A downloaded shell asset failed validation."
+/bin/sh -n "$tmp_dir/image-setup.sh" \
+  || die "The downloaded POSIX image setup asset failed validation."
 grep -Eq '^[[:space:]]*(ARG[[:space:]]+BASE_IMAGE|FROM[[:space:]])' "$tmp_dir/Containerfile" \
   || die "The downloaded Containerfile failed validation."
 [ -f "$tmp_dir/Containerfile.dockerignore" ] \
   && grep -Fqx '**' "$tmp_dir/Containerfile.dockerignore" \
+  && grep -Fqx '!image-setup.sh' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!entrypoint.sh' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!host-exec-client' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!agent-workspace-connect' "$tmp_dir/Containerfile.dockerignore" \
@@ -1051,6 +1056,7 @@ if path_exists "$release_dir"; then
     "The installed agent-container launcher"
   for executable_asset in \
     agent-container-runtime \
+    image-setup.sh \
     entrypoint.sh \
     host-exec-client \
     agent-workspace-connect \
@@ -1070,9 +1076,9 @@ if path_exists "$release_dir"; then
     > "$release_root_listing" 2>/dev/null \
     || die "Could not safely enumerate the existing release: $release_dir"
   release_root_count=$(wc -l < "$release_root_listing" | tr -d '[:space:]')
-  # Nine shared regular assets, four command aliases, the profiles directory,
+  # Ten shared regular assets, four command aliases, the profiles directory,
   # release manifest, and ownership marker.
-  expected_root_count=16
+  expected_root_count=17
   [ "$release_root_count" = "$expected_root_count" ] \
     || die "Existing release contains unexpected root entries: $release_dir"
   release_profile_listing="$tmp_dir/existing-release-profile-list"
@@ -1101,6 +1107,7 @@ else
   install -m 0644 \
     "$tmp_dir/Containerfile.dockerignore" \
     "$stage_dir/Containerfile.dockerignore"
+  install -m 0755 "$tmp_dir/image-setup.sh" "$stage_dir/image-setup.sh"
   install -m 0755 "$tmp_dir/entrypoint.sh" "$stage_dir/entrypoint.sh"
   install -m 0755 "$tmp_dir/host-exec-client" "$stage_dir/host-exec-client"
   install -m 0644 "$tmp_dir/host-exec-broker.mjs" "$stage_dir/host-exec-broker.mjs"

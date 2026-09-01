@@ -8,6 +8,8 @@ container_name=${AGENT_WORKSPACE_LIVE_CONTAINER:-}
 gateway=${AGENT_WORKSPACE_LIVE_GATEWAY:-}
 runtime_uid=${AGENT_WORKSPACE_LIVE_UID:-$(id -u)}
 runtime_gid=${AGENT_WORKSPACE_LIVE_GID:-$(id -g)}
+broker_launcher=${AGENT_WORKSPACE_LIVE_LAUNCHER:-"$repo_root/dist/agent-container-darwin-arm64"}
+owner_broker_launcher=${AGENT_WORKSPACE_LIVE_OWNER_LAUNCHER:-${AGENT_WORKSPACE_LIVE_LAUNCHER:-"$repo_root/target/release/agent-container-launcher"}}
 
 case "$container_name" in
   agent-workspace-session-test-*) ;;
@@ -23,8 +25,8 @@ case "$runtime_uid:$runtime_gid" in
 esac
 
 for required in \
-  "$repo_root/dist/agent-container-darwin-arm64" \
-  "$repo_root/target/release/agent-container-launcher" \
+  "$broker_launcher" \
+  "$owner_broker_launcher" \
   "$repo_root/runtime/agent-workspace-connect" \
   "$repo_root/runtime/agent-workspace-session" \
   "$repo_root/tests/fixtures/workspace-session-test-agent"; do
@@ -63,6 +65,8 @@ test_root=$(mktemp -d "$repo_root/.agent-workspace-session-live-test.XXXXXXXX")
 test_root=$(CDPATH= cd -- "$test_root" && pwd -P)
 background_pids=()
 guest_pid_files=()
+guest_underlay_paths=()
+guest_nested_mounts=()
 owned_broker_pids=()
 owned_broker_roots=()
 wait_status=0
@@ -76,7 +80,7 @@ session_guest_pid_file=
 
 cleanup() {
   local status=$?
-  local broker_index diagnostic_file job_spec pid pid_file
+  local broker_index diagnostic_file guest_mount guest_path job_spec pid pid_file
 
   trap '' INT TERM HUP ALRM
   trap - EXIT
@@ -110,30 +114,58 @@ cleanup() {
         | /bin/grep -v grep || true
     ' live-diagnostics "$runtime_uid" >&2 2>&1 || true
   fi
-  for pid_file in "${guest_pid_files[@]}"; do
-    container exec "$container_name" /bin/bash -c '
-      pid_file=$1
-      if [ -s "$pid_file" ]; then
-        pid=$(/bin/cat "$pid_file")
-        case "$pid" in ""|0|*[!0-9]*) ;; *) /bin/kill -TERM "$pid" 2>/dev/null ;; esac
+  if [ "${#guest_pid_files[@]}" -gt 0 ]; then
+    for pid_file in "${guest_pid_files[@]}"; do
+      container exec "$container_name" /bin/bash -c '
+        pid_file=$1
+        if [ -s "$pid_file" ]; then
+          pid=$(/bin/cat "$pid_file")
+          case "$pid" in ""|0|*[!0-9]*) ;; *) /bin/kill -TERM "$pid" 2>/dev/null ;; esac
+        fi
+        /bin/rm -f -- "$pid_file"
+      ' live-cleanup "$pid_file" >/dev/null 2>&1 || true
+    done
+  fi
+  if [ "${#background_pids[@]}" -gt 0 ]; then
+    for pid in "${background_pids[@]}"; do
+      if job_spec=$(host_job_spec_for_pid "$pid"); then
+        builtin kill -TERM "$job_spec" 2>/dev/null || true
+        /bin/sleep 0.05
+        builtin kill -KILL "$job_spec" 2>/dev/null || true
+      else
+        wait "$pid" 2>/dev/null || true
       fi
-      /bin/rm -f -- "$pid_file"
-    ' live-cleanup "$pid_file" >/dev/null 2>&1 || true
-  done
-  for pid in "${background_pids[@]}"; do
-    if job_spec=$(host_job_spec_for_pid "$pid"); then
-      builtin kill -TERM "$job_spec" 2>/dev/null || true
-      /bin/sleep 0.05
-      builtin kill -KILL "$job_spec" 2>/dev/null || true
-    else
-      wait "$pid" 2>/dev/null || true
-    fi
-  done
-  for broker_index in "${!owned_broker_pids[@]}"; do
-    wait_for_owned_broker_exit \
-      "${owned_broker_pids[$broker_index]}" \
-      "${owned_broker_roots[$broker_index]}" || true
-  done
+    done
+  fi
+  if [ "${#owned_broker_pids[@]}" -gt 0 ]; then
+    for broker_index in "${!owned_broker_pids[@]}"; do
+      wait_for_owned_broker_exit \
+        "${owned_broker_pids[$broker_index]}" \
+        "${owned_broker_roots[$broker_index]}" || true
+    done
+  fi
+  if [ "${#guest_nested_mounts[@]}" -gt 0 ]; then
+    for guest_mount in "${guest_nested_mounts[@]}"; do
+      case "$guest_mount" in
+        "$test_root"/*)
+          container exec "$container_name" /usr/bin/umount -- "$guest_mount" \
+            >/dev/null 2>&1 || true
+          ;;
+        *) status=1 ;;
+      esac
+    done
+  fi
+  if [ "${#guest_underlay_paths[@]}" -gt 0 ]; then
+    for guest_path in "${guest_underlay_paths[@]}"; do
+      case "$guest_path" in
+        "$test_root"/*)
+          container exec "$container_name" /bin/rm -rf -- "$guest_path" \
+            >/dev/null 2>&1 || true
+          ;;
+        *) status=1 ;;
+      esac
+    done
+  fi
   case "$test_root" in
     "$repo_root"/.agent-workspace-session-live-test.*)
       /bin/rm -rf -- "$test_root"
@@ -278,7 +310,7 @@ start_broker() {
 
   : > "$record"
   : > "$error"
-  "$repo_root/dist/agent-container-darwin-arm64" \
+  "$broker_launcher" \
     __workspace-broker "$workspace" "$gateway" \
     > "$record" 2> "$error" &
   broker_pid=$!
@@ -314,7 +346,7 @@ start_owned_broker() {
     /bin/rm -f -- "$fifo"
     (
       exec 7>&-
-      exec "$repo_root/target/release/agent-container-launcher" \
+      exec "$owner_broker_launcher" \
         __workspace-broker "$workspace" "$gateway" --liveness-fd 8
     ) > "$record" 2> "$error" &
     owned_pid=$!
@@ -467,7 +499,7 @@ container exec "$container_name" /bin/chmod 0755 \
   /usr/local/bin/workspace-session-test-agent
 
 printf 'TAP version 13\n'
-printf '1..5\n'
+printf '1..7\n'
 
 normal_workspace="$test_root/normal"
 /bin/mkdir "$normal_workspace"
@@ -488,6 +520,9 @@ assert_guest_clean \
   "$normal_ordinary_identity" \
   "$normal_detached_identity" \
   "$normal_stubborn_identity"
+container exec "$container_name" /bin/bash -c '
+  test ! -e "$1" && test ! -L "$1"
+' live-created-mountpoint-cleanup "$normal_workspace"
 printf 'ok 1 - normal Agent exit preserves status and cgroup-cleans ordinary, detached, and TERM-ignoring descendants\n'
 
 term_workspace="$test_root/term"
@@ -623,3 +658,90 @@ assert_guest_clean \
   "$owner_loss_detached_identity" \
   "$owner_loss_stubborn_identity"
 printf 'ok 5 - SIGKILL of the broker owner closes the active workspace and reclaims the guest session\n'
+
+nonempty_workspace="$test_root/nonempty-underlay"
+/bin/mkdir "$nonempty_workspace"
+/usr/bin/printf '%s\n' host-workspace-sentinel \
+  > "$nonempty_workspace/host-sentinel"
+guest_underlay_paths+=("$nonempty_workspace")
+container exec "$container_name" /bin/bash -c '
+  root=$1
+  /bin/mkdir -p -- "$root/original-directory"
+  /usr/bin/printf "%s\n" guest-underlay-sentinel > "$root/original-file"
+  /bin/chmod 0750 "$root/original-directory"
+  /bin/chmod 0640 "$root/original-file"
+' live-create-underlay "$nonempty_workspace"
+start_broker "$nonempty_workspace" nonempty-underlay
+nonempty_broker_pid=$broker_pid
+start_session "$nonempty_workspace" nonempty-underlay \
+  private-overlay-tree nonempty-underlay
+nonempty_session_pid=$session_pid
+nonempty_pid_file=$session_guest_pid_file
+wait_for_file "$nonempty_workspace/nonempty-underlay.ready"
+wait_for_file "$nonempty_workspace/nonempty-underlay.overlay-ready"
+# A separate exec remains in the container's initial mount namespace.  It must
+# continue to see the underlay while the Agent's private namespace sees the
+# host sentinel and records overlay-ready through SSHFS.
+container exec "$container_name" /bin/bash -c '
+  root=$1
+  test ! -e "$root/host-sentinel"
+  test ! -e "$root/nonempty-underlay.overlay-ready"
+  test -e "$root/original-file"
+  test -e "$root/original-directory"
+' live-verify-private-underlay "$nonempty_workspace"
+nonempty_main_identity=$(read_tree_identity \
+  "$nonempty_workspace/nonempty-underlay.main")
+nonempty_ordinary_identity=$(read_tree_identity \
+  "$nonempty_workspace/nonempty-underlay.ordinary")
+nonempty_detached_identity=$(read_tree_identity \
+  "$nonempty_workspace/nonempty-underlay.detached")
+nonempty_stubborn_identity=$(read_tree_identity \
+  "$nonempty_workspace/nonempty-underlay.stubborn")
+signal_guest_session "$nonempty_pid_file" TERM
+wait_for_process "$nonempty_session_pid"
+[ "$wait_status" -eq 143 ]
+wait_for_process "$nonempty_broker_pid"
+[ "$wait_status" -eq 0 ]
+[ "$(/bin/cat "$nonempty_workspace/host-sentinel")" = host-workspace-sentinel ]
+assert_guest_clean \
+  "$nonempty_main_identity" \
+  "$nonempty_ordinary_identity" \
+  "$nonempty_detached_identity" \
+  "$nonempty_stubborn_identity"
+container exec "$container_name" /bin/bash -c '
+  root=$1
+  test -d "$root" && test ! -L "$root"
+  test -d "$root/original-directory"
+  test "$(/usr/bin/stat -c %a -- "$root/original-directory")" = 750
+  test "$(/bin/cat "$root/original-file")" = guest-underlay-sentinel
+  test "$(/usr/bin/stat -c %a -- "$root/original-file")" = 640
+  test ! -e "$root/nonempty-underlay.ordinary.pid"
+  test ! -e "$root/nonempty-underlay.overlay-ready"
+' live-verify-underlay "$nonempty_workspace"
+printf 'ok 6 - FUSE3 overlays a nonempty underlay and reveals its unchanged contents after private unmount\n'
+
+nested_workspace="$test_root/nested-mount"
+nested_mount="$nested_workspace/child-mount"
+guest_underlay_paths+=("$nested_workspace")
+guest_nested_mounts+=("$nested_mount")
+container exec "$container_name" /bin/bash -c '
+  root=$1
+  target=$2
+  /bin/mkdir -p -- "$root/source" "$target"
+  /usr/bin/printf "%s\n" nested-mount-sentinel > "$root/source/sentinel"
+  /usr/bin/mount --bind "$root/source" "$target"
+  /usr/bin/mountpoint -q -- "$target"
+' live-create-nested-mount "$nested_workspace" "$nested_mount"
+broker_endpoint=127.0.0.1:1
+broker_token=0000000000000000000000000000000000000000000000000000000000000000
+start_session "$nested_workspace" nested-mount \
+  exit-tree nested-mount 0
+nested_session_pid=$session_pid
+wait_for_process "$nested_session_pid"
+[ "$wait_status" -eq 64 ]
+/usr/bin/grep -Fq \
+  'ROOT contains an existing nested mount in this session namespace.' \
+  "$test_root/nested-mount.session.err"
+container exec "$container_name" /usr/bin/mountpoint -q -- "$nested_mount"
+assert_guest_clean
+printf 'ok 7 - an inherited nested mount is rejected before SSHFS can cover its parent\n'

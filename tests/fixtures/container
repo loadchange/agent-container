@@ -173,10 +173,32 @@ case "${1:-}" in
   system)
     case "${2:-}" in
       status)
-        [ "${FAKE_SYSTEM_RUNNING:-true}" = true ] \
-          || [ -f "${FAKE_SYSTEM_STARTED_STATE:-/nonexistent}" ]
+        if [ "${FAKE_SYSTEM_RUNNING:-true}" = true ]; then
+          exit 0
+        fi
+        [ -f "${FAKE_SYSTEM_STARTED_STATE:-/nonexistent}" ] \
+          && [ "${FAKE_SYSTEM_READY_AFTER_START:-true}" = true ] \
+          || exit 1
+        readiness_failures="${FAKE_SYSTEM_STATUS_FAILURES_AFTER_START:-0}"
+        case "$readiness_failures" in
+          ''|*[!0-9]*) exit 64 ;;
+        esac
+        readiness_checks=0
+        if [ -f "${FAKE_SYSTEM_STATUS_COUNT_STATE:?}" ]; then
+          IFS= read -r readiness_checks \
+            < "$FAKE_SYSTEM_STATUS_COUNT_STATE" || exit 65
+        fi
+        case "$readiness_checks" in
+          ''|*[!0-9]*) exit 65 ;;
+        esac
+        readiness_checks=$((readiness_checks + 1))
+        printf '%s\n' "$readiness_checks" \
+          > "$FAKE_SYSTEM_STATUS_COUNT_STATE"
+        [ "$readiness_checks" -gt "$readiness_failures" ]
         ;;
       start)
+        [ -z "${FAKE_SYSTEM_START_OUTPUT:-}" ] \
+          || printf '%s\n' "$FAKE_SYSTEM_START_OUTPUT" >&2
         [ "${FAKE_SYSTEM_START_FAIL:-false}" != true ] || exit 71
         : > "${FAKE_SYSTEM_STARTED_STATE:?}"
         ;;
@@ -194,6 +216,22 @@ case "${1:-}" in
     fi
     ;;
   inspect)
+    if [ -n "${FAKE_GROW_DIRECTORY_AFTER_STOPPED_INSPECT:-}" ] \
+      && [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ] \
+      && [ -f "$FAKE_CREATED_CONTAINER_STATE.stopped" ] \
+      && [ ! -e "${FAKE_GROW_DIRECTORY_MARKER:-}" ]; then
+      growth_directory="$FAKE_GROW_DIRECTORY_AFTER_STOPPED_INSPECT"
+      growth_count="${FAKE_GROW_DIRECTORY_ENTRY_COUNT:-0}"
+      case "$growth_count" in ''|*[!0-9]*) exit 64 ;; esac
+      [ -d "$growth_directory" ] && [ ! -L "$growth_directory" ] \
+        || exit 79
+      growth_index=1
+      while [ "$growth_index" -le "$growth_count" ]; do
+        : > "$growth_directory/grown-after-stopped-inspect-$growth_index"
+        growth_index=$((growth_index + 1))
+      done
+      : > "${FAKE_GROW_DIRECTORY_MARKER:?FAKE_GROW_DIRECTORY_MARKER is required}"
+    fi
     if [ -n "${FAKE_CREATED_CONTAINER_STATE:-}" ] \
       && [ -f "$FAKE_CREATED_CONTAINER_STATE.inspect-error" ]; then
       echo "compound RPC failure after container not found: ${2:-}; state is indeterminate" >&2
@@ -234,6 +272,26 @@ case "${1:-}" in
         "$FAKE_CREATED_CONTAINER_STATE.mode" \
         "$FAKE_CREATED_CONTAINER_STATE.running" \
         "$FAKE_CREATED_CONTAINER_STATE.stopped"
+    fi
+    if [ -n "${FAKE_REPLACE_DIRECTORY_AFTER_DELETE:-}" ]; then
+      replaced_directory="$FAKE_REPLACE_DIRECTORY_AFTER_DELETE"
+      original_directory="$replaced_directory.original"
+      [ -d "$replaced_directory" ] \
+        && [ ! -L "$replaced_directory" ] \
+        && [ ! -e "$original_directory" ] \
+        && [ ! -L "$original_directory" ] \
+        || exit 79
+      mv "$replaced_directory" "$original_directory"
+      mkdir "$replaced_directory"
+      printf '%s\n' replaced-after-delete \
+        > "$replaced_directory/replacement-sentinel"
+      if [ "${FAKE_REPLACEMENT_SINGLETON_RECORDS:-false}" = true ]; then
+        for replacement_record in \
+          phase creator-pid agent-version image-digest config.sha256; do
+          printf '%s\n' foreign-replacement-record \
+            > "$replaced_directory/$replacement_record"
+        done
+      fi
     fi
     ;;
   image)

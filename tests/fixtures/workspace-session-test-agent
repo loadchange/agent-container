@@ -99,6 +99,21 @@ case "${1:-}" in
       /bin/sleep 1
     done
     ;;
+  private-overlay-tree)
+    [ "$#" -eq 2 ] || exit 64
+    prefix=$2
+    [ "$(/bin/cat "$PWD/host-sentinel")" = host-workspace-sentinel ]
+    [ ! -e "$PWD/original-file" ]
+    [ ! -e "$PWD/original-directory" ]
+    write_marker "$PWD/$prefix.overlay-ready" "$$"
+    trap 'write_marker "$PWD/$prefix.main.term" TERM; exit 0' TERM
+    spawn_tree "$prefix"
+    write_identity "$PWD/$prefix.main"
+    write_marker "$PWD/$prefix.ready" "$$"
+    while :; do
+      /bin/sleep 1
+    done
+    ;;
   *)
     exit 64
     ;;

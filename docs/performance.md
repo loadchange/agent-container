@@ -8,8 +8,9 @@ After the first launch, a new terminal avoids VM creation and uses
 per-invocation VM, but it does not make the complete workflow equivalent to a
 native macOS process.
 
-Every warm client still performs host validation, publisher-channel resolution
-when using a floating version, one workspace-broker startup, TCP
+Every warm client still performs host and effective-workspace validation,
+publisher-channel resolution when using a floating version, one
+workspace-broker startup, TCP
 authentication, private mount-namespace setup, SSHFS readiness, and Agent
 initialization. Project I/O crosses raw SFTP/FUSE. Metadata-heavy operations can
 therefore be slower than APFS and can have different caching and watcher
@@ -69,6 +70,7 @@ Test at least these states:
 | Warm singleton | Matching singleton already running, no other client |
 | Concurrent attach | Two terminals enter two different repositories in the same profile |
 | Repeated root switch | Alternate A/B/A/B without stopping the singleton |
+| Explicit containing root | One repository uses `--container-workspace-root` to reach a reviewed sibling dependency |
 | Owner death recovery | One active client whose host launcher is sent `SIGKILL` while another client remains active |
 | Legacy `run` | Profile singleton stopped; short-lived Apple-volume path selected explicitly |
 
@@ -117,9 +119,53 @@ environment or a deterministic guest command path:
 8. guest edit followed by host read.
 
 Record repository file count, total bytes, average file size, nesting depth,
-Git status size, and tool versions. SSHFS caches attributes and directory
-entries briefly, so test both cold and warm caches. Never compare workloads
-whose host and guest toolchains differ materially without disclosing it.
+Git status size, effective workspace root, and tool versions. When using
+`--container-workspace-root`, also record the containing root's total entry
+count and every sibling tree placed inside the authorization boundary. SSHFS
+caches attributes and directory entries briefly, so test both cold and warm
+caches. Never compare workloads whose host and guest toolchains differ
+materially without disclosing it.
+
+For a concrete sibling-link case, compare `sample-app` with and without its
+reviewed `shared-harness` sibling available under one common root:
+
+```bash
+cd /Users/alice/work/sample-app
+claude-container \
+  --container-workspace-root /Users/alice/work
+```
+
+Confirm that linked dependency reads, guest Node/pnpm package resolution and
+builds, host Git operations, and writes all use the same effective root. Also
+verify that an outside path remains denied. The broader root is an
+authorization and workload change,
+so do not compare its timings to a single-repository sample without labeling
+the difference.
+
+On the first pnpm invocation, confirm that the profile shadow HOME does not gain
+`.cache/node/corepack`, `.cache/pnpm`, or `.local/share/pnpm`: pnpm 11.7.0 is
+prepared once into the image's shared read-only Corepack cache, while its
+mutable store/cache/state resolve below `/var/lib/agent-container/pnpm` in the
+guest writable layer. This keeps package-manager bootstrap latency and large
+dependency stores out of every profile's VirtioFS budget.
+
+For cold-start safety measurements, record both the pre-service projection and
+the final pre-create projection. The former reserves deterministic nonzero
+floors for the legacy or singleton staging content the launcher will create,
+including optional SSH metadata and hosts data. The latter counts the actual
+generated staging and separately mounted nested sources, so it can be slightly
+larger even when the workspace itself is unchanged. Replacing, removing,
+symlinking, or swapping a frozen mount source to a different `st_dev:st_ino`
+during the image-build interval or the final multi-tree scan must be reported
+as a rejected launch, not as a faster or smaller sample. Stopped-singleton
+replacement also repeats this full gate before deleting the still-recoverable
+native container.
+
+Record any `--container-debian-mirror` value separately from runtime timings.
+It changes only HTTP transport for the Debian main repository and can dominate
+a first cold build without affecting warm client attachment. Debian security
+continues to use its official endpoint, so measure that traffic separately and
+do not describe this option as a fully isolated mirror route.
 
 File watchers need a separate result. Test the actual framework's watch mode
 with host-side and guest-side edits. A successful ordinary read does not imply
@@ -197,6 +243,17 @@ separately from the profile HOME and static configuration mounts that still use
 Apple volumes. Legacy `run` is a third category because its workspace and extra
 shares use VirtioFS.
 
+An explicit `--container-workspace-root` remains in the SFTP/SSHFS category. It
+does not add the selected tree to the VirtioFS file-entry projection. Measure
+the larger traversal and host-tool workload separately, but do not interpret a
+large selected SFTP root as the source named by a shadow-HOME or legacy-share
+VirtioFS budget error. Local path and per-tree budget checks complete before
+stopped Apple services start; the stopped-service cold capacity projection does
+too. A running service is sampled again after serialized native discovery so a
+warm singleton client is not counted as another static mount. Cold creation
+then repeats the tree count and capacity sample after image work, immediately
+before `container create`.
+
 Do not run million-file or file-table exhaustion reproducers on a daily-use
 machine. Safety overrides do not make an unsafe test safe.
 
@@ -240,6 +297,8 @@ A workload is suitable only when:
 - repository reads, writes, Git, build, and tests are correct over SSHFS;
 - watch-mode behavior is verified or explicitly documented;
 - concurrent clients retain correct cwd and independent mount lifetimes;
+- an explicit containing root admits the intended sibling links, gives SFTP
+  and host-exec the same boundary, and continues to deny paths outside it;
 - ending one client does not disturb another;
 - active-client host-launcher `SIGKILL` reclaims that broker, connection,
   Agent tree, cgroup, SSHFS mount, and session state without stopping the
