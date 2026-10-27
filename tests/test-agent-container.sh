@@ -732,6 +732,32 @@ write_build_gated_container() {
   chmod 0755 "$helper_path"
 }
 
+# A host-tool broker stand-in that runs the fixture broker and then snapshots
+# the per-client session directory. The fixture records the arguments and the
+# environment the launcher handed it there, next to the launcher's own session
+# records (access marker, catalog, roots), so a case can assert on all of them
+# after the launcher has removed the directory.
+write_session_snapshot_broker() {
+  local helper_path="$1"
+  local snapshot_dir="$2"
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf '%s\n' 'session_dir='
+    printf '%s\n' 'previous='
+    printf '%s\n' 'for argument in "$@"; do'
+    printf '%s\n' '  [ "$previous" != --session-dir ] || session_dir=$argument'
+    printf '%s\n' '  previous=$argument'
+    printf '%s\n' 'done'
+    printf '%s\n' '[ -n "$session_dir" ] || exit 66'
+    printf '%s\n' 'status=0'
+    printf '%q "$@" || status=$?\n' "$fixture_dir/host-exec-broker"
+    printf 'cp -R "$session_dir" %q\n' "$snapshot_dir"
+    printf '%s\n' 'exit "$status"'
+  } > "$helper_path"
+  chmod 0755 "$helper_path"
+}
+
 valid_fingerprint() {
   local value="$1"
   [ "${#value}" -eq 64 ] || return 1
@@ -1343,8 +1369,12 @@ pass "launcher deny/first list options reach the shared host-tool catalog"
 tests_run=$((tests_run + 1))
 new_case singleton_full_host_access_contract
 TEST_SINGLETON_LAUNCH=true
-AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
-FAKE_CAPTURE_HOST_STAGE_DIR="$case_dir/captured-host-stage"
+full_snapshot_broker="$case_dir/snapshot-host-broker"
+write_session_snapshot_broker "$full_snapshot_broker" "$case_dir/captured-session"
+AGENT_CONTAINER_HOST_BROKER_BIN="$full_snapshot_broker"
+# Full access always runs the host-tool channel; the empty value keeps the
+# harness from passing --no-container-host-tools, which the mode refuses.
+AGENT_CONTAINER_HOST_TOOLS=
 AGENT_CONTAINER_FULL_HOST_ACCESS=true
 AGENT_CONTAINER_HOST_FORWARD_PORTS=5037,8081
 AGENT_CONTAINER_HOST_MIRROR=/Volumes/Devices
@@ -1352,21 +1382,23 @@ ANDROID_HOME=/opt/test-android
 run_program "$repo_root/bin/grok-container" --version \
   >"$case_dir/out" 2>"$case_dir/err"
 full_physical_workspace=$(cd "$case_workspace" && pwd -P)
-# The host-tool broker runs unsandboxed with the loopback tunnel, never with
-# the sandbox profile or the isolated execution home.
-assert_line "$case_dir/captured-host-stage/fake-host-broker-args" 'ARG=--access'
-assert_line "$case_dir/captured-host-stage/fake-host-broker-args" 'ARG=full'
-assert_line "$case_dir/captured-host-stage/fake-host-broker-args" 'ARG=--tunnel-ports'
-assert_line "$case_dir/captured-host-stage/fake-host-broker-args" 'ARG=5037,8081'
-assert_no_line "$case_dir/captured-host-stage/fake-host-broker-args" 'ARG=--sandbox-bin'
-assert_no_line "$case_dir/captured-host-stage/fake-host-broker-args" 'ARG=--exec-home'
+# The client registers as a full-access client, and its host-tool broker runs
+# unsandboxed with the loopback tunnel, never with the sandbox profile or the
+# isolated execution home.
+assert_line "$case_dir/captured-session/access" full
+assert_line "$case_dir/captured-session/fake-host-broker-args" 'ARG=--access'
+assert_line "$case_dir/captured-session/fake-host-broker-args" 'ARG=full'
+assert_line "$case_dir/captured-session/fake-host-broker-args" 'ARG=--tunnel-ports'
+assert_line "$case_dir/captured-session/fake-host-broker-args" 'ARG=5037,8081'
+assert_no_line "$case_dir/captured-session/fake-host-broker-args" 'ARG=--sandbox-bin'
+assert_no_line "$case_dir/captured-session/fake-host-broker-args" 'ARG=--exec-home'
 # The operator's own exported environment reaches host commands; the private
 # launcher protocol never does.
-assert_line "$case_dir/captured-host-stage/fake-host-broker-env" \
+assert_line "$case_dir/captured-session/fake-host-broker-args" \
   'ENV=ANDROID_HOME=/opt/test-android'
-assert_not_contains "$case_dir/captured-host-stage/fake-host-broker-env" \
+assert_not_contains "$case_dir/captured-session/fake-host-broker-args" \
   'ENV=AGENT_CONTAINER_'
-assert_not_contains "$case_dir/captured-host-stage/fake-host-broker-env" \
+assert_not_contains "$case_dir/captured-session/fake-host-broker-args" \
   'ENV=AGENT_WORKSPACE_'
 # The guest session mounts the host filesystem at /host, starts below it,
 # and receives the full-access handoff by name only.
@@ -1384,15 +1416,17 @@ pass "full host access runs the broker unsandboxed with the operator environment
 tests_run=$((tests_run + 1))
 new_case singleton_sandboxed_env_is_unchanged_by_full_access_support
 TEST_SINGLETON_LAUNCH=true
-AGENT_CONTAINER_HOST_BROKER_BIN="$fixture_dir/host-exec-broker"
-FAKE_CAPTURE_HOST_STAGE_DIR="$case_dir/captured-host-stage"
+sandboxed_snapshot_broker="$case_dir/snapshot-host-broker"
+write_session_snapshot_broker "$sandboxed_snapshot_broker" "$case_dir/captured-session"
+AGENT_CONTAINER_HOST_BROKER_BIN="$sandboxed_snapshot_broker"
 AGENT_CONTAINER_HOST_TOOLS=
 ANDROID_HOME=/opt/test-android
 run_program "$repo_root/bin/grok-container" --version \
   >"$case_dir/out" 2>"$case_dir/err"
-assert_line "$case_dir/captured-host-stage/fake-host-broker-args" 'ARG=--sandbox-bin'
-assert_no_line "$case_dir/captured-host-stage/fake-host-broker-args" 'ARG=--access'
-assert_not_contains "$case_dir/captured-host-stage/fake-host-broker-env" \
+assert_line "$case_dir/captured-session/access" sandboxed
+assert_line "$case_dir/captured-session/fake-host-broker-args" 'ARG=--sandbox-bin'
+assert_no_line "$case_dir/captured-session/fake-host-broker-args" 'ARG=--access'
+assert_not_contains "$case_dir/captured-session/fake-host-broker-args" \
   'ENV=ANDROID_HOME='
 assert_no_line "$case_log" 'ARG=/host'
 assert_no_line "$case_log" 'ARG=AGENT_WORKSPACE_FULL_ACCESS'
@@ -1434,6 +1468,9 @@ pass "the forward-ports and mirror options are rejected without full host access
 tests_run=$((tests_run + 1))
 new_case full_host_access_rejects_workspace_root_and_bad_ports
 TEST_SINGLETON_LAUNCH=true
+# With the host-tool channel at its default, the scope and port checks are the
+# first rules these launches reach.
+AGENT_CONTAINER_HOST_TOOLS=
 AGENT_CONTAINER_FULL_HOST_ACCESS=true
 AGENT_CONTAINER_WORKSPACE_ROOT="$case_dir"
 if run_program "$repo_root/bin/grok-container" --version \
@@ -1459,6 +1496,7 @@ pass "full host access validates its scope and port options before any native mu
 
 tests_run=$((tests_run + 1))
 new_case full_host_access_rejects_legacy_run
+AGENT_CONTAINER_HOST_TOOLS=
 AGENT_CONTAINER_FULL_HOST_ACCESS=true
 if run_program "$repo_root/bin/agent-container" run grok -- --version \
   >"$case_dir/out" 2>"$case_dir/err"; then
