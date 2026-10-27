@@ -269,6 +269,45 @@ capability the everyday path; `--container-host-exec-deny` narrows it, and
 is unavailable the default launch degrades to guest binaries with one
 warning; an explicit `--container-host-tools` fails closed instead.
 
+## Full host access
+
+`--container-full-host-access` deliberately removes this client's filesystem
+and host-command confinement. It is the one mode where the Agent is intended to
+act on the real machine, and it changes the trust model accordingly. It is off
+by default, requires the default persistent-singleton path and the host-tool
+channel, and is rejected together with `--no-container-host-tools` or
+`--container-workspace-root`.
+
+What the client gains:
+
+- the whole host filesystem, read-write, over SFTP/SSHFS mounted at `/host` and
+  mirrored at the standard macOS absolute paths, with the SFTP server running
+  **without** the `sandbox-exec` workspace profile — so it holds exactly the
+  operator's own filesystem permissions, not a workspace subset;
+- host commands executed **unsandboxed** as the macOS user, with the real
+  `HOME` and environment, so interpreters, build tools, `adb`, `xcrun`,
+  `xcodebuild`, `xctest`, and service controls behave as in the operator's
+  terminal, including leaving background services running;
+- reachability of allowlisted host loopback ports (the adb server by default)
+  through the broker's authenticated tunnel.
+
+The micro-VM is therefore **not** a security boundary for a full-access client:
+the Agent, the repository contents, prompts, and anything it executes can read,
+modify, or delete anything the macOS account can, run arbitrary host programs,
+and exfiltrate any reachable data. The authentication model is unchanged — each
+channel still requires the per-client 256-bit token, the tunnel still enforces
+its port allowlist, and both brokers still die with the client — but possession
+of host authority is now the whole point, not something the sandbox contains.
+
+Because every client of a profile shares one guest kernel, numeric UID, and
+profile HOME, the token and credentials of a full-access client are readable by
+any concurrent same-profile client through the shared process table and runtime
+directory. The launcher closes that gap by refusing to run a full-access client
+alongside any other client of the profile, and a sandboxed client alongside a
+live full-access one, using an access marker in each client's session
+registration. Treat a full-access launch as granting the profile, for its
+lifetime, the operator's own authority; stop the singleton when finished.
+
 ## Identity and Linux privilege
 
 Apple volume mounts have no UID/GID translation. The runtime creates or adjusts

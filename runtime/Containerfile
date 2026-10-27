@@ -223,11 +223,13 @@ RUN mkdir -p /workspace /Users \
 
 COPY entrypoint.sh /usr/local/bin/agent-container-entrypoint
 COPY host-exec-client /usr/local/bin/agent-host-exec
+COPY agent-host-tunnel /usr/local/bin/agent-host-tunnel
 COPY agent-workspace-connect /usr/local/bin/agent-workspace-connect
 COPY agent-workspace-session /usr/local/bin/agent-workspace-session
 RUN chmod 0755 \
       /usr/local/bin/agent-container-entrypoint \
       /usr/local/bin/agent-host-exec \
+      /usr/local/bin/agent-host-tunnel \
       /usr/local/bin/agent-workspace-connect \
       /usr/local/bin/agent-workspace-session \
     && ln -s /usr/local/bin/agent-host-exec /usr/local/bin/host-exec

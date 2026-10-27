@@ -2,6 +2,7 @@
 !entrypoint.sh
 !image-setup.sh
 !host-exec-client
+!agent-host-tunnel
 !agent-workspace-connect
 !agent-workspace-session
 !tests/fixtures/workspace-session-test-agent
