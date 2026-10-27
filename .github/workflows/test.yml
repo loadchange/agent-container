@@ -62,6 +62,7 @@ jobs:
             tests/test-agent-container.sh \
             tests/test-host-exec.sh \
             tests/test-host-full.sh \
+            tests/test-host-mirrors.sh \
             tests/test-install-uninstall.sh \
             tests/test-workspace-bridge.sh \
             tests/test-workspace-session-live.sh \
@@ -117,6 +118,7 @@ jobs:
             tests/test-agent-container.sh \
             tests/test-host-exec.sh \
             tests/test-host-full.sh \
+            tests/test-host-mirrors.sh \
             tests/test-install-uninstall.sh \
             tests/test-workspace-bridge.sh \
             tests/test-workspace-session-live.sh \
@@ -140,6 +142,11 @@ jobs:
 
       - name: Run full host access tests
         run: tests/test-host-full.sh
+
+      # Exercises the guest-side mirror merge; it reports a TAP skip on macOS
+      # and runs for real on a Linux host with root and a mount namespace.
+      - name: Run host mirror tests
+        run: tests/test-host-mirrors.sh
 
       - name: Run install and uninstall transaction tests
         run: tests/test-install-uninstall.sh

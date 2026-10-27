@@ -283,11 +283,15 @@ What the client gains:
 - the whole host filesystem, read-write, over SFTP/SSHFS mounted at `/host` and
   mirrored at the standard macOS absolute paths, with the SFTP server running
   **without** the `sandbox-exec` workspace profile — so it holds exactly the
-  operator's own filesystem permissions, not a workspace subset;
+  operator's own filesystem permissions, not a workspace subset. The guest home
+  remains the profile's shadow HOME with the real home's directories merged
+  into it; dotfiles on either side are not merged, but the host's are still
+  readable under `/host`;
 - host commands executed **unsandboxed** as the macOS user, with the real
-  `HOME` and environment, so interpreters, build tools, `adb`, `xcrun`,
-  `xcodebuild`, `xctest`, and service controls behave as in the operator's
-  terminal, including leaving background services running;
+  `HOME` and the operator's exported terminal environment, so interpreters,
+  build tools, `adb`, `xcrun`, `xcodebuild`, `xctest`, and service controls
+  behave as in the operator's terminal, including leaving background services
+  running;
 - reachability of allowlisted host loopback ports (the adb server by default)
   through the broker's authenticated tunnel.
 

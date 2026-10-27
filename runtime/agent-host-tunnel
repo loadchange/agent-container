@@ -3,24 +3,33 @@
 /**
  * Guest-side loopback forwarder for agent-container full host access.
  *
- * For each allowlisted port P it listens on the guest's 127.0.0.1:P and, for
- * every accepted connection, opens one connection to the host-exec broker's
- * tunnel listener, sends the single authentication frame
- *   AGENT-CONTAINER-TUNNEL/1 <token> <P>\n
+ * For each forwarded port it listens on the guest's 127.0.0.1 and, for every
+ * accepted connection, opens one connection to the host-exec broker's tunnel
+ * listener, sends the single authentication frame
+ *   AGENT-CONTAINER-TUNNEL/1 <token> <target port>\n
  * and then relays raw bytes in both directions. The host broker connects the
- * other end to its own 127.0.0.1:P, so a guest tool that speaks to
- * 127.0.0.1:5037 reaches the operator's real adb server, and so on.
+ * other end to its own 127.0.0.1:<target port>, so a guest tool that speaks
+ * to 127.0.0.1:5037 reaches the operator's real adb server, and so on.
+ *
+ * A port entry is either P (listen on P, reach host port P — the normal
+ * case) or LISTEN:TARGET, for a guest port that must differ from the host
+ * port (for example when a guest-side service already occupies it).
+ *
+ * Teardown is graceful: when one side finishes cleanly the other side is
+ * ended, not destroyed, so a service's final burst before it closes still
+ * reaches a slow guest reader; a bounded stall watchdog then closes a peer
+ * that never drains. Only an error destroys both sides at once.
  *
  * This is not a security boundary against the guest: the token it holds is the
  * guest's own per-session credential, and the host broker is the authority
- * that decides which ports may be reached. The forwarder only listens on the
- * loopback interface and never on a routable address.
+ * that decides which target ports may be reached. The forwarder only listens
+ * on the loopback interface and never on a routable address.
  *
  * Usage:
- *   agent-host-tunnel --endpoint IPV4:PORT --token 64HEX --ports P[,P...] \
- *     [--ready-fd N]
+ *   agent-host-tunnel --endpoint IPV4:PORT --token 64HEX \
+ *     --ports P[,P...] [--ready-fd N]
  * With --ready-fd, the single byte "1" is written to that inherited descriptor
- * once every listener is bound, so the launcher can proceed deterministically.
+ * once every listener is bound, so a launcher can proceed deterministically.
  */
 
 import net from 'node:net';
@@ -29,11 +38,19 @@ import process from 'node:process';
 
 const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 const CONNECT_TIMEOUT_MS = 5_000;
+const CLOSE_STALL_MS = 30_000;
 const MAX_CONNECTIONS = 256;
 
 function fail(message) {
   process.stderr.write(`agent-host-tunnel: ${message}\n`);
   process.exit(64);
+}
+
+function parsePort(text, label) {
+  if (!/^[1-9][0-9]{0,4}$/.test(text) || Number(text) > 65535) {
+    fail(`${label} must be a TCP port from 1 to 65535`);
+  }
+  return Number(text);
 }
 
 function parseArguments(argv) {
@@ -60,16 +77,18 @@ function parseArguments(argv) {
   const token = values.get('--token') ?? '';
   if (!TOKEN_PATTERN.test(token)) fail('--token must be 64 lowercase hex characters');
 
-  const portsText = values.get('--ports') ?? '';
-  const ports = [];
-  for (const part of portsText.split(',')) {
-    if (!/^[1-9][0-9]{0,4}$/.test(part) || Number(part) > 65535) {
-      fail('--ports must be a comma-separated list of TCP ports');
+  const forwards = [];
+  for (const entry of (values.get('--ports') ?? '').split(',')) {
+    const parts = entry.split(':');
+    if (parts.length > 2) fail('--ports entries are P or LISTEN:TARGET');
+    const listen = parsePort(parts[0], '--ports listen port');
+    const target = parts.length === 2 ? parsePort(parts[1], '--ports target port') : listen;
+    if (forwards.some((forward) => forward.listen === listen)) {
+      fail(`--ports lists guest port ${listen} twice`);
     }
-    const port = Number(part);
-    if (!ports.includes(port)) ports.push(port);
+    forwards.push({ listen, target });
   }
-  if (ports.length === 0) fail('--ports must list at least one port');
+  if (forwards.length === 0) fail('--ports must list at least one port');
 
   let readyFd = null;
   if (values.has('--ready-fd')) {
@@ -78,16 +97,34 @@ function parseArguments(argv) {
     readyFd = Number(text);
   }
 
-  return { host, endpointPort, token, ports, readyFd };
+  return { host, endpointPort, token, forwards, readyFd };
 }
 
-function relayConnection(local, configuration, port, live) {
+// End a socket and let its queued writes drain. A peer that stops reading is
+// cut off once the queue has made no progress for a whole stall window.
+function endGracefully(socket) {
+  if (socket.destroyed) return;
+  socket.resume();
+  socket.end();
+  let lastPending = Number.POSITIVE_INFINITY;
+  const watchdog = setInterval(() => {
+    const pending = socket.writableLength;
+    if (pending > 0 && pending < lastPending) {
+      lastPending = pending;
+      return;
+    }
+    socket.destroy();
+  }, CLOSE_STALL_MS);
+  watchdog.unref();
+  socket.once('close', () => clearInterval(watchdog));
+}
+
+function relayConnection(local, configuration, target, live) {
   if (live.size >= MAX_CONNECTIONS) {
     local.destroy();
     return;
   }
   live.add(local);
-  local.on('error', () => local.destroy());
   local.setNoDelay(true);
   local.pause();
 
@@ -96,22 +133,31 @@ function relayConnection(local, configuration, port, live) {
     port: configuration.endpointPort,
     allowHalfOpen: true,
   });
-  const connectTimer = setTimeout(() => upstream.destroy(new Error('connect timeout')), CONNECT_TIMEOUT_MS);
-  const closeBoth = () => {
+  const connectTimer = setTimeout(
+    () => upstream.destroy(new Error('connect timeout')),
+    CONNECT_TIMEOUT_MS,
+  );
+  const destroyBoth = () => {
     clearTimeout(connectTimer);
     local.destroy();
     upstream.destroy();
   };
-  local.on('close', () => {
+  local.on('error', destroyBoth);
+  upstream.on('error', destroyBoth);
+  local.once('close', (hadError) => {
     live.delete(local);
-    upstream.destroy();
+    if (hadError) destroyBoth();
+    else endGracefully(upstream);
   });
-  upstream.on('error', closeBoth);
-  upstream.on('close', closeBoth);
+  upstream.once('close', (hadError) => {
+    clearTimeout(connectTimer);
+    if (hadError) destroyBoth();
+    else endGracefully(local);
+  });
   upstream.once('connect', () => {
     clearTimeout(connectTimer);
     upstream.setNoDelay(true);
-    upstream.write(`AGENT-CONTAINER-TUNNEL/1 ${configuration.token} ${port}\n`);
+    upstream.write(`AGENT-CONTAINER-TUNNEL/1 ${configuration.token} ${target}\n`);
     local.pipe(upstream);
     upstream.pipe(local);
     local.resume();
@@ -130,18 +176,18 @@ function main() {
       // One byte, best effort: the launcher only waits for readability.
       writeSync(configuration.readyFd, '1');
     } catch {
-      // The launcher also polls the ports, so readiness is not fatal here.
+      // The launcher can also probe the ports, so readiness is not fatal here.
     }
   };
 
-  for (const port of configuration.ports) {
+  for (const forward of configuration.forwards) {
     const server = net.createServer({ allowHalfOpen: true }, (local) => {
-      relayConnection(local, configuration, port, live);
+      relayConnection(local, configuration, forward.target, live);
     });
-    server.on('error', (error) => fail(`cannot listen on 127.0.0.1:${port}: ${error.message}`));
-    server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
+    server.on('error', (error) => fail(`cannot listen on 127.0.0.1:${forward.listen}: ${error.message}`));
+    server.listen({ host: '127.0.0.1', port: forward.listen, exclusive: true }, () => {
       bound += 1;
-      if (bound === configuration.ports.length) onAllBound();
+      if (bound === configuration.forwards.length) onAllBound();
     });
     servers.push(server);
   }

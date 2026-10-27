@@ -1081,9 +1081,9 @@ if path_exists "$release_dir"; then
     > "$release_root_listing" 2>/dev/null \
     || die "Could not safely enumerate the existing release: $release_dir"
   release_root_count=$(wc -l < "$release_root_listing" | tr -d '[:space:]')
-  # Ten shared regular assets, four command aliases, the profiles directory,
+  # Eleven shared regular assets, four command aliases, the profiles directory,
   # release manifest, and ownership marker.
-  expected_root_count=17
+  expected_root_count=18
   [ "$release_root_count" = "$expected_root_count" ] \
     || die "Existing release contains unexpected root entries: $release_dir"
   release_profile_listing="$tmp_dir/existing-release-profile-list"

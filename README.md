@@ -488,10 +488,17 @@ With it enabled, for that one client:
   directories (`/Users`, `/Volumes`, `/Applications`, `/Library`, `/System`,
   `/private`, …) and any `--container-host-mirror` paths are also mirrored at
   their own absolute paths, so `/Users/you/project` means the same files inside
-  the guest as on the host. The SFTP server runs without the `sandbox-exec`
+  the guest as on the host, and the Agent starts in that real path rather than
+  under `/host`. Your guest home stays the profile's persistent shadow HOME:
+  the real home's directories (`project`, `Documents`, …) are merged into it,
+  while dotfiles on both sides — the Agent's Linux state and your macOS
+  `~/.ssh`, `~/.gitconfig`, and friends — are left exactly where they are
+  (the latter remain reachable under `/host`). An existing non-empty guest
+  directory is never covered. The SFTP server runs without the `sandbox-exec`
   workspace profile, so it carries exactly your own filesystem permissions.
 - **Host commands.** The host-tool broker runs each command unsandboxed, as the
-  macOS user, with your real `HOME` and environment — so `adb`, `xcrun`,
+  macOS user, with your real `HOME` and your terminal's exported environment
+  (`ANDROID_HOME`, `JAVA_HOME`, `DEVELOPER_DIR`, …) — so `adb`, `xcrun`,
   `xcodebuild`, `xctest`, `brew`, `launchctl`, and the like behave as in your
   own terminal, including starting and stopping host services. A guest working
   directory under `/host` is mapped back to its real host path automatically.

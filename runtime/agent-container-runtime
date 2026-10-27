@@ -4053,13 +4053,36 @@ build_host_broker_launch_environment() {
     "PATH=$host_broker_path"
     "HOME=$host_home_dir"
   )
-  [ -n "${LANG:-}" ] && broker_env+=("LANG=$LANG")
-  [ -n "${LC_ALL:-}" ] && broker_env+=("LC_ALL=$LC_ALL")
-  [ -n "${LC_CTYPE:-}" ] && broker_env+=("LC_CTYPE=$LC_CTYPE")
-  [ -n "${LC_MESSAGES:-}" ] && broker_env+=("LC_MESSAGES=$LC_MESSAGES")
-  [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
-  [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
-  [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
+  if [ "$full_host_access" = true ]; then
+    # Full host access: host commands should see the operator's own terminal
+    # environment (ANDROID_HOME, JAVA_HOME, DEVELOPER_DIR, ...), not the
+    # sandbox allowlist. Forward every exported variable bash imported (an
+    # environment entry whose name is not a valid identifier is never
+    # imported, so it is dropped) except PATH and HOME (fixed above), the
+    # private launcher/guest protocol names, shell bookkeeping and start-up
+    # controls, loader injection, and SSH_AUTH_SOCK, which the opt-out logic
+    # below decides. The Rust launcher already removed its dangerous ambient
+    # names before this runtime started.
+    local exported_name
+    for exported_name in $(compgen -e); do
+      case "$exported_name" in
+        PATH|HOME|SSH_AUTH_SOCK|_|SHLVL|PWD|OLDPWD|IFS|PS4) continue ;;
+        AGENT_CONTAINER_*|AGENT_WORKSPACE_*|BASH_FUNC_*) continue ;;
+        BASH_ENV|ENV|SHELLOPTS|BASHOPTS|CDPATH|GLOBIGNORE|POSIXLY_CORRECT|PROMPT_COMMAND) continue ;;
+        LD_*|DYLD_*) continue ;;
+      esac
+      # The `-` default keeps an exported-but-unset name from tripping set -u.
+      broker_env+=("$exported_name=${!exported_name-}")
+    done
+  else
+    [ -n "${LANG:-}" ] && broker_env+=("LANG=$LANG")
+    [ -n "${LC_ALL:-}" ] && broker_env+=("LC_ALL=$LC_ALL")
+    [ -n "${LC_CTYPE:-}" ] && broker_env+=("LC_CTYPE=$LC_CTYPE")
+    [ -n "${LC_MESSAGES:-}" ] && broker_env+=("LC_MESSAGES=$LC_MESSAGES")
+    [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
+    [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
+    [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
+  fi
   # The broker forwards this socket only to the host-first identity commands
   # (git/gh); generic cataloged commands keep an agent-free environment. This
   # is a per-client broker capability and never part of the singleton

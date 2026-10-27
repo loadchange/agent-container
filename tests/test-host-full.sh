@@ -195,25 +195,48 @@ node_bin_dir=$(CDPATH= cd -- "$node_bin_dir" && pwd -P)
 # --- Loopback echo servers for the tunnel tests ---------------------------
 
 ports_file="$test_root/echo-ports"
+# Three loopback services plus four reserved free ports: an echo service on
+# the allowlist, an echo service off it, a "burst" service that writes one
+# large response and closes immediately (the shape that exposes a relay which
+# destroys its peer on a clean close), and free ports for the guest forwarder
+# to listen on. On one machine the forwarder cannot share the services' port
+# numbers, so the tests use its LISTEN:TARGET form.
+burst_bytes=3145728
 cat > "$test_root/echo-servers.mjs" <<'EOF'
 import net from 'node:net';
 import { writeFileSync } from 'node:fs';
-const start = () => new Promise((resolve) => {
-  const server = net.createServer({ allowHalfOpen: true }, (socket) => {
-    socket.on('error', () => {});
-    socket.pipe(socket);
-  });
+const burstBytes = Number(process.argv[3]);
+const listen = (server) => new Promise((resolve) => {
   server.listen(0, '127.0.0.1', () => resolve(server.address().port));
 });
-const allowed = await start();
-const denied = await start();
-writeFileSync(process.argv[2], `${allowed} ${denied}\n`);
+const echo = () => listen(net.createServer({ allowHalfOpen: true }, (socket) => {
+  socket.on('error', () => {});
+  socket.pipe(socket);
+}));
+const burst = () => listen(net.createServer((socket) => {
+  socket.on('error', () => {});
+  socket.end(Buffer.alloc(burstBytes, 0x62));
+}));
+const reserve = async () => {
+  const server = net.createServer();
+  const port = await listen(server);
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+};
+const allowed = await echo();
+const denied = await echo();
+const burstPort = await burst();
+const free = [];
+for (let index = 0; index < 4; index += 1) free.push(await reserve());
+writeFileSync(process.argv[2], `${allowed} ${denied} ${burstPort} ${free.join(' ')}\n`);
 setInterval(() => {}, 1000);
 EOF
-node "$test_root/echo-servers.mjs" "$ports_file" &
+node "$test_root/echo-servers.mjs" "$ports_file" "$burst_bytes" &
 helper_pid=$!
-wait_until 10 file_is_nonempty "$ports_file" || fail 'echo servers did not start'
-read -r echo_allowed_port echo_denied_port < "$ports_file"
+wait_until 10 file_is_nonempty "$ports_file" || fail 'loopback services did not start'
+read -r echo_allowed_port echo_denied_port burst_port \
+  forward_echo_port forward_burst_port forward_unbound_port forward_badtoken_port \
+  < "$ports_file"
 
 # --- Start the full-access broker -----------------------------------------
 
@@ -240,7 +263,7 @@ broker_err="$test_root/broker.err"
     --bind-address 127.0.0.1 \
     --launcher-pid "$launcher_pid" \
     --real-home "$real_home" \
-    --tunnel-ports "$echo_allowed_port"
+    --tunnel-ports "$echo_allowed_port,$burst_port"
 ) > "$broker_out" 2> "$broker_err" &
 broker_pid=$!
 wait_until 15 file_is_nonempty "$session_dir/host-exec-endpoint" \
@@ -312,7 +335,7 @@ exec 8>&- 8<&-
   || fail 'the catalog does not report full access'
 [ "$(printf '%s' "$catalog_line" | jq -r '.tunnel.port')" = "$tunnel_port" ] \
   || fail 'the catalog does not report the tunnel port'
-[ "$(printf '%s' "$catalog_line" | jq -c '.tunnel.ports')" = "[$echo_allowed_port]" ] \
+[ "$(printf '%s' "$catalog_line" | jq -c '.tunnel.ports')" = "[$echo_allowed_port,$burst_port]" ] \
   || fail 'the catalog does not report the tunnel port allowlist'
 [ "$(printf '%s' "$catalog_line" | jq -r '.commands[] | select(.name == "hello") | .mode')" = first ] \
   || fail 'a host-first command is not marked first'
@@ -509,7 +532,30 @@ const tunnelPort = Number(process.env.T_PORT);
 const token = process.env.T_TOKEN;
 const allowed = Number(process.env.T_ALLOWED);
 const denied = Number(process.env.T_DENIED);
+const burst = Number(process.env.T_BURST);
+const burstBytes = Number(process.env.T_BURST_BYTES);
 const failures = [];
+
+// A slow reader: authenticate, then do not read for a while. The service has
+// long since written its whole response and closed by the time reading
+// starts, so every byte must still be sitting in the relay's queues.
+function slowRead(line, pauseMs) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    const socket = net.connect({ host, port: tunnelPort, allowHalfOpen: true });
+    socket.on('error', () => {});
+    socket.on('connect', () => {
+      socket.write(Buffer.from(line, 'latin1'));
+      socket.pause();
+      setTimeout(() => {
+        socket.on('data', (data) => chunks.push(data));
+        socket.resume();
+      }, pauseMs);
+    });
+    socket.on('close', () => resolve(Buffer.concat(chunks)));
+    setTimeout(() => socket.destroy(), pauseMs + 20000);
+  });
+}
 
 function attempt(line, payload, { halfClose = true, wait = 700 } = {}) {
   return new Promise((resolve) => {
@@ -558,16 +604,149 @@ const parallel = await Promise.all(Array.from({ length: 8 }, (_, index) =>
 check('parallel streams stay independent',
   parallel.every((data, index) => data.toString() === `stream-${index}`));
 
+const burstReply = await slowRead(`AGENT-CONTAINER-TUNNEL/1 ${token} ${burst}\n`, 1500);
+check(`a service's final burst before closing reaches a slow reader intact (${burstReply.length}/${burstBytes} bytes)`,
+  burstReply.length === burstBytes && burstReply.every((byte) => byte === 0x62));
+
 process.exit(failures.length === 0 ? 0 : 1);
 EOF
 tunnel_output=$(T_HOST="$broker_host" T_PORT="$tunnel_port" T_TOKEN="$session_token" \
   T_ALLOWED="$echo_allowed_port" T_DENIED="$echo_denied_port" \
+  T_BURST="$burst_port" T_BURST_BYTES="$burst_bytes" \
   node "$test_root/tunnel-check.mjs" 2>&1) \
   || fail "the loopback tunnel checks failed:
 $tunnel_output"
 case "$tunnel_output" in *FAIL*) fail "the loopback tunnel checks failed:
 $tunnel_output" ;; esac
 pass 'the loopback tunnel relays binary streams and rejects everything unauthenticated'
+
+# --- Guest forwarder (agent-host-tunnel) ----------------------------------
+
+forwarder_script="$repo_root/runtime/agent-host-tunnel"
+[ -f "$forwarder_script" ] || fail 'agent-host-tunnel is missing'
+port_accepts() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+port_refuses() { ! port_accepts "$1"; }
+
+# The forwarder is the guest side of the tunnel: it listens on the guest's
+# loopback and speaks the authentication frame for the configured target port.
+node "$forwarder_script" \
+  --endpoint "$broker_host:$tunnel_port" --token "$session_token" \
+  --ports "$forward_echo_port:$echo_allowed_port,$forward_burst_port:$burst_port" \
+  > "$test_root/forwarder.out" 2> "$test_root/forwarder.err" &
+forwarder_pid=$!
+extra_pids="$extra_pids $forwarder_pid"
+wait_until 10 port_accepts "$forward_echo_port" \
+  || fail "the guest forwarder did not listen: $(cat "$test_root/forwarder.err")"
+# A forwarder holding the wrong token must be turned away by the broker.
+node "$forwarder_script" \
+  --endpoint "$broker_host:$tunnel_port" --token "$zero_token" \
+  --ports "$forward_badtoken_port:$echo_allowed_port" \
+  > /dev/null 2>&1 &
+badtoken_forwarder_pid=$!
+extra_pids="$extra_pids $badtoken_forwarder_pid"
+wait_until 10 port_accepts "$forward_badtoken_port" \
+  || fail 'the wrong-token forwarder did not listen'
+
+cat > "$test_root/forwarder-check.mjs" <<'EOF'
+import net from 'node:net';
+
+const echoPort = Number(process.env.F_ECHO);
+const burstPort = Number(process.env.F_BURST);
+const unboundPort = Number(process.env.F_UNBOUND);
+const badTokenPort = Number(process.env.F_BADTOKEN);
+const burstBytes = Number(process.env.F_BURST_BYTES);
+const failures = [];
+function check(name, ok) {
+  if (!ok) failures.push(name);
+  console.log(`${ok ? 'PASS' : 'FAIL'} ${name}`);
+}
+function viaGuest(port, payload, { pauseMs = 0, halfClose = true, wait = 3000 } = {}) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let refused = false;
+    const socket = net.connect({ host: '127.0.0.1', port, allowHalfOpen: true });
+    socket.on('error', (error) => { refused = error.code === 'ECONNREFUSED'; });
+    socket.on('connect', () => {
+      if (pauseMs > 0) socket.pause();
+      if (payload.length > 0) socket.write(payload);
+      if (halfClose) socket.end();
+      if (pauseMs > 0) {
+        setTimeout(() => {
+          socket.on('data', (data) => chunks.push(data));
+          socket.resume();
+        }, pauseMs);
+      } else {
+        socket.on('data', (data) => chunks.push(data));
+      }
+    });
+    socket.on('close', () => resolve({ data: Buffer.concat(chunks), refused }));
+    setTimeout(() => socket.destroy(), wait + pauseMs);
+  });
+}
+
+const binary = Buffer.from(Array.from({ length: 70000 }, (_, index) => (index * 31 + 7) & 0xff));
+binary[33] = 0x0a;
+const echoed = await viaGuest(echoPort, binary);
+check('a guest loopback port reaches the mapped host service with binary payload intact',
+  Buffer.compare(echoed.data, binary) === 0);
+
+const parallel = await Promise.all(Array.from({ length: 6 }, (_, index) =>
+  viaGuest(echoPort, Buffer.from(`guest-${index}`))));
+check('parallel guest connections stay independent',
+  parallel.every((result, index) => result.data.toString() === `guest-${index}`));
+
+const burst = await viaGuest(burstPort, Buffer.alloc(0), { pauseMs: 1500, halfClose: false, wait: 20000 });
+check(`a service's final burst survives both relay hops to a slow guest reader (${burst.data.length}/${burstBytes} bytes)`,
+  burst.data.length === burstBytes && burst.data.every((byte) => byte === 0x62));
+
+const unbound = await viaGuest(unboundPort, Buffer.from('x'));
+check('a port the forwarder was not given is refused on the guest side', unbound.refused);
+
+const badToken = await viaGuest(badTokenPort, Buffer.from('x'));
+check('a forwarder holding the wrong token receives nothing from the broker',
+  !badToken.refused && badToken.data.length === 0);
+
+process.exit(failures.length === 0 ? 0 : 1);
+EOF
+forwarder_output=$(F_ECHO="$forward_echo_port" F_BURST="$forward_burst_port" \
+  F_UNBOUND="$forward_unbound_port" F_BADTOKEN="$forward_badtoken_port" \
+  F_BURST_BYTES="$burst_bytes" node "$test_root/forwarder-check.mjs" 2>&1) \
+  || fail "the guest forwarder checks failed:
+$forwarder_output"
+case "$forwarder_output" in *FAIL*) fail "the guest forwarder checks failed:
+$forwarder_output" ;; esac
+pass 'the guest forwarder maps loopback ports through the tunnel and honours its allowlist and token'
+
+kill -TERM "$forwarder_pid" "$badtoken_forwarder_pid" 2>/dev/null || true
+wait "$forwarder_pid" 2>/dev/null || true
+wait "$badtoken_forwarder_pid" 2>/dev/null || true
+wait_until 10 port_refuses "$forward_echo_port" \
+  || fail 'the guest forwarder kept listening after SIGTERM'
+pass 'the guest forwarder stops listening when terminated'
+
+expect_forwarder_rejection() {
+  local description=$1 expected=$2
+  shift 2
+  local rejection_output rejection_status=0
+  rejection_output=$(node "$forwarder_script" "$@" 2>&1) || rejection_status=$?
+  [ "$rejection_status" -ne 0 ] || fail "$description was accepted"
+  case "$rejection_output" in
+    *"$expected"*) ;;
+    *) fail "$description failed with the wrong message: $rejection_output" ;;
+  esac
+}
+forwarder_common=(--endpoint 127.0.0.1:1 --token "$session_token")
+expect_forwarder_rejection 'a missing endpoint' '--endpoint must be one IPv4:port' \
+  --token "$session_token" --ports 5037
+expect_forwarder_rejection 'a short token' '--token must be 64 lowercase hex' \
+  --endpoint 127.0.0.1:1 --token abc --ports 5037
+for bad_ports in '' 0 65536 abc '5037,' ':5037' '5037:' '1:2:3' '5037,5037' '5037:1,5037:2'; do
+  expect_forwarder_rejection "forwarder ports '$bad_ports'" '--ports' \
+    "${forwarder_common[@]}" --ports "$bad_ports"
+done
+expect_forwarder_rejection 'an unknown option' 'usage:' \
+  "${forwarder_common[@]}" --ports 5037 --bogus 1
+pass 'forwarder argument validation fails closed'
 
 # --- Argument validation ---------------------------------------------------
 

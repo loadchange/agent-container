@@ -26,6 +26,7 @@ ASSETS=(
   entrypoint.sh
   host-exec-client
   host-exec-broker.mjs
+  agent-host-tunnel
   agent-workspace-connect
   agent-workspace-session
   profiles/claude.json
@@ -115,6 +116,7 @@ make_release_source() {
     "$source_root/image-setup.sh" \
     "$source_root/entrypoint.sh" \
     "$source_root/host-exec-client" \
+    "$source_root/agent-host-tunnel" \
     "$source_root/agent-workspace-connect" \
     "$source_root/agent-workspace-session"
   write_manifest "$source_root"
@@ -474,7 +476,7 @@ done
 for asset in \
   agent-container-darwin-arm64 agent-container-runtime \
   Containerfile Containerfile.dockerignore image-setup.sh entrypoint.sh host-exec-client \
-  host-exec-broker.mjs agent-workspace-connect agent-workspace-session \
+  host-exec-broker.mjs agent-host-tunnel agent-workspace-connect agent-workspace-session \
   profiles/grok.json; do
   [ -f "$selective_grok_release/$asset" ] \
     && [ ! -L "$selective_grok_release/$asset" ] \

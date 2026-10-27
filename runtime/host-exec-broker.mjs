@@ -1760,14 +1760,19 @@ function connectLoopback(port) {
 
 // The guest socket stays paused until the upstream exists, so no byte that
 // follows the authentication line can be lost or reordered.
+//
+// Teardown is graceful in both directions: when one side finishes cleanly,
+// the other side is ended rather than destroyed, so bytes still queued for a
+// slow reader (a service's final burst before it closes, or a request the
+// guest sent just before closing) are delivered, under the same stall
+// watchdog the command channel uses. Only an error destroys both sides.
 async function relayTunnel(socket, port, remainder, tunnelSockets) {
   let upstream;
-  const closeBoth = () => {
+  const destroyBoth = () => {
     socket.destroy();
     upstream?.destroy();
   };
-  socket.on('error', closeBoth);
-  socket.on('close', closeBoth);
+  socket.on('error', destroyBoth);
   try {
     upstream = await connectLoopback(port);
   } catch {
@@ -1779,10 +1784,15 @@ async function relayTunnel(socket, port, remainder, tunnelSockets) {
     return;
   }
   tunnelSockets.add(upstream);
-  upstream.on('error', closeBoth);
-  upstream.once('close', () => {
+  upstream.on('error', destroyBoth);
+  upstream.once('close', (hadError) => {
     tunnelSockets.delete(upstream);
-    closeBoth();
+    if (hadError) destroyBoth();
+    else closeSocketSoon(socket, { patient: true });
+  });
+  socket.once('close', (hadError) => {
+    if (hadError) destroyBoth();
+    else closeSocketSoon(upstream, { patient: true });
   });
   upstream.setNoDelay(true);
   if (remainder.length > 0) upstream.write(remainder);

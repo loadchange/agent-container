@@ -332,14 +332,23 @@ parallel path:
 - The guest session helper mounts that channel at `/host`, then bind-mirrors
   the standard macOS top-level directories (and any `--container-host-mirror`
   paths) at their own absolute guest paths inside the private mount namespace.
-  An existing non-empty guest directory is never shadowed, and every mirror is
-  unwound before the SSHFS mount during cleanup.
+  A guest path that already holds content is merged into rather than covered:
+  the helper descends one level (to a bounded depth) and mirrors the child
+  directories that do not collide. That is what makes the operator's home
+  work — the guest's `/Users/<name>` is the profile's shadow HOME, so the real
+  home's directories are mirrored into it while dot-entries on either side are
+  never touched. A path already below one of the session's mirrors is a no-op,
+  so the procedure is idempotent. With the mirrors in place the Agent starts in
+  the real host path of its working directory when a mirror backs it. Every
+  mirror is unwound in reverse, after the Agent tree is gone and before the
+  SSHFS mount leaves `/host`.
 - The host-tool broker runs in `--access full`: each command runs directly as
-  the macOS user with the real `HOME` and the launcher's inherited environment
-  (launcher-internal names removed), any cwd is allowed (a `/host`-prefixed cwd
-  maps back to the host path), and a command that exits normally may leave a
-  background service running. The command catalog, deny list, and host-first
-  policy are still the broker's.
+  the macOS user with the real `HOME` and the operator's exported terminal
+  environment (the launcher's own protocol names, shell bookkeeping, loader
+  injection, and the SSH-agent socket per its opt-out are withheld), any cwd is
+  allowed (a `/host`-prefixed cwd maps back to the host path), and a command
+  that exits normally may leave a background service running. The command
+  catalog, deny list, and host-first policy are still the broker's.
 - The same broker opens a second authenticated listener on the host gateway:
   an allowlisted loopback tunnel. A small guest forwarder
   (`agent-host-tunnel`, Node) listens on the guest's `127.0.0.1:<port>` for
