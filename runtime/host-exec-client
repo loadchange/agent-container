@@ -122,21 +122,42 @@ if [ -t 0 ]; then
   stdin_enabled=false
 fi
 
+# The session helper records the broker's access level next to the endpoint
+# and token. Only the exact word `full` selects the full-access environment
+# policy below; anything else (including no file, as in legacy run sessions)
+# keeps the sandboxed policy.
+full_access=false
+access_mode_file="$host_exec_dir/host-exec-mode"
+if [ -f "$access_mode_file" ] && [ ! -L "$access_mode_file" ]; then
+  access_mode=''
+  IFS= read -r access_mode < "$access_mode_file" || true
+  [ "$access_mode" = full ] && full_access=true
+fi
+
 # Filter environment controls, loader injection, launcher internals, and names
 # that conventionally carry secrets. The broker independently applies the same
 # policy and constructs a clean host environment; this client-side filter is a
 # usability and least-surprise layer, not the authentication boundary.
+# Full access has no sandbox to protect, so only names that are meaningless or
+# harmful across the VM boundary (identity, paths, shell start-up injection,
+# guest Git/Corepack/pnpm settings) are withheld, and secret-looking names are
+# forwarded like any other variable the guest already holds.
 request_json=$(
   jq -cn \
     --arg token "$token" \
     --arg command "$command_name" \
     --arg cwd "$cwd" \
     --argjson stdin "$stdin_enabled" \
+    --argjson full "$full_access" \
     --args '
+      def valid_name: test("^[A-Za-z_][A-Za-z0-9_]*$");
+      def reserved_sandboxed:
+        test("^(AGENT_|HOST_|HOME$|PATH$|SHELL$|USER$|LOGNAME$|TMPDIR$|TMP$|TEMP$|PWD$|OLDPWD$|SHLVL$|_$|SSH_AUTH_SOCK$|BASH_ENV$|ENV$|CDPATH$|GLOBIGNORE$|SHELLOPTS$|NODE_OPTIONS$|NODE_PATH$|PYTHONHOME$|PYTHONPATH$|PYTHONSTARTUP$|RUBYOPT$|PERL5OPT$|GIT_CONFIG(_GLOBAL|_SYSTEM|_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+)?$|XDG_(CONFIG|CACHE|DATA|STATE)_HOME$|SSLKEYLOGFILE$|DYLD_.*|LD_.*)")
+        or test("(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|PRIVATE_KEY|API_KEY)($|_)"; "i");
+      def reserved_full:
+        test("^(AGENT_|HOST_|HOME$|PATH$|SHELL$|USER$|LOGNAME$|TMPDIR$|TMP$|TEMP$|PWD$|OLDPWD$|SHLVL$|_$|SSH_AUTH_SOCK$|XDG_RUNTIME_DIR$|BASH_ENV$|ENV$|CDPATH$|GLOBIGNORE$|SHELLOPTS$|PYTHONHOME$|PYTHONPATH$|NODE_PATH$|GIT_CONFIG(_GLOBAL|_SYSTEM|_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+)?$|COREPACK_.*|PNPM_CONFIG_.*|IS_SANDBOX$|DYLD_.*|LD_.*)");
       def safe_name:
-        test("^[A-Za-z_][A-Za-z0-9_]*$")
-        and (test("^(AGENT_|HOST_|HOME$|PATH$|SHELL$|USER$|LOGNAME$|TMPDIR$|TMP$|TEMP$|PWD$|OLDPWD$|SHLVL$|_$|SSH_AUTH_SOCK$|BASH_ENV$|ENV$|CDPATH$|GLOBIGNORE$|SHELLOPTS$|NODE_OPTIONS$|NODE_PATH$|PYTHONHOME$|PYTHONPATH$|PYTHONSTARTUP$|RUBYOPT$|PERL5OPT$|GIT_CONFIG(_GLOBAL|_SYSTEM|_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+)?$|XDG_(CONFIG|CACHE|DATA|STATE)_HOME$|SSLKEYLOGFILE$|DYLD_.*|LD_.*)") | not)
-        and (test("(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|PRIVATE_KEY|API_KEY)($|_)"; "i") | not);
+        valid_name and ((if $full then reserved_full else reserved_sandboxed end) | not);
       {
         v: 1,
         type: "run",

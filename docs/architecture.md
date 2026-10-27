@@ -312,6 +312,58 @@ the default launch warns once and continues with guest binaries; an explicit
 `--no-container-host-tools` skips the channel. The capability is per-client
 and therefore not part of the singleton configuration fingerprint.
 
+## Full host access
+
+`--container-full-host-access` is a per-client opt-in that inverts the default
+posture: instead of narrowing authority, it removes the filesystem and
+host-command confinement for one singleton client so the Agent can drive the
+real machine (host-connected devices through `adb`/`xcrun`/`xctest`, host
+services, the whole filesystem). It is off by default and is not part of the
+persistent VM configuration fingerprint.
+
+It reuses the existing transports in a wider configuration rather than adding a
+parallel path:
+
+- The workspace broker canonicalizes and serves filesystem root `/` and runs
+  `/usr/libexec/sftp-server` directly — without the `sandbox-exec` workspace
+  profile — through the Rust launcher's `__workspace-broker … --unrestricted`
+  mode. The 256-bit token, single-connection acceptance, and owner-liveness
+  pipe are unchanged, so the channel still ends with the client.
+- The guest session helper mounts that channel at `/host`, then bind-mirrors
+  the standard macOS top-level directories (and any `--container-host-mirror`
+  paths) at their own absolute guest paths inside the private mount namespace.
+  A guest path that already holds content is merged into rather than covered:
+  the helper descends one level (to a bounded depth) and mirrors the child
+  directories that do not collide. That is what makes the operator's home
+  work — the guest's `/Users/<name>` is the profile's shadow HOME, so the real
+  home's directories are mirrored into it while dot-entries on either side are
+  never touched. A path already below one of the session's mirrors is a no-op,
+  so the procedure is idempotent. With the mirrors in place the Agent starts in
+  the real host path of its working directory when a mirror backs it. Every
+  mirror is unwound in reverse, after the Agent tree is gone and before the
+  SSHFS mount leaves `/host`.
+- The host-tool broker runs in `--access full`: each command runs directly as
+  the macOS user with the real `HOME` and the operator's exported terminal
+  environment (the launcher's own protocol names, shell bookkeeping, loader
+  injection, and the SSH-agent socket per its opt-out are withheld), any cwd is
+  allowed (a `/host`-prefixed cwd maps back to the host path), and a command
+  that exits normally may leave a background service running. The command
+  catalog, deny list, and host-first policy are still the broker's.
+- The same broker opens a second authenticated listener on the host gateway:
+  an allowlisted loopback tunnel. A small guest forwarder
+  (`agent-host-tunnel`, Node) listens on the guest's `127.0.0.1:<port>` for
+  each `--container-host-forward-ports` entry (default `5037`, the adb server)
+  and relays to the host broker, which connects the far end to the host's own
+  `127.0.0.1:<port>`.
+
+Because all clients of a profile share one guest kernel, UID, and profile HOME,
+a full-access client cannot safely coexist with any other client of that
+profile: a concurrent sandboxed client could read the full client's unsandboxed
+host-exec token from the shared process table. The launcher records an access
+marker in each client's session registration and refuses to start a mixed set,
+and it reminds the operator to `singleton stop` the profile when the
+full-access client exits.
+
 ## Shadow HOME and static mounts
 
 For host `/Users/alice`, the persistent mapping is:

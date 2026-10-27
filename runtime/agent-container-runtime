@@ -933,6 +933,8 @@ Container launcher options (must precede the profile or Agent arguments):
   --container-host-node PATH      host Node.js override
   --container-host-exec-deny LIST comma-separated host commands never proxied
   --container-host-exec-first LIST comma-separated host commands that shadow guest copies
+  --container-host-forward-ports PORTS comma-separated host loopback ports reachable from the guest (full host access; default 5037)
+  --container-host-mirror PATHS   comma-separated extra host directories mirrored at their own guest paths (full host access)
   --container-host-gateway IP     default-network host gateway override
   --container-host-alias HOSTS    comma-separated guest names mapped to the host gateway
   --container-block-host HOSTS    comma-separated guest names mapped to IPv4/IPv6 blackholes
@@ -941,6 +943,7 @@ Container launcher options (must precede the profile or Agent arguments):
 
 Boolean container options:
   --container-enable-experimental
+  --container-full-host-access
   --container-host-tools
   --container-rebuild
   --container-skip-build
@@ -1208,6 +1211,7 @@ if [ ! -f "$asset_dir/Containerfile" ] \
   || [ ! -f "$asset_dir/entrypoint.sh" ] \
   || [ ! -f "$asset_dir/host-exec-client" ] \
   || [ ! -f "$asset_dir/host-exec-broker.mjs" ] \
+  || [ ! -f "$asset_dir/agent-host-tunnel" ] \
   || [ ! -f "$asset_dir/agent-workspace-connect" ] \
   || [ ! -f "$asset_dir/agent-workspace-session" ] \
   || [ ! -d "$asset_dir/profiles" ]; then
@@ -1229,6 +1233,8 @@ asset_dir=$(resolve_absolute_dir "$asset_dir") \
   || die "host-exec-client not found. Re-run install.sh or pass --container-assets PATH."
 [ -f "$asset_dir/host-exec-broker.mjs" ] && [ ! -L "$asset_dir/host-exec-broker.mjs" ] \
   || die "host-exec-broker.mjs not found. Re-run install.sh or pass --container-assets PATH."
+[ -f "$asset_dir/agent-host-tunnel" ] && [ ! -L "$asset_dir/agent-host-tunnel" ] \
+  || die "agent-host-tunnel not found. Re-run install.sh or pass --container-assets PATH."
 [ -f "$asset_dir/agent-workspace-connect" ] && [ ! -L "$asset_dir/agent-workspace-connect" ] \
   && [ -x "$asset_dir/agent-workspace-connect" ] \
   || die "agent-workspace-connect not found. Re-run install.sh or pass --container-assets PATH."
@@ -1417,6 +1423,81 @@ if [ -n "${AGENT_CONTAINER_HOST_SSH_AGENT+x}" ]; then
       die "--container-host-ssh-agent must be true or false."
       ;;
   esac
+fi
+
+# Full host access removes the micro-VM's filesystem and host-command
+# confinement for one client: the whole host filesystem is transported and
+# mounted at /host (with host directories mirrored at their own paths), host
+# commands run unsandboxed as the macOS user with the real HOME, and selected
+# host loopback ports (the adb server by default) are reachable from the guest.
+# It is off by default and never part of the persistent VM fingerprint.
+full_host_access=false
+if [ -n "${AGENT_CONTAINER_FULL_HOST_ACCESS+x}" ]; then
+  case "$AGENT_CONTAINER_FULL_HOST_ACCESS" in
+    true) full_host_access=true ;;
+    false) full_host_access=false ;;
+    *) die "--container-full-host-access must be true or false." ;;
+  esac
+fi
+
+# Guest loopback ports forwarded to the host's own 127.0.0.1 through the
+# authenticated host-exec tunnel. Default: the adb server port, so Android
+# tooling (adb, Gradle, Flutter, Appium) reaches host-connected devices.
+host_forward_ports_value="${AGENT_CONTAINER_HOST_FORWARD_PORTS:-}"
+host_mirror_value="${AGENT_CONTAINER_HOST_MIRROR:-}"
+if [ "$full_host_access" != true ]; then
+  [ -z "$host_forward_ports_value" ] \
+    || die "--container-host-forward-ports requires --container-full-host-access."
+  [ -z "$host_mirror_value" ] \
+    || die "--container-host-mirror requires --container-full-host-access."
+fi
+host_forward_ports=""
+if [ "$full_host_access" = true ]; then
+  [ -n "$host_forward_ports_value" ] || host_forward_ports_value="5037"
+  case "$host_forward_ports_value" in
+    none|'') host_forward_ports="" ;;
+    *)
+      case "$host_forward_ports_value" in
+        ,*|*,|*,,*|*$'\n'*|*$'\r'*|*$'\t'*)
+          die "--container-host-forward-ports must be a comma-separated list of TCP ports."
+          ;;
+      esac
+      IFS=, read -r -a requested_forward_ports <<EOF
+$host_forward_ports_value
+EOF
+      forward_ports_clean=()
+      for forward_port in "${requested_forward_ports[@]}"; do
+        case "$forward_port" in
+          ''|*[!0-9]*) die "--container-host-forward-ports contains a non-numeric port: $forward_port" ;;
+        esac
+        [ "${#forward_port}" -le 5 ] && [ "$forward_port" -ge 1 ] \
+          && [ "$forward_port" -le 65535 ] \
+          || die "--container-host-forward-ports contains an out-of-range port: $forward_port"
+        if [ "${#forward_ports_clean[@]}" -eq 0 ] \
+          || ! array_contains_value "$forward_port" "${forward_ports_clean[@]}"; then
+          forward_ports_clean+=("$forward_port")
+        fi
+      done
+      [ "${#forward_ports_clean[@]}" -le 64 ] \
+        || die "--container-host-forward-ports accepts at most 64 ports."
+      host_forward_ports=$(IFS=,; printf '%s' "${forward_ports_clean[*]}")
+      ;;
+  esac
+  reject_control_characters --container-host-mirror "$host_mirror_value"
+fi
+if [ "$full_host_access" = true ] && [ "$host_tools_mode" != true ]; then
+  die "--container-full-host-access needs the host-tool channel; do not combine it with --no-container-host-tools."
+fi
+# Full access always runs the host-tool channel and fails closed if it cannot.
+if [ "$full_host_access" = true ]; then
+  host_tools_mode=true
+  host_tools_explicit=true
+fi
+if [ "$full_host_access" = true ]; then
+  [ "$singleton_requested" = true ] \
+    || die "--container-full-host-access is supported only on the default persistent singleton path, not legacy run or singleton control."
+  [ -z "${AGENT_CONTAINER_WORKSPACE_ROOT:-}" ] \
+    || die "--container-full-host-access already transports the whole host filesystem; --container-workspace-root is not accepted with it."
 fi
 
 # Both launch modes share one host-tool policy vocabulary. The launcher list
@@ -3219,6 +3300,35 @@ run_singleton_client() {
   local singleton_pending_signal_status=""
   local forward_env_name
   local -a singleton_exec_args singleton_forwarded_env_names
+  local -a workspace_broker_extra_args=()
+  local workspace_broker_root="$mount_root"
+  local guest_mount_root="$mount_root"
+  local guest_workspace_cwd="$host_workspace"
+
+  # Full host access transports the whole host filesystem. The workspace broker
+  # serves "/" unrestricted; the guest mounts it at /host and the Agent's cwd is
+  # the host working directory under that mount point. The host-exec channel's
+  # /host-prefix mapping and the identical-path mirrors keep real host paths
+  # working on both sides.
+  if [ "$full_host_access" = true ]; then
+    workspace_broker_root="/"
+    workspace_broker_extra_args=(--unrestricted)
+    guest_mount_root="/host"
+    case "$host_workspace" in
+      /) guest_workspace_cwd="/host" ;;
+      *) guest_workspace_cwd="/host$host_workspace" ;;
+    esac
+    warn "======================================================================"
+    warn "FULL HOST ACCESS is enabled for this '$profile_id' client."
+    warn "The Agent can read and write your entire host filesystem (mounted at"
+    warn "/host, with host paths mirrored), run host commands unsandboxed as you"
+    warn "with your real HOME and credentials, and reach host loopback ports"
+    warn "(${host_forward_ports:-none} → the host's own 127.0.0.1)."
+    warn "The micro-VM is no longer a security boundary for this client. Use it"
+    warn "only with code and prompts you trust, and stop the VM when done:"
+    warn "  agent-container singleton stop $profile_id"
+    warn "======================================================================"
+  fi
 
   singleton_exec_is_active_job() {
     local job_pid job_state
@@ -3343,8 +3453,9 @@ run_singleton_client() {
     exec 7>&-
     : > "$broker_signal_ready"
     exec "$workspace_launcher_bin" \
-      __workspace-broker "$mount_root" "$host_gateway" \
-      --liveness-fd 8
+      __workspace-broker "$workspace_broker_root" "$host_gateway" \
+      --liveness-fd 8 \
+      ${workspace_broker_extra_args[@]+"${workspace_broker_extra_args[@]}"}
   ) > "$broker_record" 2> "$broker_log" &
   workspace_broker_pid=$!
   exec 8<&-
@@ -3463,6 +3574,19 @@ run_singleton_client() {
     )
   fi
 
+  if [ "$full_host_access" = true ]; then
+    # The session helper reads these to mount the host filesystem at /host,
+    # publish identical-path mirrors, and apply the full-access policy. Only the
+    # names cross the Apple CLI argument vector; the mirror list travels by
+    # value through the environment handoff.
+    export AGENT_WORKSPACE_FULL_ACCESS=1
+    export AGENT_WORKSPACE_HOST_MIRROR="$host_mirror_value"
+    singleton_exec_args+=(
+      --env AGENT_WORKSPACE_FULL_ACCESS
+      --env AGENT_WORKSPACE_HOST_MIRROR
+    )
+  fi
+
   # The persistent VM references only profile-scoped static staging. This
   # client's registration and host-tool broker session stay under its own
   # sessions/session-<pid> directory: the singleton-client mode marker lets
@@ -3489,7 +3613,7 @@ run_singleton_client() {
     exec "$container_bin" "${singleton_exec_args[@]}" \
       "$singleton_container_name" \
       /usr/local/bin/agent-workspace-session \
-      "$mount_root" "$host_workspace" "$host_uid" "$host_gid" \
+      "$guest_mount_root" "$guest_workspace_cwd" "$host_uid" "$host_gid" \
       "$profile_command" "$@"
   ) <&0 &
   singleton_exec_pid=$!
@@ -3506,6 +3630,9 @@ run_singleton_client() {
   workspace_broker_pid=""
   stop_host_broker
   trap - INT TERM HUP
+  if [ "$full_host_access" = true ]; then
+    warn "Full-host-access '$profile_id' client exited. The persistent VM keeps running; stop it when finished so a later client does not reuse it: agent-container singleton stop $profile_id"
+  fi
   exit "$run_status"
 }
 
@@ -3620,11 +3747,32 @@ for session_dir in "$sessions_root"/session-*; do
     [ "$registered_mode" = singleton-client ] \
       || die "Agent session registration has an invalid mode: $session_dir"
   fi
+  registered_access="sandboxed"
+  if [ -e "$session_dir/access" ] || [ -L "$session_dir/access" ]; then
+    registered_access=$(read_single_line "$session_dir/access" || true)
+    case "$registered_access" in
+      sandboxed|full) ;;
+      *) die "Agent session registration has an invalid access marker: $session_dir" ;;
+    esac
+  fi
   if kill -0 "$registered_pid" 2>/dev/null; then
     if [ "$registered_mode" = singleton-client ]; then
       # Live singleton clients share their profile VM and hold per-client
-      # broker staging; they do not conflict with another singleton client.
+      # broker staging; ordinary sandboxed clients do not conflict. Full host
+      # access is different: every client of a profile shares one guest UID and
+      # process table, so a concurrent client could read a full-access client's
+      # unsandboxed host-exec token and borrow its authority. A full-access
+      # client therefore requires the profile to itself, and no client may
+      # attach alongside a live full-access client of the same profile.
       if [ "$singleton_requested" = true ]; then
+        if [ "$registered_profile" = "$profile_id" ]; then
+          if [ "$full_host_access" = true ]; then
+            die "A '$profile_id' singleton client is active (PID $registered_pid). Full host access requires the profile to itself; stop other clients first (agent-container singleton stop $profile_id once they exit)."
+          fi
+          if [ "$registered_access" = full ]; then
+            die "A full-host-access '$profile_id' client is active (PID $registered_pid); a sandboxed client may not share its VM. Wait for it to exit."
+          fi
+        fi
         continue
       fi
       die "A '$registered_profile' singleton client is active (PID $registered_pid); stop it before using legacy run mode."
@@ -3707,6 +3855,13 @@ if [ "$singleton_requested" = true ]; then
   # Reconciliation and uninstall must be able to distinguish a live singleton
   # client's per-exec staging from a legacy attached run session.
   printf '%s\n' singleton-client > "$host_stage_dir/mode"
+  # The access marker lets a later launch enforce the full-access trust rule
+  # above without inspecting another client's private broker state.
+  if [ "$full_host_access" = true ]; then
+    printf '%s\n' full > "$host_stage_dir/access"
+  else
+    printf '%s\n' sandboxed > "$host_stage_dir/access"
+  fi
 fi
 
 host_node_bin=""
@@ -3898,13 +4053,36 @@ build_host_broker_launch_environment() {
     "PATH=$host_broker_path"
     "HOME=$host_home_dir"
   )
-  [ -n "${LANG:-}" ] && broker_env+=("LANG=$LANG")
-  [ -n "${LC_ALL:-}" ] && broker_env+=("LC_ALL=$LC_ALL")
-  [ -n "${LC_CTYPE:-}" ] && broker_env+=("LC_CTYPE=$LC_CTYPE")
-  [ -n "${LC_MESSAGES:-}" ] && broker_env+=("LC_MESSAGES=$LC_MESSAGES")
-  [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
-  [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
-  [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
+  if [ "$full_host_access" = true ]; then
+    # Full host access: host commands should see the operator's own terminal
+    # environment (ANDROID_HOME, JAVA_HOME, DEVELOPER_DIR, ...), not the
+    # sandbox allowlist. Forward every exported variable bash imported (an
+    # environment entry whose name is not a valid identifier is never
+    # imported, so it is dropped) except PATH and HOME (fixed above), the
+    # private launcher/guest protocol names, shell bookkeeping and start-up
+    # controls, loader injection, and SSH_AUTH_SOCK, which the opt-out logic
+    # below decides. The Rust launcher already removed its dangerous ambient
+    # names before this runtime started.
+    local exported_name
+    for exported_name in $(compgen -e); do
+      case "$exported_name" in
+        PATH|HOME|SSH_AUTH_SOCK|_|SHLVL|PWD|OLDPWD|IFS|PS4) continue ;;
+        AGENT_CONTAINER_*|AGENT_WORKSPACE_*|BASH_FUNC_*) continue ;;
+        BASH_ENV|ENV|SHELLOPTS|BASHOPTS|CDPATH|GLOBIGNORE|POSIXLY_CORRECT|PROMPT_COMMAND) continue ;;
+        LD_*|DYLD_*) continue ;;
+      esac
+      # The `-` default keeps an exported-but-unset name from tripping set -u.
+      broker_env+=("$exported_name=${!exported_name-}")
+    done
+  else
+    [ -n "${LANG:-}" ] && broker_env+=("LANG=$LANG")
+    [ -n "${LC_ALL:-}" ] && broker_env+=("LC_ALL=$LC_ALL")
+    [ -n "${LC_CTYPE:-}" ] && broker_env+=("LC_CTYPE=$LC_CTYPE")
+    [ -n "${LC_MESSAGES:-}" ] && broker_env+=("LC_MESSAGES=$LC_MESSAGES")
+    [ -n "${TZ:-}" ] && broker_env+=("TZ=$TZ")
+    [ -n "${USER:-}" ] && broker_env+=("USER=$USER")
+    [ -n "${LOGNAME:-}" ] && broker_env+=("LOGNAME=$LOGNAME")
+  fi
   # The broker forwards this socket only to the host-first identity commands
   # (git/gh); generic cataloged commands keep an agent-free environment. This
   # is a per-client broker capability and never part of the singleton
@@ -3966,9 +4144,20 @@ start_host_exec_broker() {
     --bind-address "$host_gateway"
     --launcher-pid "$$"
     --real-home "$host_home_dir"
-    --exec-home "$profile_host_exec_home"
-    --sandbox-bin /usr/bin/sandbox-exec
   )
+  if [ "$full_host_access" = true ]; then
+    # No sandbox and no isolated execution home: commands run as the operator
+    # with the real HOME. The broker also opens an authenticated loopback
+    # tunnel for the allowlisted ports.
+    broker_args+=(--access full)
+    [ -n "$host_forward_ports" ] \
+      && broker_args+=(--tunnel-ports "$host_forward_ports")
+  else
+    broker_args+=(
+      --exec-home "$profile_host_exec_home"
+      --sandbox-bin /usr/bin/sandbox-exec
+    )
+  fi
   # The broker must not inherit the lifecycle-lock descriptor: it outlives the
   # critical section and would otherwise serialize every later transaction.
   if [ -n "${AGENT_CONTAINER_HOST_BROKER_BIN:-}" ]; then
@@ -4528,6 +4717,7 @@ asset_fingerprint=$(
     sha256_file "$asset_dir/entrypoint.sh"
     sha256_file "$asset_dir/host-exec-client"
     sha256_file "$asset_dir/host-exec-broker.mjs"
+    sha256_file "$asset_dir/agent-host-tunnel"
     sha256_file "$asset_dir/agent-workspace-connect"
     sha256_file "$asset_dir/agent-workspace-session"
     sha256_file "$profile_file"

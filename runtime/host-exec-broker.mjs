@@ -41,6 +41,27 @@
  *
  * PTYs, terminal resize, file-descriptor passing, and reconnecting to a
  * detached service are intentionally out of scope for this first version.
+ *
+ * Full host access (--access full):
+ * The launcher opts one client out of the sandbox entirely. The same protocol
+ * and the same token authenticate the guest, but a command then
+ * - runs directly (no sandbox-exec) as the macOS user, with the real HOME and
+ *   this broker's inherited environment (launcher-internal names removed);
+ * - may start in any host directory (a cwd below the guest's /host mount is
+ *   mapped back to the host path; a guest-only cwd falls back to HOME with a
+ *   note on stderr);
+ * - is selected from the whole PATH catalog with no tool-root containment;
+ * - may leave background processes behind: the process group is only
+ *   signalled when the guest disconnects early, never after a normal exit.
+ *   A background process that keeps the output pipes open is cut loose after
+ *   a short idle period instead of hanging the guest forever.
+ * A second listener on the same host-only address relays authenticated,
+ * allowlisted loopback ports. Its first line is
+ *   AGENT-CONTAINER-TUNNEL/1 <token> <port>\n
+ * and everything after it is an unmodified byte stream to 127.0.0.1:<port>.
+ * Nothing here is a security boundary against the guest: possession of the
+ * token is the whole authorization. Do not expose the listeners beyond the
+ * VM gateway address.
  */
 
 import { constants as fsConstants } from 'node:fs';
@@ -103,6 +124,17 @@ const LIMITS = Object.freeze({
   authenticationMs: 15_000,
   terminateGraceMs: 1_000,
   launcherPollMs: 500,
+  // A finished command's socket is force-closed only after its queued output
+  // has stopped draining for this long (normally the guest closes first).
+  closeStallMs: 30_000,
+  // Full access mode only.
+  fullEnvCount: 1024,
+  exitDrainMs: 400,
+  tunnelPorts: 64,
+  tunnelConnections: 128,
+  tunnelAuthBytes: 160,
+  tunnelAuthMs: 5_000,
+  tunnelConnectMs: 5_000,
 });
 
 const SAFE_COMMAND_NAME = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
@@ -129,6 +161,19 @@ const FORWARDED_HOST_ENV = new Set([
   'USER',
   'LOGNAME',
 ]);
+
+// Full access mode (--access full). With no sandbox, the name filters shrink
+// to the variables that are meaningless or harmful once they cross the VM
+// boundary: guest identity and path variables, shell start-up injection
+// points, guest Git configuration, and image-specific Corepack/pnpm paths.
+// Reserved names are dropped rather than rejected so a guest client that
+// disagrees about the list can never turn a harmless difference into a failed
+// command. Secret-looking names are forwarded: the guest already holds them.
+const GUEST_HOST_ROOT = '/host';
+const FULL_RESERVED_ENV_PATTERN = /^(?:AGENT_|HOST_|HOME$|PATH$|SHELL$|USER$|LOGNAME$|TMPDIR$|TMP$|TEMP$|PWD$|OLDPWD$|SHLVL$|_$|SSH_AUTH_SOCK$|XDG_RUNTIME_DIR$|BASH_ENV$|ENV$|CDPATH$|GLOBIGNORE$|SHELLOPTS$|PYTHONHOME$|PYTHONPATH$|NODE_PATH$|GIT_CONFIG(?:_GLOBAL|_SYSTEM|_COUNT|_KEY_[0-9]+|_VALUE_[0-9]+)?$|COREPACK_.*|PNPM_CONFIG_.*|IS_SANDBOX$|DYLD_.*|LD_.*)/;
+// The launcher's private protocol variables never reach a host command.
+const LAUNCHER_INTERNAL_ENV_PATTERN = /^(?:AGENT_CONTAINER_|AGENT_WORKSPACE_)/;
+const TUNNEL_AUTH_PATTERN = /^AGENT-CONTAINER-TUNNEL\/1 ([0-9a-f]{64}) ([1-9][0-9]{0,4})$/;
 
 // These paths are part of the macOS runtime, not user-selected tool roots.
 // system.sb supplies most dylib/framework rules; the explicit paths cover
@@ -177,7 +222,9 @@ function usage() {
   --launcher-pid PID \\
   --real-home ABSOLUTE_DIR \\
   --exec-home ABSOLUTE_DIR \\
-  --sandbox-bin ABSOLUTE_EXECUTABLE`;
+  --sandbox-bin ABSOLUTE_EXECUTABLE
+  (or, for full host access, replace the last two options with
+   --access full [--tunnel-ports PORT[,PORT...]])`;
 }
 
 function fail(code, message) {
@@ -237,6 +284,8 @@ function parseArguments(argv) {
     '--real-home',
     '--exec-home',
     '--sandbox-bin',
+    '--access',
+    '--tunnel-ports',
   ]);
 
   for (let index = 0; index < argv.length; index += 2) {
@@ -250,10 +299,29 @@ function parseArguments(argv) {
     }
     values.set(name, value);
   }
-  for (const name of allowed) {
+
+  const access = values.get('--access') ?? 'sandboxed';
+  if (access !== 'sandboxed' && access !== 'full') {
+    fail('INVALID_ARGUMENT', '--access must be sandboxed or full.');
+  }
+  for (const name of ['--session-dir', '--bind-address', '--launcher-pid', '--real-home']) {
     if (!values.has(name)) {
       fail('INVALID_ARGUMENT', `Missing ${name}.\n${usage()}`);
     }
+  }
+  for (const name of ['--exec-home', '--sandbox-bin']) {
+    if (access === 'sandboxed' && !values.has(name)) {
+      fail('INVALID_ARGUMENT', `Missing ${name}.\n${usage()}`);
+    }
+    // Full access has no sandbox and no isolated home. Refuse the options
+    // instead of silently ignoring them so a caller can never believe it is
+    // still confined.
+    if (access === 'full' && values.has(name)) {
+      fail('INVALID_ARGUMENT', `${name} is not used with --access full.`);
+    }
+  }
+  if (access === 'sandboxed' && values.has('--tunnel-ports')) {
+    fail('INVALID_ARGUMENT', '--tunnel-ports requires --access full.');
   }
 
   const launcherPidText = values.get('--launcher-pid');
@@ -268,12 +336,14 @@ function parseArguments(argv) {
   const bindAddress = values.get('--bind-address');
   validateBindAddress(bindAddress);
   return {
+    access,
     sessionDirInput: values.get('--session-dir'),
     bindAddress,
     launcherPid,
     realHomeInput: values.get('--real-home'),
-    execHomeInput: values.get('--exec-home'),
-    sandboxBinInput: values.get('--sandbox-bin'),
+    execHomeInput: values.get('--exec-home') ?? null,
+    sandboxBinInput: values.get('--sandbox-bin') ?? null,
+    tunnelPortsInput: values.get('--tunnel-ports') ?? '',
   };
 }
 
@@ -708,6 +778,102 @@ async function buildCatalogManifests(sessionDir, realHome, execHome, roots, spec
   await writeGeneratedManifest(sessionDir, FILES.commands, commandLines);
 }
 
+async function readSessionToken(sessionDir) {
+  const tokenText = await readTrustedManifest(sessionDir, FILES.token, { maxBytes: 1024 });
+  const token = tokenText.endsWith('\n') ? tokenText.slice(0, -1) : tokenText;
+  if (!TOKEN_PATTERN.test(token) || tokenText !== `${token}\n`) {
+    fail('INVALID_MANIFEST', `${FILES.token} must contain exactly one lowercase 64-hex token and a newline.`);
+  }
+  return token;
+}
+
+function parseTunnelPorts(value) {
+  if (value === '') return [];
+  const ports = [];
+  for (const text of value.split(',')) {
+    if (!/^[1-9][0-9]{0,4}$/.test(text) || Number(text) > 65535) {
+      fail('INVALID_ARGUMENT', '--tunnel-ports must be a comma-separated list of TCP ports from 1 to 65535.');
+    }
+    const port = Number(text);
+    if (!ports.includes(port)) ports.push(port);
+  }
+  if (ports.length > LIMITS.tunnelPorts) {
+    fail('INVALID_ARGUMENT', `--tunnel-ports accepts at most ${LIMITS.tunnelPorts} ports.`);
+  }
+  return ports;
+}
+
+// Full access mode: the catalog is simply "what a terminal would find". The
+// first PATH occurrence of a name claims it, exactly like lookup, and the
+// entry keeps its PATH location (not the symlink target) so multi-call
+// binaries still see the name they were invoked as. No tool-root containment
+// and no Agent-writable exclusion apply, because nothing is sandboxed and the
+// Agent can already write anywhere the account can.
+async function buildUnrestrictedCommands(specification) {
+  const commands = new Map();
+  let droppedByCap = 0;
+  for (const directory of specification.pathDirectories) {
+    let canonicalPathDirectory;
+    try {
+      canonicalPathDirectory = await realpath(directory);
+      if (!(await stat(canonicalPathDirectory)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    if (hasUnsafePathCharacters(canonicalPathDirectory)) continue;
+    let entryNames;
+    try {
+      entryNames = (await readdir(canonicalPathDirectory)).sort();
+    } catch {
+      continue;
+    }
+    for (const entryName of entryNames) {
+      if (!SAFE_COMMAND_NAME.test(entryName)) continue;
+      if (commands.has(entryName) || specification.deny.has(entryName)) continue;
+      const candidate = path.join(canonicalPathDirectory, entryName);
+      if (!(await usableExecutableFile(candidate))) continue;
+      if (commands.size >= LIMITS.commandManifestLines) {
+        droppedByCap += 1;
+        continue;
+      }
+      commands.set(entryName, Object.freeze({
+        mode: specification.first.has(entryName) ? 'first' : 'fallback',
+        name: entryName,
+        executable: candidate,
+      }));
+    }
+  }
+  if (droppedByCap > 0) {
+    process.stderr.write(`host-exec-broker: command catalog reached its ${LIMITS.commandManifestLines}-entry bound; ${droppedByCap} later PATH commands were dropped\n`);
+  }
+  return commands;
+}
+
+async function loadFullConfiguration(argumentsValue) {
+  const sessionDir = await canonicalDirectory(argumentsValue.sessionDirInput, '--session-dir');
+  const realHome = await canonicalDirectory(argumentsValue.realHomeInput, '--real-home');
+  const token = await readSessionToken(sessionDir);
+  const specification = await readCatalogSpecification(sessionDir);
+  if (specification === null) {
+    fail('INVALID_MANIFEST', `${FILES.catalog} is missing.`);
+  }
+  const commands = await buildUnrestrictedCommands(specification);
+  if (commands.size === 0) {
+    fail('INVALID_MANIFEST', 'No host command could be cataloged from the staged PATH directories.');
+  }
+  return Object.freeze({
+    ...argumentsValue,
+    sessionDir,
+    realHome,
+    token,
+    tokenBuffer: Buffer.from(token, 'ascii'),
+    commands,
+    tunnelPorts: Object.freeze(parseTunnelPorts(argumentsValue.tunnelPortsInput)),
+    // Mutable on purpose: the tunnel listener publishes its port after bind.
+    runtime: { tunnelPort: 0 },
+  });
+}
+
 async function loadConfiguration(argumentsValue) {
   const sessionDir = await canonicalDirectory(argumentsValue.sessionDirInput, '--session-dir');
   const realHome = await canonicalDirectory(argumentsValue.realHomeInput, '--real-home');
@@ -717,11 +883,7 @@ async function loadConfiguration(argumentsValue) {
   }
   const sandboxBin = await canonicalExecutable(argumentsValue.sandboxBinInput, '--sandbox-bin');
 
-  const tokenText = await readTrustedManifest(sessionDir, FILES.token, { maxBytes: 1024 });
-  const token = tokenText.endsWith('\n') ? tokenText.slice(0, -1) : tokenText;
-  if (!TOKEN_PATTERN.test(token) || tokenText !== `${token}\n`) {
-    fail('INVALID_MANIFEST', `${FILES.token} must contain exactly one lowercase 64-hex token and a newline.`);
-  }
+  const token = await readSessionToken(sessionDir);
 
   const rootText = await readTrustedManifest(sessionDir, FILES.roots);
   const roots = await parseCanonicalRootLines(rootText, FILES.roots, realHome, execHome, true);
@@ -852,13 +1014,23 @@ function validateRequest(request, configuration) {
     fail('INVALID_REQUEST', 'argv exceeds the total byte limit.');
   }
 
-  if (!isPlainObject(request.env) || Object.keys(request.env).length > LIMITS.envCount) {
+  const fullAccess = configuration.access === 'full';
+  const envLimit = fullAccess ? LIMITS.fullEnvCount : LIMITS.envCount;
+  if (!isPlainObject(request.env) || Object.keys(request.env).length > envLimit) {
     fail('INVALID_REQUEST', 'env is not a bounded object.');
   }
   let envBytes = 0;
   const forwardedEnvironment = {};
   for (const [name, value] of Object.entries(request.env)) {
-    if (!isForwardableEnvironmentName(name) || typeof value !== 'string'
+    if (fullAccess) {
+      if (!SAFE_ENV_NAME.test(name) || byteLength(name) > LIMITS.envNameBytes
+        || typeof value !== 'string' || value.includes('\0')
+        || byteLength(value) > LIMITS.envValueBytes) {
+        fail('INVALID_REQUEST', 'env contains an invalid or oversized entry.');
+      }
+      // Guest identity and path variables are dropped, not rejected.
+      if (FULL_RESERVED_ENV_PATTERN.test(name)) continue;
+    } else if (!isForwardableEnvironmentName(name) || typeof value !== 'string'
       || value.includes('\0') || byteLength(value) > LIMITS.envValueBytes) {
       fail('INVALID_REQUEST', 'env contains a reserved, invalid, or oversized entry.');
     }
@@ -876,7 +1048,8 @@ function validateRequest(request, configuration) {
   // the real GitHub/Git configuration read-only, so these configuration-
   // changing auth operations cannot complete reliably. Reject them after the
   // complete protocol shape is validated but before spawn.
-  const ghAuthMutation = command.name === 'gh'
+  const ghAuthMutation = !fullAccess
+    && command.name === 'gh'
     && request.argv[0] === 'auth'
     && ['login', 'logout', 'refresh', 'setup-git'].includes(request.argv[1]);
   if (ghAuthMutation) {
@@ -920,9 +1093,37 @@ async function resolveRequestCwd(cwdInput, configuration) {
   return cwd;
 }
 
+// Full access mode has no execution roots. A guest cwd below the /host mount
+// is the same directory as the host path without that prefix; any other path
+// is tried as given. A directory that exists only inside the guest (for
+// example /tmp/scratch) must not make `adb devices` or `xcrun simctl list`
+// fail, so the command runs in the real HOME and says so on stderr instead of
+// silently guessing: relative arguments are the only thing that can differ.
+async function resolveFullCwd(cwdInput, configuration) {
+  const candidates = [];
+  if (cwdInput === GUEST_HOST_ROOT || cwdInput.startsWith(`${GUEST_HOST_ROOT}/`)) {
+    candidates.push(cwdInput.slice(GUEST_HOST_ROOT.length) || '/');
+  }
+  candidates.push(cwdInput);
+  for (const candidate of candidates) {
+    try {
+      const resolved = await realpath(candidate);
+      if ((await stat(resolved)).isDirectory()) return { cwd: resolved, note: null };
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return {
+    cwd: configuration.realHome,
+    note: `host-exec: note: ${JSON.stringify(cwdInput)} does not exist on the macOS host; running in ${JSON.stringify(configuration.realHome)} instead.\n`,
+  };
+}
+
 // A catalog request answers with the enabled command names and their guest
 // PATH mode, then ends the connection. Guest session helpers use it to build
-// local shims; command executable paths stay host-side.
+// local shims; command executable paths stay host-side. A full-access broker
+// additionally reports its access level and loopback tunnel endpoint so the
+// guest never has to be told out of band.
 function handleCatalogRequest(context, request, configuration) {
   const allowedKeys = new Set(['v', 'type', 'token']);
   if (!isPlainObject(request)
@@ -933,8 +1134,18 @@ function handleCatalogRequest(context, request, configuration) {
   verifySessionToken(request.token, configuration);
   const commands = [...configuration.commands.values()]
     .map((command) => ({ name: command.name, mode: command.mode }));
+  const response = { type: 'catalog', commands };
+  if (configuration.access === 'full') {
+    response.access = 'full';
+    if (configuration.runtime.tunnelPort > 0) {
+      response.tunnel = {
+        port: configuration.runtime.tunnelPort,
+        ports: [...configuration.tunnelPorts],
+      };
+    }
+  }
   if (enterTerminalState(context)) {
-    sendFrame(context.socket, { type: 'catalog', commands });
+    sendFrame(context.socket, response);
     closeSocketSoon(context.socket);
   }
 }
@@ -1063,6 +1274,28 @@ function buildChildEnvironment(configuration, command, forwardedEnvironment) {
   return environment;
 }
 
+// Full access environment: the broker's own inherited environment is the
+// user's terminal environment as the launcher saw it (launcher-internal names
+// removed, SSH_AUTH_SOCK present only when the launcher chose to keep it), the
+// real HOME replaces any isolated one, and the guest request layers its own
+// non-reserved variables on top (locale, TERM, ANDROID_SERIAL, ...).
+function buildUnrestrictedEnvironment(configuration, forwardedEnvironment, cwd) {
+  const environment = {};
+  for (const [name, value] of Object.entries(process.env)) {
+    if (typeof value !== 'string' || value.includes('\0')) continue;
+    if (LAUNCHER_INTERNAL_ENV_PATTERN.test(name)) continue;
+    environment[name] = value;
+  }
+  environment.HOME = configuration.realHome;
+  environment.PWD = cwd;
+  if (!environment.PATH) environment.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+  if (!environment.SHELL) environment.SHELL = '/bin/zsh';
+  environment.AGENT_CONTAINER_HOST_EXEC = '1';
+  environment.AGENT_HOST_ACCESS = 'full';
+  Object.assign(environment, forwardedEnvironment);
+  return environment;
+}
+
 function strictBase64(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > Math.ceil(LIMITS.stdinFrameBytes / 3) * 4 + 4
     || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
@@ -1095,8 +1328,34 @@ function sendError(socket, error) {
   sendFrame(socket, { type: 'error', code, message });
 }
 
-function closeSocketSoon(socket) {
+// Error and catalog replies are one small frame: close promptly so a peer
+// that never closes its half cannot hold a connection slot.
+//
+// After an exit frame (`patient`), megabytes of command output may still be
+// queued for a slow guest. Destroying the socket then would discard Node's
+// unsent buffer, and closing it while late input (a stdin_end frame racing
+// the exit frame) sits unread makes the kernel answer with a reset that also
+// discards the output already in flight. So late input is read and ignored,
+// the write side is ended, and the socket is destroyed only once the guest
+// closes its side or the queued output has stopped draining for a while.
+function closeSocketSoon(socket, { patient = false } = {}) {
   if (socket.destroyed) return;
+  if (patient) {
+    socket.resume();
+    socket.end();
+    let lastPending = Number.POSITIVE_INFINITY;
+    const watchdog = setInterval(() => {
+      const pending = socket.writableLength;
+      if (pending > 0 && pending < lastPending) {
+        lastPending = pending;
+        return;
+      }
+      socket.destroy();
+    }, LIMITS.closeStallMs);
+    watchdog.unref();
+    socket.once('close', () => clearInterval(watchdog));
+    return;
+  }
   socket.pause();
   socket.end();
   if (typeof socket.destroySoon === 'function') socket.destroySoon();
@@ -1144,14 +1403,42 @@ function failContext(context, error) {
   closeSocketSoon(context.socket);
 }
 
-function attachOutputStream(stream, socket, type) {
+function attachOutputStream(stream, socket, type, context) {
+  // A pipe read error ends this stream; it must not crash the broker.
+  stream.on('error', () => {});
   stream.on('data', (chunk) => {
     const writable = sendFrame(socket, { type, data: chunk.toString('base64') });
+    // After a full-access leader exits, output that is still flowing keeps the
+    // drain window open; only a silent pipe is cut loose.
+    if (context.exited) armDrainTimer(context);
     if (!writable && !socket.destroyed) {
       stream.pause();
       socket.once('drain', () => stream.resume());
     }
   });
+}
+
+// Full access only. A command may legitimately leave a daemon behind (adb's
+// server, an emulator started with `&`). That daemon can still hold this
+// command's stdout/stderr, in which case 'close' would never fire and the
+// guest would hang for as long as the daemon lives. Once the leader has
+// exited, wait for the pipes to go quiet and then stop reading them.
+// A pipe this broker paused for backpressure is not quiet: the guest simply
+// has not consumed its output yet, and bytes still queued in the OS pipe
+// would be lost by destroying it. While the guest socket is alive the timer
+// therefore re-arms; once it is gone nothing can consume the output anyway.
+function armDrainTimer(context) {
+  if (context.drainTimer) clearTimeout(context.drainTimer);
+  context.drainTimer = setTimeout(() => {
+    context.drainTimer = undefined;
+    const { stdout, stderr } = context.child ?? {};
+    if (!context.socket.destroyed && (stdout?.isPaused() || stderr?.isPaused())) {
+      armDrainTimer(context);
+      return;
+    }
+    stdout?.destroy();
+    stderr?.destroy();
+  }, LIMITS.exitDrainMs);
 }
 
 async function spawnRequest(context, validated, configuration, activeContexts) {
@@ -1162,9 +1449,15 @@ async function spawnRequest(context, validated, configuration, activeContexts) {
   // burst of requests can all observe the same pre-spawn count and exceed the
   // advertised per-session concurrency bound.
   activeContexts.add(context);
+  const fullAccess = configuration.access === 'full';
   let cwd;
+  let cwdNote = null;
   try {
-    cwd = await resolveRequestCwd(validated.request.cwd, configuration);
+    if (fullAccess) {
+      ({ cwd, note: cwdNote } = await resolveFullCwd(validated.request.cwd, configuration));
+    } else {
+      cwd = await resolveRequestCwd(validated.request.cwd, configuration);
+    }
   } catch (error) {
     activeContexts.delete(context);
     throw error;
@@ -1174,26 +1467,46 @@ async function spawnRequest(context, validated, configuration, activeContexts) {
     return;
   }
 
-  const profile = buildCommandSandboxProfile(configuration, validated.command);
-  if (byteLength(profile) > LIMITS.sandboxProfileBytes) {
-    activeContexts.delete(context);
-    fail('INVALID_MANIFEST', 'The generated command sandbox profile is too large.');
+  let spawnFile;
+  let spawnArguments;
+  let childEnvironment;
+  const spawnExtras = {};
+  if (fullAccess) {
+    // No sandbox: run the cataloged executable directly, as a terminal would,
+    // with argv[0] set to the name the guest typed.
+    spawnFile = validated.command.executable;
+    spawnArguments = validated.request.argv;
+    spawnExtras.argv0 = validated.command.name;
+    childEnvironment = buildUnrestrictedEnvironment(
+      configuration,
+      validated.forwardedEnvironment,
+      cwd,
+    );
+  } else {
+    const profile = buildCommandSandboxProfile(configuration, validated.command);
+    if (byteLength(profile) > LIMITS.sandboxProfileBytes) {
+      activeContexts.delete(context);
+      fail('INVALID_MANIFEST', 'The generated command sandbox profile is too large.');
+    }
+    childEnvironment = buildChildEnvironment(
+      configuration,
+      validated.command,
+      validated.forwardedEnvironment,
+    );
+    spawnFile = configuration.sandboxBin;
+    spawnArguments = ['-p', profile, validated.command.executable, ...validated.request.argv];
   }
-  const childEnvironment = buildChildEnvironment(
-    configuration,
-    validated.command,
-    validated.forwardedEnvironment,
-  );
   let child;
   try {
     child = spawn(
-      configuration.sandboxBin,
-      ['-p', profile, validated.command.executable, ...validated.request.argv],
+      spawnFile,
+      spawnArguments,
       {
         cwd,
         env: childEnvironment,
         detached: true,
         stdio: ['pipe', 'pipe', 'pipe'],
+        ...spawnExtras,
       },
     );
   } catch (error) {
@@ -1204,12 +1517,36 @@ async function spawnRequest(context, validated, configuration, activeContexts) {
   context.phase = 'running';
   context.stdinExpected = validated.request.stdin;
 
-  attachOutputStream(child.stdout, context.socket, 'stdout');
-  attachOutputStream(child.stderr, context.socket, 'stderr');
+  // A command may stop reading stdin long before the guest stops sending it
+  // (`yes | host-command head -1`). The next write then fails with EPIPE; that
+  // must only discard the rest of the input, never reach the process-wide
+  // uncaught-exception handler that shuts the whole broker down.
+  child.stdin.on('error', () => {
+    context.stdinBroken = true;
+    if (context.inputPaused && !context.terminal) {
+      // A 'drain' that will never come was holding further frames back.
+      context.inputPaused = false;
+      context.socket.resume();
+      try {
+        processBufferedLines(context, configuration, activeContexts);
+      } catch (error) {
+        failContext(context, error);
+      }
+    }
+  });
+
+  attachOutputStream(child.stdout, context.socket, 'stdout', context);
+  attachOutputStream(child.stderr, context.socket, 'stderr', context);
 
   child.once('spawn', () => {
     context.authTimer && clearTimeout(context.authTimer);
     context.authTimer = undefined;
+    if (cwdNote) {
+      sendFrame(context.socket, {
+        type: 'stderr',
+        data: Buffer.from(cwdNote, 'utf8').toString('base64'),
+      });
+    }
     sendFrame(context.socket, {
       type: 'start',
       pid: child.pid,
@@ -1227,18 +1564,31 @@ async function spawnRequest(context, validated, configuration, activeContexts) {
     terminateContext(context, true);
   });
 
+  if (fullAccess) {
+    child.once('exit', () => {
+      context.exited = true;
+      armDrainTimer(context);
+    });
+  }
+
   child.once('close', (code, signal) => {
     activeContexts.delete(context);
-    // End every background descendant that remains in this request's process
-    // group whenever its leader exits. Deliberate setsid-style daemonization is
-    // outside the protocol contract and cannot be contained by a PGID alone.
-    killProcessGroup(context, 'SIGTERM');
-    if (!context.killTimer) {
-      context.killTimer = setTimeout(
-        () => killProcessGroup(context, 'SIGKILL'),
-        LIMITS.terminateGraceMs,
-      );
-      context.killTimer.unref();
+    if (context.drainTimer) clearTimeout(context.drainTimer);
+    context.drainTimer = undefined;
+    if (!fullAccess) {
+      // End every background descendant that remains in this request's process
+      // group whenever its leader exits. Deliberate setsid-style daemonization is
+      // outside the protocol contract and cannot be contained by a PGID alone.
+      // Full access deliberately skips this: a command that finished normally
+      // may have started a service, and stopping it is the Agent's decision.
+      killProcessGroup(context, 'SIGTERM');
+      if (!context.killTimer) {
+        context.killTimer = setTimeout(
+          () => killProcessGroup(context, 'SIGKILL'),
+          LIMITS.terminateGraceMs,
+        );
+        context.killTimer.unref();
+      }
     }
     const status = Number.isInteger(code) ? Math.max(0, Math.min(255, code)) : signalExitStatus(signal);
     if (enterTerminalState(context)) {
@@ -1248,7 +1598,7 @@ async function spawnRequest(context, validated, configuration, activeContexts) {
         signal: signal || null,
         status,
       });
-      closeSocketSoon(context.socket);
+      closeSocketSoon(context.socket, { patient: true });
     }
     context.completed = true;
   });
@@ -1319,6 +1669,9 @@ function processBufferedLines(context, configuration, activeContexts) {
       if (context.stdinBytes > LIMITS.stdinTotalBytes) {
         throw new BrokerError('INVALID_STDIN', 'stdin exceeds the per-command byte limit.');
       }
+      // The command already closed its stdin; the frame was validated and is
+      // dropped like any input a process never reads.
+      if (context.stdinBroken || context.child.stdin.destroyed) continue;
       if (!context.child.stdin.write(decoded)) {
         context.inputPaused = true;
         context.socket.pause();
@@ -1337,7 +1690,7 @@ function processBufferedLines(context, configuration, activeContexts) {
         throw new BrokerError('INVALID_STDIN', 'stdin_end is unexpected.');
       }
       context.stdinEnded = true;
-      context.child.stdin.end();
+      if (!context.stdinBroken && !context.child.stdin.destroyed) context.child.stdin.end();
     } else if (frame.type === 'signal') {
       if (Object.keys(frame).some((key) => !['type', 'signal'].includes(key))
         || !['SIGINT', 'SIGTERM', 'SIGHUP'].includes(frame.signal)) {
@@ -1355,6 +1708,140 @@ function processBufferedLines(context, configuration, activeContexts) {
   if (byteLength(context.buffer) > bufferedLimit) {
     throw new BrokerError('INVALID_FRAME', 'An unterminated protocol frame exceeds its byte limit.');
   }
+}
+
+// Loopback tunnel (full access only). The listener shares the broker's
+// host-only address but not its framing: after one authentication line the
+// connection is an unmodified byte stream, so it is read as raw Buffers and
+// never decoded as text. The port allowlist comes from the launcher, the token
+// is the same 256-bit session token, and a failed attempt gets no reply at all.
+function verifyTunnelAuthentication(line, configuration) {
+  const match = TUNNEL_AUTH_PATTERN.exec(line);
+  if (!match) return null;
+  const supplied = Buffer.from(match[1], 'ascii');
+  if (supplied.length !== configuration.tokenBuffer.length
+    || !timingSafeEqual(supplied, configuration.tokenBuffer)) {
+    return null;
+  }
+  const port = Number(match[2]);
+  return configuration.tunnelPorts.includes(port) ? port : null;
+}
+
+// Resolves with a connected loopback socket. Some services listen on the IPv6
+// loopback only, so an IPv4 refusal is retried once on ::1; no other address
+// is ever tried, which keeps the allowlisted port a loopback-only capability.
+function connectLoopback(port) {
+  const hosts = ['127.0.0.1', '::1'];
+  return new Promise((resolve, reject) => {
+    const attempt = (index) => {
+      const candidate = net.connect({ host: hosts[index], port, allowHalfOpen: true });
+      const timer = setTimeout(
+        () => candidate.destroy(new Error('connect timeout')),
+        LIMITS.tunnelConnectMs,
+      );
+      candidate.once('connect', () => {
+        clearTimeout(timer);
+        candidate.removeAllListeners('error');
+        resolve(candidate);
+      });
+      candidate.once('error', (error) => {
+        clearTimeout(timer);
+        candidate.destroy();
+        if (index + 1 < hosts.length && error?.code === 'ECONNREFUSED') {
+          attempt(index + 1);
+        } else {
+          reject(error);
+        }
+      });
+    };
+    attempt(0);
+  });
+}
+
+// The guest socket stays paused until the upstream exists, so no byte that
+// follows the authentication line can be lost or reordered.
+//
+// Teardown is graceful in both directions: when one side finishes cleanly,
+// the other side is ended rather than destroyed, so bytes still queued for a
+// slow reader (a service's final burst before it closes, or a request the
+// guest sent just before closing) are delivered, under the same stall
+// watchdog the command channel uses. Only an error destroys both sides.
+async function relayTunnel(socket, port, remainder, tunnelSockets) {
+  let upstream;
+  const destroyBoth = () => {
+    socket.destroy();
+    upstream?.destroy();
+  };
+  socket.on('error', destroyBoth);
+  try {
+    upstream = await connectLoopback(port);
+  } catch {
+    socket.destroy();
+    return;
+  }
+  if (socket.destroyed) {
+    upstream.destroy();
+    return;
+  }
+  tunnelSockets.add(upstream);
+  upstream.on('error', destroyBoth);
+  upstream.once('close', (hadError) => {
+    tunnelSockets.delete(upstream);
+    if (hadError) destroyBoth();
+    else closeSocketSoon(socket, { patient: true });
+  });
+  socket.once('close', (hadError) => {
+    if (hadError) destroyBoth();
+    else closeSocketSoon(upstream, { patient: true });
+  });
+  upstream.setNoDelay(true);
+  if (remainder.length > 0) upstream.write(remainder);
+  socket.pipe(upstream);
+  upstream.pipe(socket);
+}
+
+function startTunnelServer(configuration, tunnelSockets) {
+  const server = net.createServer({ allowHalfOpen: true, pauseOnConnect: true }, (socket) => {
+    if (tunnelSockets.size >= LIMITS.tunnelConnections) {
+      socket.destroy();
+      return;
+    }
+    tunnelSockets.add(socket);
+    socket.once('close', () => tunnelSockets.delete(socket));
+    socket.on('error', () => socket.destroy());
+    socket.setNoDelay(true);
+
+    let pending = Buffer.alloc(0);
+    const authTimer = setTimeout(() => socket.destroy(), LIMITS.tunnelAuthMs);
+    const onData = (chunk) => {
+      pending = Buffer.concat([pending, chunk]);
+      const newline = pending.indexOf(0x0a);
+      if (newline === -1) {
+        if (pending.length > LIMITS.tunnelAuthBytes) socket.destroy();
+        return;
+      }
+      socket.off('data', onData);
+      socket.pause();
+      clearTimeout(authTimer);
+      const port = newline <= LIMITS.tunnelAuthBytes
+        ? verifyTunnelAuthentication(pending.subarray(0, newline).toString('latin1'), configuration)
+        : null;
+      if (port === null) {
+        socket.destroy();
+        return;
+      }
+      void relayTunnel(socket, port, pending.subarray(newline + 1), tunnelSockets);
+    };
+    socket.on('data', onData);
+    socket.resume();
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen({ host: configuration.bindAddress, port: 0, exclusive: true }, () => {
+      server.off('error', reject);
+      resolve(server);
+    });
+  });
 }
 
 async function writeEndpoint(configuration, address, port) {
@@ -1394,14 +1881,23 @@ async function main() {
   if (!isPidAlive(argumentsValue.launcherPid)) {
     fail('LAUNCHER_GONE', 'The launcher PID is not alive.');
   }
-  const configuration = await loadConfiguration(argumentsValue);
-  const sandboxProfile = buildSandboxProfile(configuration);
-  if (byteLength(sandboxProfile) > LIMITS.sandboxProfileBytes) {
-    fail('INVALID_MANIFEST', 'The generated sandbox profile is too large.');
+  const fullAccess = argumentsValue.access === 'full';
+  const configuration = fullAccess
+    ? await loadFullConfiguration(argumentsValue)
+    : await loadConfiguration(argumentsValue);
+  if (!fullAccess) {
+    const sandboxProfile = buildSandboxProfile(configuration);
+    if (byteLength(sandboxProfile) > LIMITS.sandboxProfileBytes) {
+      fail('INVALID_MANIFEST', 'The generated sandbox profile is too large.');
+    }
+  } else {
+    process.stderr.write('host-exec-broker: FULL HOST ACCESS: commands run as this user without a sandbox\n');
   }
 
   const activeContexts = new Set();
   const sockets = new Set();
+  const tunnelSockets = new Set();
+  let tunnelServer;
   let shuttingDown = false;
   let endpointPath;
   let launcherTimer;
@@ -1422,12 +1918,16 @@ async function main() {
       child: undefined,
       stdinExpected: false,
       stdinEnded: false,
+      stdinBroken: false,
       stdinBytes: 0,
       inputPaused: false,
       completed: false,
       killTimer: undefined,
       authTimer: undefined,
       terminal: false,
+      // Full access only: leader exit tracking for the output drain window.
+      exited: false,
+      drainTimer: undefined,
     };
 
     context.authTimer = setTimeout(() => {
@@ -1479,6 +1979,8 @@ async function main() {
     shuttingDown = true;
     if (launcherTimer) clearInterval(launcherTimer);
     server.close();
+    if (tunnelServer) tunnelServer.close();
+    for (const tunnelSocket of tunnelSockets) tunnelSocket.destroy();
     for (const context of activeContexts) terminateContext(context);
     for (const socket of sockets) socket.destroy();
     await new Promise((resolve) => setTimeout(resolve, LIMITS.terminateGraceMs + 50));
@@ -1509,16 +2011,32 @@ async function main() {
     await shutdown('listener did not receive an IPv4 address', 70);
     return;
   }
+  // The tunnel is a secondary capability: if it cannot start, the command
+  // channel still works and the catalog simply omits it.
+  if (fullAccess && configuration.tunnelPorts.length > 0) {
+    try {
+      tunnelServer = await startTunnelServer(configuration, tunnelSockets);
+      configuration.runtime.tunnelPort = tunnelServer.address().port;
+    } catch (error) {
+      tunnelServer = undefined;
+      process.stderr.write(`host-exec-broker: loopback tunnel unavailable: ${error.message}\n`);
+    }
+  }
   endpointPath = await writeEndpoint(configuration, address.address, address.port);
 
   // This is the only structured readiness output. Launchers may wait for either
   // this line or the atomically published endpoint file.
-  process.stdout.write(`${JSON.stringify({
+  const ready = {
     type: 'ready',
     address: address.address,
     port: address.port,
     endpoint: `${address.address}:${address.port}`,
-  })}\n`);
+  };
+  if (fullAccess) {
+    ready.access = 'full';
+    ready.tunnelPort = configuration.runtime.tunnelPort;
+  }
+  process.stdout.write(`${JSON.stringify(ready)}\n`);
 
   launcherTimer = setInterval(() => {
     if (!isPidAlive(configuration.launcherPid)) {

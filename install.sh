@@ -30,6 +30,7 @@ ASSETS=(
   entrypoint.sh
   host-exec-client
   host-exec-broker.mjs
+  agent-host-tunnel
   agent-workspace-connect
   agent-workspace-session
   profiles/claude.json
@@ -126,7 +127,7 @@ asset_is_selected() {
   local requested_asset="$1"
   local asset_profile
   case "$requested_asset" in
-    agent-container-darwin-arm64|agent-container-runtime|Containerfile|Containerfile.dockerignore|image-setup.sh|entrypoint.sh|host-exec-client|host-exec-broker.mjs|agent-workspace-connect|agent-workspace-session)
+    agent-container-darwin-arm64|agent-container-runtime|Containerfile|Containerfile.dockerignore|image-setup.sh|entrypoint.sh|host-exec-client|host-exec-broker.mjs|agent-host-tunnel|agent-workspace-connect|agent-workspace-session)
       return 0
       ;;
     profiles/*.json)
@@ -903,11 +904,14 @@ grep -Eq '^[[:space:]]*(ARG[[:space:]]+BASE_IMAGE|FROM[[:space:]])' "$tmp_dir/Co
   && grep -Fqx '!image-setup.sh' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!entrypoint.sh' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!host-exec-client' "$tmp_dir/Containerfile.dockerignore" \
+  && grep -Fqx '!agent-host-tunnel' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!agent-workspace-connect' "$tmp_dir/Containerfile.dockerignore" \
   && grep -Fqx '!agent-workspace-session' "$tmp_dir/Containerfile.dockerignore" \
   || die "The downloaded Containerfile.dockerignore failed validation."
 grep -Fq 'createServer' "$tmp_dir/host-exec-broker.mjs" \
   || die "The downloaded host-exec broker failed validation."
+grep -Fq 'AGENT-CONTAINER-TUNNEL' "$tmp_dir/agent-host-tunnel" \
+  || die "The downloaded host loopback forwarder failed validation."
 plutil_bin=$(command -v plutil || true)
 [ -n "$plutil_bin" ] || die "macOS plutil is required to validate Agent profiles."
 for profile_id in claude codex grok; do
@@ -1059,6 +1063,7 @@ if path_exists "$release_dir"; then
     image-setup.sh \
     entrypoint.sh \
     host-exec-client \
+    agent-host-tunnel \
     agent-workspace-connect \
     agent-workspace-session; do
     [ -f "$release_dir/$executable_asset" ] \
@@ -1076,9 +1081,9 @@ if path_exists "$release_dir"; then
     > "$release_root_listing" 2>/dev/null \
     || die "Could not safely enumerate the existing release: $release_dir"
   release_root_count=$(wc -l < "$release_root_listing" | tr -d '[:space:]')
-  # Ten shared regular assets, four command aliases, the profiles directory,
+  # Eleven shared regular assets, four command aliases, the profiles directory,
   # release manifest, and ownership marker.
-  expected_root_count=17
+  expected_root_count=18
   [ "$release_root_count" = "$expected_root_count" ] \
     || die "Existing release contains unexpected root entries: $release_dir"
   release_profile_listing="$tmp_dir/existing-release-profile-list"
@@ -1111,6 +1116,7 @@ else
   install -m 0755 "$tmp_dir/entrypoint.sh" "$stage_dir/entrypoint.sh"
   install -m 0755 "$tmp_dir/host-exec-client" "$stage_dir/host-exec-client"
   install -m 0644 "$tmp_dir/host-exec-broker.mjs" "$stage_dir/host-exec-broker.mjs"
+  install -m 0755 "$tmp_dir/agent-host-tunnel" "$stage_dir/agent-host-tunnel"
   install -m 0755 \
     "$tmp_dir/agent-workspace-connect" \
     "$stage_dir/agent-workspace-connect"

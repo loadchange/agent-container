@@ -61,6 +61,8 @@ jobs:
             scripts/generate-manifest.sh \
             tests/test-agent-container.sh \
             tests/test-host-exec.sh \
+            tests/test-host-full.sh \
+            tests/test-host-mirrors.sh \
             tests/test-install-uninstall.sh \
             tests/test-workspace-bridge.sh \
             tests/test-workspace-session-live.sh \
@@ -79,6 +81,9 @@ jobs:
 
       - name: Validate host broker syntax
         run: node --check runtime/host-exec-broker.mjs
+
+      - name: Validate host loopback forwarder syntax
+        run: node --check runtime/agent-host-tunnel
 
       - name: Validate Homebrew formula syntax
         run: ruby -c Formula/agent-container.rb
@@ -99,6 +104,7 @@ jobs:
             runtime/agent-workspace-session \
             runtime/entrypoint.sh \
             runtime/host-exec-client \
+            runtime/agent-host-tunnel \
             scripts/build-release.sh \
             scripts/generate-manifest.sh \
             dist/agent-container-darwin-arm64 \
@@ -106,10 +112,13 @@ jobs:
             dist/image-setup.sh \
             dist/entrypoint.sh \
             dist/host-exec-client \
+            dist/agent-host-tunnel \
             dist/agent-workspace-connect \
             dist/agent-workspace-session \
             tests/test-agent-container.sh \
             tests/test-host-exec.sh \
+            tests/test-host-full.sh \
+            tests/test-host-mirrors.sh \
             tests/test-install-uninstall.sh \
             tests/test-workspace-bridge.sh \
             tests/test-workspace-session-live.sh \
@@ -130,6 +139,14 @@ jobs:
 
       - name: Run host executor contract tests
         run: tests/test-host-exec.sh
+
+      - name: Run full host access tests
+        run: tests/test-host-full.sh
+
+      # Exercises the guest-side mirror merge; it reports a TAP skip on macOS
+      # and runs for real on a Linux host with root and a mount namespace.
+      - name: Run host mirror tests
+        run: tests/test-host-mirrors.sh
 
       - name: Run install and uninstall transaction tests
         run: tests/test-install-uninstall.sh

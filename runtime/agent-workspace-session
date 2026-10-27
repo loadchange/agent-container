@@ -6,6 +6,10 @@ fail() {
   exit 64
 }
 
+warn() {
+  printf '%s\n' "$*" >&2
+}
+
 [ "$EUID" -eq 0 ] \
   || fail 'the workspace session helper must run as root.'
 
@@ -144,6 +148,30 @@ unset AGENT_WORKSPACE_ENDPOINT AGENT_WORKSPACE_TOKEN
 [[ "$workspace_token" =~ ^[0-9a-f]{64}$ ]] \
   || fail 'AGENT_WORKSPACE_TOKEN must contain exactly 64 lowercase hexadecimal characters.'
 
+# Full host access is an explicit, launcher-set per-client capability. In this
+# mode ROOT is the whole host filesystem mounted at a guest mount point (/host),
+# the launcher additionally mirrors selected host directories at their own
+# absolute paths, and the host-tool channel runs its commands unsandboxed. The
+# marker only takes effect when the launcher set it; a guest-forged value never
+# reaches this helper because the environment is scrubbed by the launcher.
+host_full_access=false
+case "${AGENT_WORKSPACE_FULL_ACCESS:-0}" in
+  0|'') ;;
+  1) host_full_access=true ;;
+  *) fail 'AGENT_WORKSPACE_FULL_ACCESS must be 0 or 1.' ;;
+esac
+unset AGENT_WORKSPACE_FULL_ACCESS
+# Optional comma-separated extra absolute host paths to mirror at identical
+# guest paths, beyond the automatically chosen host top-level directories.
+host_mirror_spec="${AGENT_WORKSPACE_HOST_MIRROR:-}"
+unset AGENT_WORKSPACE_HOST_MIRROR
+case "$host_mirror_spec" in
+  *$'\n'*|*$'\r'*|*$'\t'*) fail 'AGENT_WORKSPACE_HOST_MIRROR contains a control character.' ;;
+esac
+if [ "$host_full_access" = false ] && [ -n "$host_mirror_spec" ]; then
+  fail 'AGENT_WORKSPACE_HOST_MIRROR requires full host access.'
+fi
+
 # The optional host-tool channel arrives on the same private environment
 # path as the workspace transport. Both fields must agree; a partial handoff
 # is treated as corruption rather than silently ignored. The command catalog
@@ -278,6 +306,14 @@ pending_signal_status=
 workspace_mounted=false
 session_runtime_dir=
 session_control_dir=
+# Full host access bookkeeping. host_mirror_mounts and host_mirror_dirs are
+# stacks (one array element per path, so spaces and glob characters survive)
+# unwound in reverse by remove_host_mirrors; host_tunnel_pid is the guest
+# loopback forwarder; agent_start_cwd is where the Agent is finally started.
+host_mirror_mounts=()
+host_mirror_dirs=()
+host_tunnel_pid=
+agent_start_cwd=
 
 load_agent_identity() {
   local identity_pid identity_sid identity_pgid identity_extra
@@ -400,6 +436,201 @@ stop_agent_processes() {
   agent_identity_ready=false
 }
 
+# --- host mirror functions begin ---
+# Full host access: mirror selected host directories at their own absolute
+# guest paths so macOS-style paths (/Users/... , /Volumes/...) resolve the same
+# content the Agent sees under /host. Each mirror is a bind mount of a /host
+# subtree inside this session's private mount namespace. Mounting is
+# best-effort: a directory that cannot be mirrored warns and is skipped rather
+# than aborting the session, and every function here returns 0 so `set -e`
+# can never turn a skipped mirror into a dead session.
+#
+# A guest path that already holds content is never covered. Instead the merge
+# descends one level and mirrors the children that do not collide, to a
+# bounded depth. That is what makes the operator's home work: the guest's
+# /Users/<name> is the profile's persistent shadow HOME (a VirtioFS mount), so
+# /Users cannot be covered; descending mirrors /Users/<name>/project,
+# Documents, and the other real home directories into it, while dot-entries
+# (the shadow HOME's own Linux-side state and the host's macOS dotfiles) stay
+# exactly as they are. Only directories are mirrored; a loose file in the
+# home remains reachable under /host.
+#
+# host_mirror_guest_root is a test seam: mirror targets are placed below it so
+# the merge logic can be exercised against a scratch tree. It is empty in
+# production.
+host_mirror_guest_root=""
+readonly HOST_MIRROR_MAX_DEPTH=2
+
+mirror_target_is_protected() {
+  case "$1" in
+    /|"$workspace_root"|"$workspace_root"/* ) return 0 ;;
+    /bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/home|/home/*) return 0 ;;
+    /lib|/lib/*|/lib64|/lib64/*|/proc|/proc/*|/root|/root/*|/run|/run/*) return 0 ;;
+    /sbin|/sbin/*|/sys|/sys/*|/tmp|/tmp/*|/usr|/usr/*|/var|/var/*) return 0 ;;
+    /workspace|/workspace/*) return 0 ;;
+  esac
+  return 1
+}
+
+add_host_mirror() {
+  local host_path="$1"
+  local depth="${2:-0}"
+  local source="$workspace_root$host_path"
+  local target="$host_mirror_guest_root$host_path"
+  local created_dir=false
+  local resolved_source child existing
+
+  case "$host_path" in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  case "$host_path" in
+    *$'\n'*|*$'\r'*|*$'\t'*|*//*|*/..*|*/.) return 0 ;;
+  esac
+  if mirror_target_is_protected "$host_path"; then
+    warn "agent-workspace-session: refusing to mirror a protected guest path: $host_path"
+    return 0
+  fi
+  # A path at or below one of this session's mirrors already shows the host
+  # content; mirroring it again would only nest a redundant bind. This also
+  # makes a repeated create_host_mirrors call a no-op.
+  if [ "${#host_mirror_mounts[@]}" -gt 0 ]; then
+    for existing in "${host_mirror_mounts[@]}"; do
+      case "$target" in
+        "$existing"|"$existing"/*) return 0 ;;
+      esac
+    done
+  fi
+  # The source must be a real directory under /host and must not escape it.
+  if [ ! -d "$source" ] || [ -L "$source" ]; then
+    return 0
+  fi
+  resolved_source=$(/usr/bin/realpath -e -- "$source" 2>/dev/null || true)
+  case "$resolved_source" in
+    "$workspace_root"|"$workspace_root"/*) ;;
+    *) return 0 ;;
+  esac
+
+  if [ ! -e "$target" ]; then
+    # A placeholder mountpoint. It is owned by the Agent so that, should the
+    # session ever end without cleanup, the empty leftover is the user's own.
+    if ! (umask 0022; /usr/bin/mkdir -- "$target") 2>/dev/null; then
+      warn "agent-workspace-session: cannot create mirror point $target"
+      return 0
+    fi
+    /usr/bin/chown "$runtime_uid:$runtime_gid" -- "$target" 2>/dev/null || true
+    created_dir=true
+  elif [ -d "$target" ] && [ ! -L "$target" ]; then
+    if /usr/bin/mountpoint -q -- "$target" 2>/dev/null \
+      || [ -n "$(/usr/bin/ls -A -- "$target" 2>/dev/null)" ]; then
+      # Existing guest content (a mount such as the shadow HOME, or an
+      # image-provided tree) is merged into, never covered: mirror each
+      # non-hidden child directory that does not itself collide.
+      if [ "$depth" -ge "$HOST_MIRROR_MAX_DEPTH" ]; then
+        return 0
+      fi
+      for child in "$source"/*; do
+        if [ -d "$child" ] && [ ! -L "$child" ]; then
+          add_host_mirror "$host_path/${child##*/}" $((depth + 1))
+        fi
+      done
+      return 0
+    fi
+  else
+    return 0
+  fi
+
+  if /usr/bin/mount --bind -- "$source" "$target" 2>/dev/null; then
+    host_mirror_mounts+=("$target")
+    if [ "$created_dir" = true ]; then
+      host_mirror_dirs+=("$target")
+    fi
+  else
+    warn "agent-workspace-session: cannot mirror $source at $target"
+    if [ "$created_dir" = true ]; then
+      /usr/bin/rmdir -- "$target" 2>/dev/null || true
+    fi
+  fi
+  return 0
+}
+
+create_host_mirrors() {
+  local auto_name explicit_path saved_ifs
+  # Standard macOS top-level directories that do not collide with the Linux
+  # guest's own system trees.
+  for auto_name in Users Volumes Applications Library System private cores Network; do
+    if [ -e "$workspace_root/$auto_name" ]; then
+      add_host_mirror "/$auto_name"
+    fi
+  done
+  # Operator-selected additional paths (comma-separated absolute host paths).
+  if [ -n "$host_mirror_spec" ]; then
+    saved_ifs="$IFS"
+    IFS=,
+    for explicit_path in $host_mirror_spec; do
+      if [ -n "$explicit_path" ]; then
+        add_host_mirror "$explicit_path"
+      fi
+    done
+    IFS="$saved_ifs"
+  fi
+  return 0
+}
+
+# Unwind the mirrors innermost first. A mirror is a bind mount of a /host
+# subpath, so every mirror must be gone before SSHFS leaves /host, and only the
+# placeholder mountpoints this helper created are removed.
+remove_host_mirrors() {
+  local index target
+  if [ "${#host_mirror_mounts[@]}" -gt 0 ]; then
+    for ((index = ${#host_mirror_mounts[@]} - 1; index >= 0; index--)); do
+      target=${host_mirror_mounts[index]}
+      if /usr/bin/mountpoint -q -- "$target" 2>/dev/null; then
+        /usr/bin/umount -- "$target" 2>/dev/null \
+          || /usr/bin/umount -l -- "$target" 2>/dev/null || true
+      fi
+    done
+  fi
+  host_mirror_mounts=()
+  if [ "${#host_mirror_dirs[@]}" -gt 0 ]; then
+    for ((index = ${#host_mirror_dirs[@]} - 1; index >= 0; index--)); do
+      /usr/bin/rmdir -- "${host_mirror_dirs[index]}" 2>/dev/null || true
+    done
+  fi
+  host_mirror_dirs=()
+  return 0
+}
+
+# With the identical-path mirrors in place, start the Agent in the real host
+# path whenever that path is backed by a mirror: pwd and every absolute path a
+# tool prints then match the host, and host commands resolve the cwd directly.
+# Otherwise the /host form remains the working directory.
+select_agent_start_cwd() {
+  local native_cwd="${workspace_cwd#"$workspace_root"}"
+  local candidate mirror
+  agent_start_cwd="$workspace_cwd"
+  [ "$host_full_access" = true ] || return 0
+  case "$native_cwd" in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  candidate="$host_mirror_guest_root$native_cwd"
+  if [ "${#host_mirror_mounts[@]}" -gt 0 ]; then
+    for mirror in "${host_mirror_mounts[@]}"; do
+      case "$candidate" in
+        "$mirror"|"$mirror"/*)
+          if [ -d "$candidate" ] && [ ! -L "$candidate" ]; then
+            agent_start_cwd="$candidate"
+          fi
+          return 0
+          ;;
+      esac
+    done
+  fi
+  return 0
+}
+# --- host mirror functions end ---
+
 cleanup() {
   local retry
   set +e
@@ -425,6 +656,17 @@ cleanup() {
     esac
   fi
   agent_cgroup=
+
+  # Full host access teardown, innermost first: stop the loopback forwarder,
+  # then unwind the identical-path mirrors in reverse (a mirror is a bind mount
+  # of a /host subpath, so every mirror must be gone before SSHFS leaves /host),
+  # removing only the mountpoints this helper created.
+  if [ -n "$host_tunnel_pid" ]; then
+    kill -TERM "$host_tunnel_pid" 2>/dev/null || true
+    wait "$host_tunnel_pid" 2>/dev/null || true
+    host_tunnel_pid=
+  fi
+  remove_host_mirrors
 
   # The helper entered the FUSE tree before starting the Agent. Leave it before
   # asking SSHFS to exit so libfuse can perform the normal, single unmount.
@@ -637,6 +879,73 @@ EOF
   [ "$host_exec_fallback_count" -eq 0 ] \
     || /bin/chmod 0755 -- "$host_exec_fallback_dir"/* \
     || fail 'cannot publish the host-fallback command shims.'
+
+  if [ "$host_full_access" = true ]; then
+    # The guest client reads this marker to apply the full-access environment
+    # policy (forward everything except guest-only names) instead of the
+    # sandboxed one. Writing it here, next to the credentials, keeps it inside
+    # the Agent-owned private runtime directory.
+    (umask 077; printf 'full\n' > "$host_exec_state_dir/host-exec-mode") \
+      && /usr/bin/chown "$runtime_uid:$runtime_gid" -- \
+        "$host_exec_state_dir/host-exec-mode" \
+      || fail 'cannot publish the host-exec access marker.'
+
+    # The broker reports its loopback tunnel in the same catalog response. When
+    # present, start one guest forwarder for the allowlisted ports so guest
+    # tools reach the operator's real adb server and other loopback services.
+    host_tunnel_port=$(printf '%s\n' "$host_exec_catalog_response" \
+      | /usr/bin/jq -er '.tunnel.port // empty | select(type=="number")' 2>/dev/null || true)
+    host_tunnel_ports=$(printf '%s\n' "$host_exec_catalog_response" \
+      | /usr/bin/jq -er '
+          (.tunnel.ports // []) | select(type=="array")
+          | map(select(type=="number" and . >= 1 and . <= 65535)) | join(",")' \
+        2>/dev/null || true)
+    if [ -n "$host_tunnel_port" ] && [ -n "$host_tunnel_ports" ]; then
+      case "$host_tunnel_port" in
+        ''|*[!0-9]*) fail 'the host-tool broker reported an invalid tunnel port.' ;;
+      esac
+      [ "$host_tunnel_port" -ge 1 ] && [ "$host_tunnel_port" -le 65535 ] \
+        || fail 'the host-tool broker reported an out-of-range tunnel port.'
+      # The image installs the pinned Node.js release under /usr/local.
+      [ -f /usr/local/bin/agent-host-tunnel ] && [ -x /usr/local/bin/node ] \
+        || fail 'the loopback forwarder requires /usr/local/bin/node and agent-host-tunnel.'
+      # The forwarder is best-effort device-and-service plumbing: if it cannot
+      # bind, the Agent still has full filesystem and host-command access, so a
+      # failure here warns rather than aborting the session.
+      (
+        trap '' INT TERM HUP
+        exec /usr/bin/setpriv \
+          --reuid="$runtime_uid" --regid="$runtime_gid" \
+          --clear-groups --no-new-privs \
+          /usr/local/bin/node /usr/local/bin/agent-host-tunnel \
+          --endpoint "$host_exec_host:$host_tunnel_port" \
+          --token "$host_exec_token" \
+          --ports "$host_tunnel_ports" \
+          < /dev/null
+      ) &
+      host_tunnel_pid=$!
+      host_tunnel_first_port=${host_tunnel_ports%%,*}
+      host_tunnel_ready=false
+      for host_tunnel_attempt in $(/usr/bin/seq 1 100); do
+        kill -0 "$host_tunnel_pid" 2>/dev/null || break
+        if (exec 3<>"/dev/tcp/127.0.0.1/$host_tunnel_first_port") 2>/dev/null; then
+          exec 3>&- 3<&- 2>/dev/null || true
+          host_tunnel_ready=true
+          break
+        fi
+        /bin/sleep 0.05
+      done
+      if [ "$host_tunnel_ready" != true ]; then
+        warn "agent-workspace-session: the host loopback forwarder did not start; host ports ($host_tunnel_ports) are unavailable this session."
+        if [ -n "$host_tunnel_pid" ]; then
+          kill -TERM "$host_tunnel_pid" 2>/dev/null || true
+          wait "$host_tunnel_pid" 2>/dev/null || true
+          host_tunnel_pid=
+        fi
+      fi
+    fi
+  fi
+
   host_exec_catalog_response=
   host_exec_catalog_tsv=
 fi
@@ -740,6 +1049,14 @@ done
   || fail 'sshfs did not mount ROOT within 10 seconds.'
 workspace_mounted=true
 
+# With the whole host filesystem mounted at ROOT, publish the identical-path
+# mirrors so the Agent can use real host paths directly, then prefer the real
+# path of the working directory when a mirror backs it.
+if [ "$host_full_access" = true ]; then
+  create_host_mirrors
+fi
+select_agent_start_cwd
+
 [ -d "$workspace_cwd" ] && [ ! -L "$workspace_cwd" ] \
   || fail 'CWD is not a directory after mounting ROOT.'
 resolved_cwd=$(/usr/bin/realpath -e -- "$workspace_cwd") \
@@ -753,7 +1070,7 @@ esac
 child_job_is_active "$sshfs_pid" \
   || fail 'sshfs stopped after mount readiness.'
 
-cd -- "$workspace_cwd"
+cd -- "$agent_start_cwd"
 agent_start_fifo="$session_control_dir/agent.start"
 /usr/bin/mkfifo -m 0600 -- "$agent_start_fifo" \
   || fail 'cannot create the Agent bootstrap gate.'

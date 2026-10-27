@@ -26,6 +26,7 @@ readonly RELEASE_ASSET_SOURCES=(
   "entrypoint.sh:runtime/entrypoint.sh"
   "host-exec-client:runtime/host-exec-client"
   "host-exec-broker.mjs:runtime/host-exec-broker.mjs"
+  "agent-host-tunnel:runtime/agent-host-tunnel"
   "agent-workspace-connect:runtime/agent-workspace-connect"
   "agent-workspace-session:runtime/agent-workspace-session"
   "profiles/claude.json:runtime/profiles/claude.json"

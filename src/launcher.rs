@@ -39,6 +39,8 @@ const VALUE_OPTIONS: &[(&str, &str)] = &[
     ("host-node", "AGENT_CONTAINER_HOST_NODE_BIN"),
     ("host-exec-deny", "AGENT_CONTAINER_HOST_EXEC_DENY"),
     ("host-exec-first", "AGENT_CONTAINER_HOST_EXEC_FIRST"),
+    ("host-forward-ports", "AGENT_CONTAINER_HOST_FORWARD_PORTS"),
+    ("host-mirror", "AGENT_CONTAINER_HOST_MIRROR"),
     ("host-gateway", "AGENT_CONTAINER_HOST_GATEWAY"),
     ("host-alias", "AGENT_CONTAINER_HOST_ALIAS"),
     ("block-host", "AGENT_CONTAINER_BLOCK_HOST"),
@@ -63,6 +65,7 @@ const BOOLEAN_OPTIONS: &[(&str, &str)] = &[
     ("disable-fd-watchdog", "AGENT_CONTAINER_DISABLE_FD_WATCHDOG"),
     ("host-tools", "AGENT_CONTAINER_HOST_TOOLS"),
     ("host-ssh-agent", "AGENT_CONTAINER_HOST_SSH_AGENT"),
+    ("full-host-access", "AGENT_CONTAINER_FULL_HOST_ACCESS"),
 ];
 
 const REMOVED_ENVIRONMENT: &[(&str, &str)] = &[
@@ -708,6 +711,8 @@ mod tests {
             ("host-node", "AGENT_CONTAINER_HOST_NODE_BIN"),
             ("host-exec-deny", "AGENT_CONTAINER_HOST_EXEC_DENY"),
             ("host-exec-first", "AGENT_CONTAINER_HOST_EXEC_FIRST"),
+            ("host-forward-ports", "AGENT_CONTAINER_HOST_FORWARD_PORTS"),
+            ("host-mirror", "AGENT_CONTAINER_HOST_MIRROR"),
             ("host-gateway", "AGENT_CONTAINER_HOST_GATEWAY"),
             ("host-alias", "AGENT_CONTAINER_HOST_ALIAS"),
             ("block-host", "AGENT_CONTAINER_BLOCK_HOST"),
@@ -736,8 +741,61 @@ mod tests {
             ("disable-fd-watchdog", "AGENT_CONTAINER_DISABLE_FD_WATCHDOG"),
             ("host-tools", "AGENT_CONTAINER_HOST_TOOLS"),
             ("host-ssh-agent", "AGENT_CONTAINER_HOST_SSH_AGENT"),
+            ("full-host-access", "AGENT_CONTAINER_FULL_HOST_ACCESS"),
         ];
         assert_eq!(BOOLEAN_OPTIONS, expected);
+    }
+
+    #[test]
+    fn maps_full_host_access_and_its_value_options() {
+        let enabled = plan(
+            OsStr::new("claude-container"),
+            &os_values(&[
+                "--container-full-host-access",
+                "--container-host-forward-ports=5037,8081",
+                "--container-host-mirror",
+                "/Volumes/Work,/private/tmp",
+                "--",
+                "--container-full-host-access",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            environment_value(&enabled, "AGENT_CONTAINER_FULL_HOST_ACCESS"),
+            Some(OsStr::new("true"))
+        );
+        assert_eq!(
+            environment_value(&enabled, "AGENT_CONTAINER_HOST_FORWARD_PORTS"),
+            Some(OsStr::new("5037,8081"))
+        );
+        assert_eq!(
+            environment_value(&enabled, "AGENT_CONTAINER_HOST_MIRROR"),
+            Some(OsStr::new("/Volumes/Work,/private/tmp"))
+        );
+        // After --, the same spelling is an ordinary Agent argument.
+        assert_eq!(
+            enabled.runtime_arguments,
+            os_values(&["claude", "--container-full-host-access"])
+        );
+
+        let disabled = plan(
+            OsStr::new("claude-container"),
+            &os_values(&["--no-container-full-host-access"]),
+        )
+        .unwrap();
+        assert_eq!(
+            environment_value(&disabled, "AGENT_CONTAINER_FULL_HOST_ACCESS"),
+            Some(OsStr::new("false"))
+        );
+
+        // The capability is a launcher option only; an exported variable is
+        // rejected like every other former runtime setting.
+        let ambient = vec![(
+            OsString::from("AGENT_CONTAINER_FULL_HOST_ACCESS"),
+            OsString::from("true"),
+        )];
+        let error = legacy_environment_error(&ambient).unwrap();
+        assert!(error.contains("--container-full-host-access"));
     }
 
     #[test]

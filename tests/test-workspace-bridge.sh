@@ -547,10 +547,20 @@ for session_contract in \
   'session_runtime_dir=$(/usr/bin/mktemp -d' \
   'XDG_RUNTIME_DIR="$session_runtime_dir"' \
   '[ "$mountpoint_created" = true ]' \
-  '/usr/bin/rmdir -- "$workspace_root"'; do
+  '/usr/bin/rmdir -- "$workspace_root"' \
+  '# --- host mirror functions begin ---' \
+  '# --- host mirror functions end ---' \
+  'remove_host_mirrors' \
+  'select_agent_start_cwd' \
+  'cd -- "$agent_start_cwd"' \
+  '/usr/local/bin/node /usr/local/bin/agent-host-tunnel'; do
   grep -Fq -- "$session_contract" "$session_script" \
     || fail "workspace session helper is missing contract: $session_contract"
 done
+# The image installs Node.js under /usr/local; a /usr/bin/node reference
+# would abort every full-access launch that forwards a port.
+grep -Fq -- '/usr/bin/node' "$session_script" \
+  && fail "workspace session must use the image's /usr/local/bin/node"
 grep -Fq -- '-o nonempty' "$session_script" \
   && fail "workspace session must not pass the obsolete FUSE2 nonempty option"
 grep -Fq -- 'ROOT mountpoint is not empty.' "$session_script" \
@@ -573,7 +583,11 @@ sshfs_wait_line=$(grep -nF '[ -z "$sshfs_pid" ] || wait "$sshfs_pid"' "$session_
   | head -n 1 | cut -d: -f1)
 fallback_unmount_line=$(grep -nF '/usr/bin/fusermount3 -u -- "$workspace_root"' "$session_script" \
   | head -n 1 | cut -d: -f1)
-case "$agent_stop_line:$cgroup_remove_line:$cleanup_cd_line:$sshfs_term_line:$sshfs_wait_line:$fallback_unmount_line" in
+# The full-access mirrors are bind mounts of /host subpaths: cleanup must
+# unwind them after the Agent tree is gone and before SSHFS leaves /host.
+mirror_unwind_line=$(grep -nE '^  remove_host_mirrors$' "$session_script" \
+  | head -n 1 | cut -d: -f1)
+case "$agent_stop_line:$cgroup_remove_line:$cleanup_cd_line:$sshfs_term_line:$sshfs_wait_line:$fallback_unmount_line:$mirror_unwind_line" in
   *[!0-9:]*|:*|*::*|*:)
     fail "workspace session cleanup ordering could not be inspected"
     ;;
@@ -584,6 +598,9 @@ esac
   && [ "$sshfs_term_line" -lt "$sshfs_wait_line" ] \
   && [ "$sshfs_wait_line" -lt "$fallback_unmount_line" ] \
   || fail "workspace session must empty the Agent cgroup, reap SSHFS, then use fallback unmount"
+[ "$agent_stop_line" -lt "$mirror_unwind_line" ] \
+  && [ "$mirror_unwind_line" -lt "$cleanup_cd_line" ] \
+  || fail "workspace session must unwind host mirrors after the Agent tree and before leaving /host"
 if [ "$(id -u)" -ne 0 ]; then
   set +e
   "$session_script" /tmp /tmp 1 1 claude \

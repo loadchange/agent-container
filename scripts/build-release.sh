@@ -121,6 +121,8 @@ install -m 0755 "$repo_root/runtime/image-setup.sh" \
   "$dist_dir/image-setup.sh"
 install -m 0644 "$repo_root/runtime/host-exec-broker.mjs" \
   "$dist_dir/host-exec-broker.mjs"
+install -m 0755 "$repo_root/runtime/agent-host-tunnel" \
+  "$dist_dir/agent-host-tunnel"
 for profile_id in claude codex grok; do
   install -m 0644 "$repo_root/runtime/profiles/$profile_id.json" \
     "$dist_dir/profiles/$profile_id.json"
@@ -154,6 +156,7 @@ if [ "$pack_tarball" = true ]; then
     entrypoint.sh \
     host-exec-client \
     host-exec-broker.mjs \
+    agent-host-tunnel \
     agent-workspace-connect \
     agent-workspace-session \
     profiles/claude.json \

@@ -17,7 +17,7 @@ while [ "$#" -gt 0 ]; do
       bind_address="$2"
       shift 2
       ;;
-    --launcher-pid|--real-home|--exec-home|--sandbox-bin)
+    --launcher-pid|--real-home|--exec-home|--sandbox-bin|--access|--tunnel-ports)
       [ "$#" -ge 2 ] || exit 64
       shift 2
       ;;
@@ -28,9 +28,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$session_dir" ] && [ -d "$session_dir" ] || exit 66
-for argument in "${broker_arguments[@]}"; do
-  printf 'ARG=%s\n' "$argument" >> "$session_dir/fake-host-broker-args"
-done
+# The launcher starts the real broker from a deliberately constructed clean
+# environment (env -i). Record the arguments and exactly the environment that
+# arrived so the contract suite can prove which host variables each access
+# mode forwards. Both go in the one record file: the session directory is a
+# VirtioFS-budgeted tree whose legacy entry count the suite asserts exactly.
+{
+  for argument in "${broker_arguments[@]}"; do
+    printf 'ARG=%s\n' "$argument"
+  done
+  env | LC_ALL=C sort | sed 's/^/ENV=/'
+} >> "$session_dir/fake-host-broker-args"
 endpoint_tmp="$session_dir/.host-exec-endpoint.$$"
 case "$session_dir" in
   *broker_endpoint_zero*) endpoint="$bind_address:0" ;;

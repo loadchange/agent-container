@@ -461,6 +461,70 @@ or `refresh` operation (including hostname and storage options) in a normal
 macOS terminal, forward `GH_TOKEN`, or disable host tools and use the guest
 `gh` configuration instead.
 
+## Full host access
+
+Sometimes the point is the opposite of isolation: you want the Agent to drive
+the real machine — host-connected devices over `adb`, `xcrun`/`xctest`,
+host services you start and stop, and your whole filesystem — as if it were not
+in a container at all. `--container-full-host-access` is that explicit,
+per-client opt-in. It is off by default and never part of the persistent VM
+fingerprint.
+
+```bash
+# Android: the adb server (host 127.0.0.1:5037) is forwarded by default, so
+# the guest's adb/Gradle/Flutter see the devices plugged into your Mac.
+claude-container --container-full-host-access
+
+# Reach extra host loopback services and mirror an external volume.
+claude-container --container-full-host-access \
+  --container-host-forward-ports 5037,8081,9222 \
+  --container-host-mirror /Volumes/Devices
+```
+
+With it enabled, for that one client:
+
+- **Filesystem.** The whole host filesystem is transported over the same
+  SFTP/SSHFS channel and mounted read-write at `/host`. Standard macOS
+  directories (`/Users`, `/Volumes`, `/Applications`, `/Library`, `/System`,
+  `/private`, …) and any `--container-host-mirror` paths are also mirrored at
+  their own absolute paths, so `/Users/you/project` means the same files inside
+  the guest as on the host, and the Agent starts in that real path rather than
+  under `/host`. Your guest home stays the profile's persistent shadow HOME:
+  the real home's directories (`project`, `Documents`, …) are merged into it,
+  while dotfiles on both sides — the Agent's Linux state and your macOS
+  `~/.ssh`, `~/.gitconfig`, and friends — are left exactly where they are
+  (the latter remain reachable under `/host`). An existing non-empty guest
+  directory is never covered. The SFTP server runs without the `sandbox-exec`
+  workspace profile, so it carries exactly your own filesystem permissions.
+- **Host commands.** The host-tool broker runs each command unsandboxed, as the
+  macOS user, with your real `HOME` and your terminal's exported environment
+  (`ANDROID_HOME`, `JAVA_HOME`, `DEVELOPER_DIR`, …) — so `adb`, `xcrun`,
+  `xcodebuild`, `xctest`, `brew`, `launchctl`, and the like behave as in your
+  own terminal, including starting and stopping host services. A guest working
+  directory under `/host` is mapped back to its real host path automatically.
+- **Host loopback ports.** `--container-host-forward-ports` (default the adb
+  server, `5037`) makes the listed host `127.0.0.1` ports reachable from the
+  guest's own `127.0.0.1`, through the broker's authenticated, allowlisted
+  tunnel. The guest never gets a routable path to the host — only those ports.
+
+This is a deliberate removal of the micro-VM boundary for that client. The
+Agent, the code it runs, and its prompts can read, change, or delete anything
+your account can, run arbitrary host programs, and exfiltrate anything
+reachable. Use it only with code and prompts you trust. Because every client of
+a profile shares one guest kernel, UID, and profile HOME, a full-access client
+requires the profile to itself: the launcher refuses to start one while another
+client of that profile is live, refuses to start a sandboxed client alongside a
+live full-access one, and prints a reminder to stop the VM when you are done:
+
+```bash
+agent-container singleton stop claude
+```
+
+Full host access requires the default persistent-singleton path and the
+host-tool channel; it is rejected by legacy `run`, by the singleton control
+commands, and together with `--no-container-host-tools` or
+`--container-workspace-root`.
+
 ## Configuration: `--container-*`
 
 Normal use requires no configuration. Public launcher settings are command-line
@@ -492,6 +556,8 @@ Boolean options use `--container-<name>` and `--no-container-<name>`.
 | `--container-forward-env VALUE` | unset | Comma-separated exact exported names for provider, model, token, or Agent settings |
 | `--container-host-exec-deny VALUE` | unset | Comma-separated host commands never proxied into the guest |
 | `--container-host-exec-first VALUE` | unset | Comma-separated host commands preferred over guest copies, like the built-in `git`/`gh` |
+| `--container-host-forward-ports VALUE` | `5037` with full host access | Comma-separated host loopback ports reachable from the guest through the authenticated tunnel (full host access only); `none` disables |
+| `--container-host-mirror VALUE` | unset | Comma-separated extra absolute host directories mirrored at their own guest paths (full host access only) |
 | `--container-host-alias VALUE` | unset | Comma-separated guest DNS names mapped to the Apple host gateway while preserving URL/SNI |
 | `--container-block-host VALUE` | unset | Comma-separated guest DNS names mapped to IPv4 and IPv6 blackholes |
 | `--container-max-files VALUE` | `40000` | Safety budget for remaining VirtioFS-backed trees and legacy `run` shares |
@@ -514,6 +580,7 @@ Boolean options use `--container-<name>` and `--no-container-<name>`.
 | `--container-disable-fd-watchdog` | off | Disable the legacy `run` live file/vnode watchdog for controlled testing |
 | `--container-host-tools` | on | Mirror the host command catalog as sandboxed host executables (host-first `git`/`gh`) |
 | `--container-host-ssh-agent` | on | Hand the terminal's live `SSH_AUTH_SOCK` to host-first `git`/`gh` for SSH remotes; never enters the guest |
+| `--container-full-host-access` | off | Remove this client's filesystem and host-command confinement: mount the whole host filesystem at `/host` with host paths mirrored, run host commands unsandboxed as you, and reach host loopback ports. See [Full host access](#full-host-access). |
 
 Every boolean has a negative form, for example
 `--no-container-full-git-config`. Repeated settings use the last value.

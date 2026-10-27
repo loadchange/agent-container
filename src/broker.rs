@@ -146,25 +146,57 @@ const SANDBOX_PROFILE: &str = r#"(version 1)
   (path-ancestors (param "WORKSPACE_ROOT")))
 "#;
 
-pub fn run(arguments: &[OsString]) -> Result<(), String> {
-    let liveness_fd = match arguments {
-        [_, _] => None,
-        [_, _, option, fd] if option == OsStr::new("--liveness-fd") && fd == OsStr::new("8") => {
-            Some(RUNTIME_LIVENESS_FD)
-        }
-        _ => {
-            return Err(
-                "usage: agent-container __workspace-broker ROOT BIND_IP [--liveness-fd 8]"
-                    .to_owned(),
-            )
-        }
-    };
+const USAGE: &str =
+    "usage: agent-container __workspace-broker ROOT BIND_IP [--liveness-fd 8] [--unrestricted]";
 
-    let root = canonical_root(Path::new(&arguments[0]))?;
+#[derive(Debug, PartialEq, Eq)]
+struct BrokerOptions {
+    liveness_fd: Option<RawFd>,
+    // Full host access: serve ROOT (normally `/`) with the user's own
+    // authority instead of the workspace sandbox.
+    unrestricted: bool,
+}
+
+fn parse_options(options: &[OsString]) -> Result<BrokerOptions, String> {
+    let mut parsed = BrokerOptions {
+        liveness_fd: None,
+        unrestricted: false,
+    };
+    let mut index = 0;
+    while index < options.len() {
+        let option = options[index].as_os_str();
+        if option == OsStr::new("--liveness-fd") && parsed.liveness_fd.is_none() {
+            if options.get(index + 1).map(OsString::as_os_str) != Some(OsStr::new("8")) {
+                return Err(USAGE.to_owned());
+            }
+            parsed.liveness_fd = Some(RUNTIME_LIVENESS_FD);
+            index += 2;
+        } else if option == OsStr::new("--unrestricted") && !parsed.unrestricted {
+            parsed.unrestricted = true;
+            index += 1;
+        } else {
+            return Err(USAGE.to_owned());
+        }
+    }
+    Ok(parsed)
+}
+
+pub fn run(arguments: &[OsString]) -> Result<(), String> {
+    if arguments.len() < 2 {
+        return Err(USAGE.to_owned());
+    }
+    let options = parse_options(&arguments[2..])?;
+
+    let root = canonical_root(Path::new(&arguments[0]), options.unrestricted)?;
     let bind_ip = parse_bind_ip(&arguments[1])?;
-    require_system_executable(Path::new(SANDBOX_EXEC))?;
+    if !options.unrestricted {
+        require_system_executable(Path::new(SANDBOX_EXEC))?;
+    }
     require_system_executable(Path::new(SFTP_SERVER))?;
-    let liveness = liveness_fd.map(BrokerLiveness::from_fd).transpose()?;
+    let liveness = options
+        .liveness_fd
+        .map(BrokerLiveness::from_fd)
+        .transpose()?;
 
     let listener = TcpListener::bind((bind_ip, 0))
         .map_err(|error| format!("could not bind workspace broker to {bind_ip}: {error}"))?;
@@ -189,10 +221,10 @@ pub fn run(arguments: &[OsString]) -> Result<(), String> {
         .set_nodelay(true)
         .map_err(|error| format!("could not configure workspace broker connection: {error}"))?;
     authenticate(&mut stream, &token)?;
-    serve_sftp(stream, &root)
+    serve_sftp(stream, &root, options.unrestricted)
 }
 
-fn canonical_root(input: &Path) -> Result<PathBuf, String> {
+fn canonical_root(input: &Path, allow_filesystem_root: bool) -> Result<PathBuf, String> {
     if !input.is_absolute() {
         return Err(format!(
             "workspace root must be an absolute path: {:?}",
@@ -215,7 +247,7 @@ fn canonical_root(input: &Path) -> Result<PathBuf, String> {
             canonical
         ));
     }
-    if canonical == Path::new("/") {
+    if canonical == Path::new("/") && !allow_filesystem_root {
         return Err(
             "refusing to expose the filesystem root through the workspace broker".to_owned(),
         );
@@ -390,13 +422,22 @@ fn workspace_definition(root: &Path) -> OsString {
     value
 }
 
-fn serve_sftp(mut stream: TcpStream, root: &Path) -> Result<(), String> {
-    let mut child = Command::new(SANDBOX_EXEC)
-        .arg("-D")
-        .arg(workspace_definition(root))
-        .arg("-p")
-        .arg(SANDBOX_PROFILE)
-        .arg(SFTP_SERVER)
+fn sftp_command(root: &Path, unrestricted: bool) -> Command {
+    let mut command = if unrestricted {
+        // Full host access: the platform SFTP server runs directly, so the
+        // guest holds exactly this account's filesystem authority below ROOT.
+        Command::new(SFTP_SERVER)
+    } else {
+        let mut sandboxed = Command::new(SANDBOX_EXEC);
+        sandboxed
+            .arg("-D")
+            .arg(workspace_definition(root))
+            .arg("-p")
+            .arg(SANDBOX_PROFILE)
+            .arg(SFTP_SERVER);
+        sandboxed
+    };
+    command
         .arg("-e")
         .arg("-d")
         .arg(root.as_os_str())
@@ -405,18 +446,23 @@ fn serve_sftp(mut stream: TcpStream, root: &Path) -> Result<(), String> {
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
+}
+
+fn serve_sftp(mut stream: TcpStream, root: &Path, unrestricted: bool) -> Result<(), String> {
+    let mut child = sftp_command(root, unrestricted)
         .spawn()
-        .map_err(|error| format!("could not start sandboxed SFTP server: {error}"))?;
+        .map_err(|error| format!("could not start the SFTP server: {error}"))?;
 
     let mut child_stdin = child
         .stdin
         .take()
-        .ok_or_else(|| "sandboxed SFTP server has no stdin pipe".to_owned())?;
+        .ok_or_else(|| "the SFTP server has no stdin pipe".to_owned())?;
     let mut child_stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "sandboxed SFTP server has no stdout pipe".to_owned())?;
+        .ok_or_else(|| "the SFTP server has no stdout pipe".to_owned())?;
     let mut upload_stream = stream
         .try_clone()
         .map_err(|error| format!("could not clone workspace broker connection: {error}"))?;
@@ -441,7 +487,7 @@ fn serve_sftp(mut stream: TcpStream, root: &Path) -> Result<(), String> {
     }
     let status = child
         .wait()
-        .map_err(|error| format!("could not wait for sandboxed SFTP server: {error}"))?;
+        .map_err(|error| format!("could not wait for the SFTP server: {error}"))?;
 
     if let Err(error) = download_result {
         return Err(format!("workspace broker download relay failed: {error}"));
@@ -452,9 +498,7 @@ fn serve_sftp(mut stream: TcpStream, root: &Path) -> Result<(), String> {
         }
     }
     if !status.success() {
-        return Err(format!(
-            "sandboxed SFTP server exited unsuccessfully: {status}"
-        ));
+        return Err(format!("the SFTP server exited unsuccessfully: {status}"));
     }
     Ok(())
 }
@@ -571,7 +615,7 @@ mod tests {
 
     #[test]
     fn canonical_root_rejects_relative_input() {
-        let error = canonical_root(Path::new(".")).unwrap_err();
+        let error = canonical_root(Path::new("."), false).unwrap_err();
         assert!(error.contains("must be an absolute path"));
     }
 
@@ -591,7 +635,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
 
-        let error = canonical_root(&link).unwrap_err();
+        let error = canonical_root(&link, false).unwrap_err();
         assert!(error.contains("must already be canonical"));
 
         fs::remove_file(link).unwrap();
@@ -609,14 +653,88 @@ mod tests {
         fs::create_dir(&test_root).unwrap();
         let test_root = fs::canonicalize(&test_root).unwrap();
 
-        assert_eq!(canonical_root(&test_root).unwrap(), test_root);
+        assert_eq!(canonical_root(&test_root, false).unwrap(), test_root);
 
         fs::remove_dir(test_root).unwrap();
     }
 
     #[test]
     fn canonical_root_rejects_the_filesystem_root() {
-        assert!(canonical_root(Path::new("/")).is_err());
+        assert!(canonical_root(Path::new("/"), false).is_err());
+    }
+
+    #[test]
+    fn only_full_host_access_may_serve_the_filesystem_root() {
+        assert_eq!(
+            canonical_root(Path::new("/"), true).unwrap(),
+            PathBuf::from("/")
+        );
+        // Unrestricted mode keeps every other root rule.
+        assert!(canonical_root(Path::new("relative"), true).is_err());
+    }
+
+    #[test]
+    fn broker_options_accept_liveness_and_unrestricted_in_any_order() {
+        let none = parse_options(&[]).unwrap();
+        assert_eq!(
+            none,
+            BrokerOptions {
+                liveness_fd: None,
+                unrestricted: false
+            }
+        );
+        for options in [
+            vec!["--liveness-fd", "8", "--unrestricted"],
+            vec!["--unrestricted", "--liveness-fd", "8"],
+        ] {
+            let parsed =
+                parse_options(&options.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+            assert_eq!(parsed.liveness_fd, Some(RUNTIME_LIVENESS_FD));
+            assert!(parsed.unrestricted);
+        }
+        for invalid in [
+            vec!["--liveness-fd", "9"],
+            vec!["--liveness-fd"],
+            vec!["--unrestricted", "--unrestricted"],
+            vec!["--liveness-fd", "8", "--liveness-fd", "8"],
+            vec!["--sandboxed"],
+        ] {
+            let error =
+                parse_options(&invalid.iter().map(OsString::from).collect::<Vec<_>>()).unwrap_err();
+            assert!(error.starts_with("usage:"), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn sandboxed_sftp_command_runs_the_server_inside_sandbox_exec() {
+        let command = sftp_command(Path::new("/tmp"), false);
+        assert_eq!(command.get_program(), OsStr::new(SANDBOX_EXEC));
+        let arguments: Vec<&OsStr> = command.get_args().collect();
+        assert_eq!(arguments[0], OsStr::new("-D"));
+        assert_eq!(arguments[1], OsStr::new("WORKSPACE_ROOT=/tmp"));
+        assert_eq!(arguments[2], OsStr::new("-p"));
+        assert_eq!(arguments[3], OsStr::new(SANDBOX_PROFILE));
+        assert_eq!(
+            arguments[4..],
+            [
+                OsStr::new(SFTP_SERVER),
+                OsStr::new("-e"),
+                OsStr::new("-d"),
+                OsStr::new("/tmp")
+            ]
+        );
+    }
+
+    #[test]
+    fn unrestricted_sftp_command_runs_the_server_directly() {
+        let command = sftp_command(Path::new("/"), true);
+        assert_eq!(command.get_program(), OsStr::new(SFTP_SERVER));
+        let arguments: Vec<&OsStr> = command.get_args().collect();
+        assert_eq!(
+            arguments,
+            [OsStr::new("-e"), OsStr::new("-d"), OsStr::new("/")]
+        );
+        assert!(!arguments.contains(&OsStr::new(SANDBOX_PROFILE)));
     }
 
     #[test]
